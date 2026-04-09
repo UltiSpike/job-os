@@ -70,6 +70,23 @@ def list_progress():
     return {"items": curriculum_repo.list_progress()}
 
 
+@router.get("/lessons/{lesson_slug}/drills")
+def list_lesson_drills(lesson_slug: str):
+    """Drill questions for a lesson — id 顺序排（q_drill_<slug>_1, _2, _3）"""
+    if not curriculum_repo.get_lesson(lesson_slug):
+        raise HTTPException(404, "lesson not found")
+    with get_conn() as conn:
+        rows = conn.execute(
+            """SELECT id, text, best_practice_answer, lesson_slug, rating, review_count,
+                      first_seen_at, last_reviewed_at, next_review_at
+               FROM questions
+               WHERE lesson_slug = ? AND (is_capstone IS NULL OR is_capstone = 0)
+               ORDER BY id""",
+            (lesson_slug,),
+        ).fetchall()
+    return {"items": [dict(r) for r in rows]}
+
+
 @router.post("/lessons/{lesson_slug}/capstone-question")
 def ensure_capstone_question(lesson_slug: str):
     """Lazily creates (or returns) the capstone question row for this lesson.

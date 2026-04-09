@@ -171,7 +171,8 @@ class AnalysisCreate(BaseModel):
 @router.post("")
 def create_analysis(body: AnalysisCreate):
     """前端流式接收完后调用，把解析后的结构化数据持久化"""
-    if not questions_repo.get_question(body.question_id):
+    q = questions_repo.get_question(body.question_id)
+    if not q:
         raise HTTPException(404, "question not found")
     a = analyses_repo.create({
         "question_id": body.question_id,
@@ -184,6 +185,22 @@ def create_analysis(body: AnalysisCreate):
         "suggestions": body.suggestions,
         "topics_touched": body.topics_touched,
     })
+    # 副作用 1：如果这道题是某个 lesson 的毕业题，自动更新 lesson_progress
+    if q.get("is_capstone") and q.get("lesson_slug") and body.score is not None:
+        from server.storage import curriculum_repo
+        curriculum_repo.upsert_progress(
+            lesson_slug=q["lesson_slug"],
+            status="passed" if body.score >= 70 else "in_progress",
+            capstone_score=body.score,
+        )
+    # 副作用 2：标记 first_seen_at — 课程题做过一次后才会进入 training SRS 池
+    if not q.get("first_seen_at"):
+        from server.storage.base import now_iso, transaction
+        with transaction() as conn:
+            conn.execute(
+                "UPDATE questions SET first_seen_at = ? WHERE id = ? AND first_seen_at IS NULL",
+                (now_iso(), body.question_id),
+            )
     return a.model_dump()
 
 

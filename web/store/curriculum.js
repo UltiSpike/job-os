@@ -31,3 +31,11 @@ export async function reloadTree() {
   const tree = await curriculumApi.getTrackTree(slug);
   curriculumStore.patch({ tree });
 }
+
+export async function switchTrack(slug) {
+  const tracks = curriculumStore.state.tracks || [];
+  if (!tracks.find(t => t.slug === slug)) return;
+  curriculumStore.patch({ activeTrackSlug: slug, tree: null });
+  const tree = await curriculumApi.getTrackTree(slug);
+  curriculumStore.patch({ tree });
+}

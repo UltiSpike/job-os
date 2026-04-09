@@ -22,10 +22,10 @@ from fastapi.staticfiles import StaticFiles
 from server.exceptions import ConfigError, JobOsError, NotFoundError, UpstreamError, ValidationError
 from server.logging_setup import configure_logging, get_logger, set_request_id
 from server.routers import (
-    analyses, answers, asr, asr_config, chat, curriculum, export, interviews,
-    job_state_events, jobs, llm, llm_presets, migration, profile,
-    prompts, questions, resume_profiles, resumes, settings as settings_router,
-    study_plans, topics,
+    analyses, answers, asr, asr_config, chat, concepts, curriculum, export,
+    interviews, job_state_events, jobs, llm, llm_presets, me, migration,
+    profile, prompts, questions, resume_profiles, resumes,
+    settings as settings_router, study_plans, topics,
 )
 from server.storage.db import get_conn, init_db
 
@@ -134,6 +134,9 @@ def create_app() -> FastAPI:
     # Curriculum
     app.include_router(curriculum.router)
     app.include_router(study_plans.router)
+    # Concept + Me (核心抽象)
+    app.include_router(concepts.router)
+    app.include_router(me.router)
     # Settings / Profile
     app.include_router(settings_router.router)
     app.include_router(profile.router)

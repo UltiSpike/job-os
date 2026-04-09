@@ -4,6 +4,7 @@ import { interviewsApi } from '../api/interviews.js';
 import { toast, undoableToast } from '../components/toast.js';
 import { router } from '../app.js';
 import { escapeHtml } from '../components/html.js';
+import { refreshMastery } from '../store/me.js';
 
 const TYPES = ['HR 沟通', '一面', '二面', '三面', 'Onsite', 'HR 终面'];
 const RESULT_LABEL = { pending: '待定', pass: '通过', fail: '挂了' };
@@ -101,17 +102,127 @@ export function openInterviewModal(jobId, defaults = {}) {
   });
 }
 
+// ─── Verification 闭环：记录这次面试涉及的 concepts ───
+const OUTCOME_LABEL = { good: '✓ 答得好', ok: '◐ 一般', bad: '○ 翻车', unknown: '— 未知' };
+const DEPTH_LABEL = { 1: '浅', 2: '中', 3: '深' };
+
+function buildConceptsSection() {
+  return `
+    <div class="iv-concepts-sec">
+      <div class="iv-concepts-head">
+        <span class="iv-concepts-title">◇ 涉及的知识点（mastery 反馈用）</span>
+      </div>
+      <div class="iv-concepts-list" id="iv-concepts-list">
+        <div class="iv-concepts-empty mono">载入中…</div>
+      </div>
+      <div class="iv-concepts-extract">
+        <textarea id="iv-concepts-notes" rows="3" placeholder="粘贴你的面试笔记，AI 会自动识别涉及的 concepts + 估算表现"></textarea>
+        <div class="iv-concepts-actions">
+          <button class="btn ghost" type="button" id="iv-concepts-extract-btn">✦ 让 AI 抽取</button>
+          <span class="iv-concepts-status mono" id="iv-concepts-status"></span>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+async function loadInterviewConcepts(card, interviewId) {
+  const list = card.querySelector('#iv-concepts-list');
+  if (!list) return;
+  try {
+    const r = await interviewsApi.listConcepts(interviewId);
+    renderConceptsList(card, interviewId, r.items || []);
+  } catch (e) {
+    list.innerHTML = `<div class="iv-concepts-empty mono">载入失败：${escapeHtml(e.message)}</div>`;
+  }
+}
+
+function renderConceptsList(card, interviewId, items) {
+  const list = card.querySelector('#iv-concepts-list');
+  if (!list) return;
+  if (items.length === 0) {
+    list.innerHTML = '<div class="iv-concepts-empty mono">还没记录涉及的 concept — 用下方 LLM 抽取或手动添加</div>';
+    return;
+  }
+  list.innerHTML = items.map(it => `
+    <div class="iv-concept-row">
+      <span class="iv-concept-name">${escapeHtml(it.concept_name || it.concept_slug)}</span>
+      <span class="iv-concept-depth">深度 ${DEPTH_LABEL[it.asked_depth] || it.asked_depth}</span>
+      <span class="iv-concept-outcome r-${it.outcome}">${OUTCOME_LABEL[it.outcome] || it.outcome}</span>
+      <button class="iv-concept-del" data-del-concept="${it.id}" title="移除">✕</button>
+    </div>
+  `).join('');
+  card.querySelectorAll('[data-del-concept]').forEach(el => {
+    el.addEventListener('click', async () => {
+      try {
+        await interviewsApi.deleteConcept(el.dataset.delConcept);
+        await loadInterviewConcepts(card, interviewId);
+        refreshMastery();
+      } catch (e) { toast(e.message, 'danger'); }
+    });
+  });
+}
+
+function bindConceptsSection(card, interviewId) {
+  const btn = card.querySelector('#iv-concepts-extract-btn');
+  const status = card.querySelector('#iv-concepts-status');
+  if (!btn) return;
+  btn.addEventListener('click', async () => {
+    const notes = card.querySelector('#iv-concepts-notes')?.value || '';
+    if (!notes.trim()) {
+      toast('先粘贴笔记', 'danger');
+      return;
+    }
+    btn.disabled = true;
+    if (status) status.textContent = '⋯ AI 抽取中';
+    try {
+      const r = await interviewsApi.extractConcepts(interviewId, notes);
+      const items = r.items || [];
+      if (items.length === 0) {
+        if (status) status.textContent = '没匹配到 concept';
+        return;
+      }
+      // 自动 insert 所有抽取出来的 concept
+      let inserted = 0;
+      for (const it of items) {
+        try {
+          await interviewsApi.addConcept(interviewId, {
+            concept_slug: it.concept_slug,
+            asked_depth: it.asked_depth,
+            outcome: it.outcome,
+            note: it.evidence || '',
+          });
+          inserted++;
+        } catch (_) {}
+      }
+      await loadInterviewConcepts(card, interviewId);
+      refreshMastery();
+      if (status) status.textContent = `✓ 已写入 ${inserted} / ${items.length}`;
+      toast(`AI 识别 ${items.length} 个 concept`, 'success');
+    } catch (e) {
+      if (status) status.textContent = '✕ ' + e.message;
+      toast('抽取失败：' + e.message, 'danger');
+    } finally {
+      btn.disabled = false;
+    }
+  });
+}
+
 // 编辑已有面试
 export function openInterviewEditModal(interview, onAfter) {
   openModal({
     title: '编辑面试',
     sub: `${interview.type} · #${interview.id}`,
-    body: buildBody(interview),
+    body: buildBody(interview) + buildConceptsSection(),
     actions: `
       <button class="btn" data-close>取消</button>
       <button class="btn primary" id="iv-save">保存</button>
     `,
     onMount(card) {
+      // 加载已记录的 concepts
+      loadInterviewConcepts(card, interview.id);
+      bindConceptsSection(card, interview.id);
+
       card.querySelector('#iv-save').addEventListener('click', async () => {
         try {
           const newData = readForm(card);

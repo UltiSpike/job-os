@@ -7,6 +7,8 @@ import { openModal, closeModal } from '../components/modal.js';
 import { openPractice } from './_practiceModal.js';
 import { toast, undoableToast } from '../components/toast.js';
 import { router } from '../app.js';
+import { meStore, getCurriculumUrl } from '../store/me.js';
+import { curriculumStore } from '../store/curriculum.js';
 
 let topicFilter = null;     // null = all
 let ratingFilter = 'all';   // all | due | unrated | bad | ok | good
@@ -249,6 +251,28 @@ function qItem(q) {
     dataChips.push(`<span class="q-data-chip" title="有笔记">✎ ${q.note.length} 字</span>`);
   }
 
+  // Lesson 来源面包屑（仅当 q 来自 curriculum drill 时显示）— graceful: 没有 lesson 信息就不渲染
+  let breadcrumbHTML = '';
+  if (q.lesson_slug) {
+    const concept = meStore.state.conceptsBySlug[q.lesson_slug];
+    if (concept) {
+      const tree = curriculumStore.state.tree;
+      const trackName = (curriculumStore.state.tracks || []).find(t => t.slug === concept.track_slug)?.name || concept.track_slug || '';
+      // 找到 module name
+      let modName = concept.module_slug || '';
+      for (const t of (curriculumStore.state.tracks || [])) {
+        if (t.slug !== concept.track_slug) continue;
+      }
+      // 简化 — 用 concept.module_slug 作显示
+      const url = getCurriculumUrl(q.lesson_slug);
+      breadcrumbHTML = `
+        <a class="q-lesson-bc" href="${url}" title="跳回这节课的教材">
+          ← ${escapeHtml(trackName)} · ${escapeHtml(concept.name)}
+        </a>
+      `;
+    }
+  }
+
   return html`
     <div class="q-item">
       <div class="q-row">
@@ -257,6 +281,7 @@ function qItem(q) {
           ${q.review_count || 0}×
         </div>
         <div class="q-body">
+          ${raw(breadcrumbHTML)}
           <div class="q-text" data-practice-one="${escapeAttr(q.id)}" style="cursor:pointer" title="点击进入单题练习">${q.text}</div>
           <div class="q-meta">
             ${raw((q.topics || []).map(t => `<span class="topic">${t}</span>`).join(''))}

@@ -26,11 +26,12 @@ let editingResumeDraft = { name: '', content: '', is_default: false };
 let resumeProfiles = {}; // resumeId -> latest profile (or null)
 let extractingResumeId = null;
 
-export async function openSettingsModal() {
+export async function openSettingsModal(initialTab) {
   if (!settingsStore.state.loaded) {
     try { await loadSettings(); }
     catch (e) { toast(e.message, 'danger'); }
   }
+  if (initialTab) currentTab = initialTab;
   renderModal();
 }
 

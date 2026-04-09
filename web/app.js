@@ -9,12 +9,15 @@ import { pipelineView } from './views/pipeline.js';
 import { trainingView } from './views/training.js';
 import { curriculumView } from './views/curriculum.js';
 import { decisionView } from './views/decision.js';
+import { meView } from './views/me.js';
 import { curriculumStore, loadCurriculum } from './store/curriculum.js';
+import { meStore, loadMe } from './store/me.js';
+import { installPersistentStrip } from './components/persistentStrip.js';
 import { openSettingsModal } from './views/_settingsModal.js';
 import { fmtClock } from './components/dates.js';
 import { toast } from './components/toast.js';
 
-const VIEWS = [todayView, discoverView, pipelineView, trainingView, curriculumView, decisionView];
+const VIEWS = [meView, todayView, discoverView, pipelineView, trainingView, curriculumView, decisionView];
 
 class Router {
   constructor() {
@@ -58,10 +61,11 @@ async function boot() {
   const status = document.getElementById('cli-status');
   const setStatus = (s) => { if (status) status.textContent = s; };
 
-  // initial hash route
+  // initial hash route — only first segment determines view, rest 留给 view 自己解析
   const hash = location.hash.replace('#/', '');
-  if (hash && VIEWS.find(v => v.name === hash)) {
-    router.current = hash;
+  const firstSeg = hash.split('/')[0];
+  if (firstSeg && VIEWS.find(v => v.name === firstSeg)) {
+    router.current = firstSeg;
   }
   document.getElementById('cli-cmd').textContent = router.current;
 
@@ -75,7 +79,7 @@ async function boot() {
 
   setStatus('loading…');
   try {
-    await Promise.all([loadJobs(), loadQuestions(), loadSettings(), loadCurriculum()]);
+    await Promise.all([loadJobs(), loadQuestions(), loadSettings(), loadCurriculum(), loadMe()]);
   } catch (e) {
     toast('加载失败：' + e.message, 'danger');
   }
@@ -85,6 +89,9 @@ async function boot() {
   jobsStore.subscribe(rerender);
   questionsStore.subscribe(rerender);
   curriculumStore.subscribe(rerender);
+  meStore.subscribe(rerender);
+
+  installPersistentStrip();
 
   router.refresh();
   setStatus('ready');
@@ -92,9 +99,10 @@ async function boot() {
 
   window.addEventListener('hashchange', () => {
     const h = location.hash.replace('#/', '');
-    if (h && VIEWS.find(v => v.name === h) && h !== router.current) {
-      router.current = h;
-      document.getElementById('cli-cmd').textContent = h;
+    const seg = h.split('/')[0];
+    if (seg && VIEWS.find(v => v.name === seg) && seg !== router.current) {
+      router.current = seg;
+      document.getElementById('cli-cmd').textContent = seg;
       router.refresh();
     }
   });

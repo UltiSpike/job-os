@@ -11,6 +11,7 @@ export const curriculumApi = {
   listProgress:  ()      => api.get('/lesson-progress'),
   putProgress:   (slug, body) => api.put(`/lesson-progress/${slug}`, body),
   ensureCapstoneQuestion: (slug) => api.post(`/lessons/${slug}/capstone-question`, {}),
+  listDrills:    (slug) => api.get(`/lessons/${slug}/drills`),
 };
 
 export const resumeProfilesApi = {

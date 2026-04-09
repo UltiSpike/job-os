@@ -322,6 +322,59 @@ CREATE TABLE IF NOT EXISTS interview_topics (
 );
 CREATE INDEX IF NOT EXISTS idx_iv_topics_iv ON interview_topics(interview_id);
 CREATE INDEX IF NOT EXISTS idx_iv_topics_lesson ON interview_topics(lesson_slug);
+
+-- ─── Concepts: 知识点中心实体 (1 lesson = 1 concept 起步) ───
+CREATE TABLE IF NOT EXISTS concepts (
+    slug TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    description TEXT DEFAULT '',
+    track_slug TEXT,                 -- 来自哪个 track，便于按 track 聚合
+    module_slug TEXT,                -- 来自哪个 module
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_concepts_track ON concepts(track_slug);
+
+-- 一道 question 可以 probe 多个 concept；一个 concept 被多道 question 探查
+CREATE TABLE IF NOT EXISTS concept_questions (
+    concept_slug TEXT NOT NULL,
+    question_id TEXT NOT NULL,
+    PRIMARY KEY (concept_slug, question_id),
+    FOREIGN KEY (concept_slug) REFERENCES concepts(slug) ON DELETE CASCADE,
+    FOREIGN KEY (question_id) REFERENCES questions(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_cq_question ON concept_questions(question_id);
+
+-- 真实面试涉及的 concept (与 interview_topics 不同：这是 concept 级，那是 lesson 级)
+CREATE TABLE IF NOT EXISTS interview_concepts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    interview_id INTEGER NOT NULL,
+    concept_slug TEXT NOT NULL,
+    asked_depth INTEGER DEFAULT 1,    -- 1 浅 / 2 中 / 3 深
+    outcome TEXT DEFAULT 'unknown',   -- good / ok / bad / unknown
+    note TEXT DEFAULT '',
+    at TEXT NOT NULL,
+    FOREIGN KEY (interview_id) REFERENCES interviews(id) ON DELETE CASCADE,
+    FOREIGN KEY (concept_slug) REFERENCES concepts(slug) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_iv_concepts_iv ON interview_concepts(interview_id);
+CREATE INDEX IF NOT EXISTS idx_iv_concepts_concept ON interview_concepts(concept_slug);
+
+-- ─── User: 这个 app 的主语 (singleton, id=1) ───
+CREATE TABLE IF NOT EXISTS user_profile (
+    id INTEGER PRIMARY KEY DEFAULT 1,
+    display_name TEXT DEFAULT '',
+    current_role TEXT DEFAULT '',
+    target_role TEXT DEFAULT '',
+    target_seniority TEXT DEFAULT '',
+    bio TEXT DEFAULT '',
+    active_resume_id TEXT,
+    active_target_job_hrefs TEXT DEFAULT '[]',  -- JSON array
+    target_vector_cache TEXT DEFAULT '{}',      -- JSON {concept_slug: weight}
+    target_vector_synced_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    CHECK (id = 1)
+);
 """
 
 
@@ -332,7 +385,7 @@ def init_db():
         # 老库可能仍有 answer_variants/analyses/chat_sessions/stage_history 列；先检测
         q_cols = {r["name"] for r in conn.execute("PRAGMA table_info(questions)").fetchall()}
         st_cols = {r["name"] for r in conn.execute("PRAGMA table_info(job_states)").fetchall()}
-        # additive: questions.lesson_slug / is_capstone（老库没有就加上）
+        # additive: questions.lesson_slug / is_capstone / first_seen_at
         if "lesson_slug" not in q_cols:
             try:
                 conn.execute("ALTER TABLE questions ADD COLUMN lesson_slug TEXT")
@@ -343,6 +396,21 @@ def init_db():
                 conn.execute("ALTER TABLE questions ADD COLUMN is_capstone INTEGER DEFAULT 0")
             except Exception:
                 pass
+        if "first_seen_at" not in q_cols:
+            try:
+                conn.execute("ALTER TABLE questions ADD COLUMN first_seen_at TEXT")
+            except Exception:
+                pass
+        # 单例 user_profile 默认行
+        try:
+            conn.execute(
+                """INSERT OR IGNORE INTO user_profile
+                   (id, display_name, bio, active_target_job_hrefs, target_vector_cache, created_at, updated_at)
+                   VALUES (1, '', '', '[]', '{}', ?, ?)""",
+                (_now_iso_local(), _now_iso_local()),
+            )
+        except Exception:
+            pass
         # 兼容启动：旧库需要为迁移函数提供这些列；新库 SCHEMA 已不含 → 无需 ADD
         # 旧列存在 = 还没迁过 = 走迁移路径
 

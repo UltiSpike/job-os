@@ -28,6 +28,7 @@ let activeAnalysis = null;     // 当前流式分析的临时状态 { partial, p
 let editingVariant = false;    // 是否正在 inline 编辑当前 variant
 let variantDraft = '';         // 编辑中的草稿
 let activeSessionId = null;    // 当前查看的追问会话 id
+let sessionMenuOpen = false;   // 追问会话切换菜单展开状态
 
 // ─── 题目级数据缓存 ─── 替代旧的 q.answer_variants / q.analyses / q.chat_sessions
 // 每次切换题目时通过 dedicated APIs 重新拉取

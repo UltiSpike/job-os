@@ -51,9 +51,15 @@ def list_questions(
     limit: int = 0,
     offset: int = 0,
     q: str | None = None,
+    include_capstone: bool = False,
 ) -> list[dict]:
     sql = "SELECT * FROM questions WHERE 1=1"
     params: list[Any] = []
+    if not include_capstone:
+        # 课程的 capstone 永远不进通用题库（毕业题是收口测试，不是日常复习卡）。
+        # drill 题（lesson_slug != NULL, is_capstone = 0）只有用户至少做过一次 (first_seen_at) 才进入 SRS 池。
+        sql += """ AND (is_capstone IS NULL OR is_capstone = 0)
+                   AND (lesson_slug IS NULL OR first_seen_at IS NOT NULL)"""
     if source:
         sql += " AND source = ?"
         params.append(source)

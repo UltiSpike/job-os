@@ -1,6 +1,7 @@
 import { html, raw, escapeAttr, escapeHtml } from '../components/html.js';
 import { jobsStore, jobId } from '../store/jobs.js';
 import { questionsStore } from '../store/questions.js';
+import { meStore } from '../store/me.js';
 import { fmtDate, daysSince, hoursUntil, fmtRelativeFuture } from '../components/dates.js';
 import { clean, cleanTitle } from '../components/text.js';
 import { router } from '../app.js';
@@ -331,6 +332,27 @@ export const todayView = {
           </div>
           <p class="page-lede">每一日的求职操作台 — 看面试、追跟进、清待办。</p>
         </header>
+
+        ${(() => {
+          const rec = meStore.state.todayRec;
+          const cov = meStore.state.coverage;
+          if (!rec || rec.kind === 'empty') return '';
+          const covLabel = (cov && !cov.fallback && cov.total > 0)
+            ? `<span class="today-rec-cov">目标覆盖度 ${Math.round((cov.percentage || 0) * 100)}% (${cov.covered}/${cov.total})</span>`
+            : '';
+          return raw(`
+            <a class="today-rec" href="${rec.url || '#/today'}">
+              <div class="today-rec-left">
+                <div class="today-rec-kind">${rec.kind}</div>
+                <div class="today-rec-label">${escapeHtml(rec.label)}</div>
+              </div>
+              <div class="today-rec-right">
+                ${covLabel}
+                <span class="today-rec-arrow">▶</span>
+              </div>
+            </a>
+          `);
+        })()}
 
         <div class="today-stats">
           <button class="stat" data-stat-jump="target"><div class="label">目标 // target</div><div class="num amber">${stats.target}</div></button>

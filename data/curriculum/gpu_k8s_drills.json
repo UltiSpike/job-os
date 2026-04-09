@@ -1,0 +1,215 @@
+{
+  "comment": "Drill questions for GPU 训练 on K8s track. 3 per lesson, model answer 2-4 sentences.",
+  "drills": {
+    "device-plugin": [
+      {
+        "text": "Device Plugin 通过什么协议向 kubelet 注册资源？资源名为什么是 nvidia.com/gpu 这种带前缀的形式？",
+        "answer": "通过 gRPC，监听 unix socket /var/lib/kubelet/device-plugins/nvidia.sock。资源名带域名前缀（nvidia.com/）是 K8s extended resource 的命名规范，用域名做 namespace 防冲突——AMD 的 plugin 用 amd.com/gpu，避免不同厂商抢同一个名字。"
+      },
+      {
+        "text": "Pod yaml 里只写了 'requests.nvidia.com/gpu: 2' 没写 limits，会发生什么？",
+        "answer": "admission 直接拒绝。GPU 是 extended resource，K8s 强制 request == limit，少写一边等价于另一边为 0，调度时不通过。这是为了保证 device 不能被'部分'分配——要 2 卡就必须独占 2 卡。"
+      },
+      {
+        "text": "kubelet 调用 Allocate 拿到 device ID 之后，是怎么把这个 ID 让 cuda runtime 看见的？",
+        "answer": "通过环境变量 NVIDIA_VISIBLE_DEVICES（注入到容器 env）+ NVIDIA Container Toolkit（一个 OCI runtime hook）。Toolkit 在容器启动时读这个 env，把对应的 /dev/nvidia* 设备节点和 nvidia driver bind-mount 进容器，cuda runtime 通过 /dev/nvidia0 等节点看到 GPU。"
+      }
+    ],
+    "gpu-resource-semantics": [
+      {
+        "text": "为什么 GPU 资源不能像 CPU 一样写 0.5？除了 'integer-only' 这个回答，往下挖一层。",
+        "answer": "因为 device plugin 的 Allocate 接口返回的是整数个 device ID 列表，K8s 的资源核算单位是个数。要支持 0.5 卡需要额外机制：MIG（硬件分一片）、time-slicing（虚拟出多个副本）、vGPU（虚拟化方案）。这些都不是改 K8s 而是改 plugin 的暴露方式——把一张物理卡暴露成多个 device。"
+      },
+      {
+        "text": "为什么 GPU extended resource 不能超售？CPU 可以。",
+        "answer": "CPU 是分时复用的连续资源，K8s 用 cgroups quota 强制限制；超售时假设大家不会同时用满。GPU device 是独占型——一个 cuda context 跑起来就独占整张卡的 SM 和 memory，没有 OS 层面的抢占机制（time-slicing 是软件折中且没有隔离）。所以 K8s 不允许 device 超分，allocate 后不可被另一个 Pod 使用。"
+      },
+      {
+        "text": "你想跑一个推理服务希望弹性—— '正常 1 卡，需要时弹到 2 卡'。K8s 能直接做吗？为什么？该怎么实现这种弹性？",
+        "answer": "不能直接做。GPU request==limit 强制约束，HPA 也不能改单 Pod 的 GPU 数（只能改副本数）。实现弹性的正确做法是水平扩 Pod 副本——基于 GPU 利用率指标（DCGM_FI_DEV_GPU_UTIL）做 HPA，每个 Pod 固定 1 卡，副本数从 1 弹到 2。"
+      }
+    ],
+    "gpu-topology": [
+      {
+        "text": "Topology Manager 的四种 policy 各自适合什么场景？",
+        "answer": "none：不感知拓扑，调度最快但带宽差；best-effort：尽量同 NUMA 但失败也继续，调度成功率高；restricted：必须满足拓扑要求否则 admission 失败，平衡型；single-numa-node：所有资源必须在同一 NUMA node，最严格也带宽最好。生产 GPU 训练通常用 single-numa-node 或 restricted。"
+      },
+      {
+        "text": "你跑 nvidia-smi topo -m 看到拓扑里出现 'PXB' 和 'NV4' 两种连接，分别是什么？哪个快？",
+        "answer": "PXB 是 PCIe Switch（Peripheral Component Interconnect Express Bridge），数据走 PCIe 总线；NV4 是 NVLink 4 通道。NVLink 远快于 PCIe——A100 NVLink 单链路 25 GB/s × 12 = 600 GB/s，PCIe gen4 x16 才 32 GB/s。看到 PXB 说明这两张卡之间没有直接 NVLink 连接，要走总线绕路。"
+      },
+      {
+        "text": "NVIDIA GPU Operator 给节点打的 label nvidia.com/gpu.product 这种信息是怎么来的？为什么 admin 不需要手写？",
+        "answer": "GPU Operator 的子组件 NFD（Node Feature Discovery）+ GFD（GPU Feature Discovery）扫描节点上的 nvidia-smi 信息，自动把 product / driver version / cuda capability / memory / count 等打成 node label。admin 只需要把 GPU Operator 装上，label 就会自动维护、节点更换 GPU 后 label 也会更新。"
+      }
+    ],
+    "mig-partition": [
+      {
+        "text": "MIG 1g.5gb 的 '1g' 和 '5gb' 分别什么意思？1g 占整卡多少算力？",
+        "answer": "1g 表示 1 个 GPU compute slice（A100 共 7 个 slice），5gb 表示 5 GB 显存。1g 大约是整卡 1/7 的 SM 算力。完整命名规范是 <计算 slice 数>g.<显存>gb，常见组合 1g.5gb / 2g.10gb / 3g.20gb / 4g.20gb / 7g.40gb。"
+      },
+      {
+        "text": "为什么一个节点不能同时存在 'MIG 实例' 和 '完整 GPU'？",
+        "answer": "MIG 是 GPU 整卡级的开关，开启 MIG 模式后该卡只能以实例形式被使用，不能同时对外暴露为整卡。所以同一节点上的同一张卡只能二选一。但同节点的不同卡可以独立设置——理论上一节点 8 卡里 4 张 MIG / 4 张整卡是可以的，只是 nvidia plugin 通常配置的粒度是节点级，operator 默认整节点统一。"
+      },
+      {
+        "text": "MIG 实例之间的隔离强度是什么级别？一个实例 OOM 会影响其他实例吗？",
+        "answer": "硬件级隔离。每个 MIG 实例有独立的 SM 子集、独立的 L2 cache 分区、独立的显存控制器和显存切片。一个实例 OOM 只 kill 自己的 cuda context，不影响同卡上其他 MIG 实例的运行。这是和 time-slicing 的根本区别。"
+      }
+    ],
+    "gpu-time-slicing": [
+      {
+        "text": "time-slicing 配置 replicas: 4 之后，一张 V100 在 K8s 里看起来是 4 张 GPU。这 4 张'卡'是同一张物理卡还是不同的？",
+        "answer": "同一张物理卡。device plugin 把同一个 device ID 重复注册了 4 次（带不同的 instance index），K8s 调度层把它们当成 4 个独立资源，但实际启动容器时所有 4 个容器都看到的是同一张物理 GPU 上的同一块显存——它们的 cuda context 在硬件上时间片轮转。"
+      },
+      {
+        "text": "MIG 和 time-slicing 都能让多个 Pod 共享一张 GPU。除了硬件型号（A100+ vs 老卡），它们最关键的差异是什么？",
+        "answer": "隔离强度。MIG 是硬件级隔离——内存和算力都分区，一个故障不影响别的。time-slicing 是软件级 best-effort 共享——内存全共享（一个 OOM 全崩）、算力时间片抢占（一个跑满会饿死别的）。生产任务用 MIG，开发/notebook 共享用 time-slicing。"
+      },
+      {
+        "text": "你给一台 V100 节点开 time-slicing replicas: 4，4 个 Jupyter notebook 都申请 1 卡都调度上了。其中一个 notebook 的代码 import torch 后立刻 OOM 写个 1000GB tensor，其他 3 个会怎样？",
+        "answer": "全部受影响。time-slicing 没有显存隔离——这 4 个 notebook 共享同一张物理卡的全部 16/32GB 显存。一个 notebook 把显存吃光后，另外 3 个的 cuda context 在自己的 kernel 调用里也会 OOM 报错（cudaMalloc failed）。这就是为什么 time-slicing 不能用于生产。"
+      }
+    ],
+    "gpu-quota": [
+      {
+        "text": "ResourceQuota 限制 nvidia.com/gpu 总量为 10，team-A 的 namespace 已用 10 卡。团队再提交一个申请 1 卡的 Pod 会发生什么？",
+        "answer": "admission 拒绝。ResourceQuota 是 admission webhook，在 Pod 创建时立即校验该 namespace 的总申请量是否超过 quota，超过直接 403 拒绝创建。Pod 不会进入 pending 队列，是直接失败。客户端能看到清晰的 'exceeded quota' 错误。"
+      },
+      {
+        "text": "Kueue 的 cohort 借用机制下，A 借了 B 5 张卡正在跑训练，B 突然要回这 5 张。Kueue 怎么处理被 A 占用的训练？",
+        "answer": "通过 preemption。Kueue 检测到 B 的 nominal quota 不足时，找到 A 的'借用 workload'（borrowedQuota > 0），按优先级顺序对其发起 preempt——把对应的 Pod 删掉让 A 的 workload 重新进队列等待。被抢的训练任务如果有 checkpoint 则恢复，没有就丢掉前面的进度。所以借用方应该跑 checkpoint 友好的任务。"
+      },
+      {
+        "text": "ResourceQuota 和 Kueue 各自的最大缺陷是什么？为什么生产里两者经常一起用？",
+        "answer": "ResourceQuota 缺陷：硬上限不能借，资源闲置浪费；Kueue 缺陷：admission 在外部，恶意/出 bug 的客户端可能绕过 Kueue 直接创建 Pod，没有强制力。生产组合：用 Kueue 做'弹性借用 + 调度排队'，再用 ResourceQuota 做'最终安全网'防止被绕过。两层防御。"
+      }
+    ],
+    "gpu-node-isolation": [
+      {
+        "text": "GPU 节点上的 taint 'nvidia.com/gpu=true:NoSchedule' 起到什么效果？为什么不直接禁止非 GPU Pod 调度？",
+        "answer": "taint 让默认 Pod 调度不上去（除非显式 toleration），但允许带 toleration 的 GPU 任务进来。直接'禁止非 GPU Pod' K8s 没有这种二元开关——taint+toleration 才是声明式的方法。这种设计灵活：有些必须跑在每个节点上的 DaemonSet（如日志、监控）可以加 toleration 跑到 GPU 节点上，普通业务 Pod 默认就被挡住。"
+      },
+      {
+        "text": "如果某个普通 web Pod 'tolerations' 写得太宽（toleration 了所有 taint）会发生什么？怎么防御？",
+        "answer": "它会被调度到任何节点包括 GPU 节点，浪费机时。防御方法：(1) PodSecurityAdmission / OPA / Kyverno 策略禁止业务 namespace 的 Pod 用 'operator: Exists' 或 toleration GPU taint；(2) ResourceQuota 限制 namespace 不能申请 nvidia.com/gpu（即使有 toleration 也不会调度）；(3) 审计 + 告警监控不该出现的 toleration。"
+      },
+      {
+        "text": "cluster-autoscaler 看到 pending 的 GPU Pod 会扩 GPU 节点。它怎么知道'GPU 节点'是哪个节点池？",
+        "answer": "通过 node template label。每个云厂商节点池在 ASG/MIG/scale set 上有 tag，autoscaler 读 tag 知道这个节点池启动后会带哪些 label 和 taint，匹配 pending Pod 的 nodeSelector / toleration / nodeAffinity 决定扩哪个池。也支持 priorityExpander 等策略选最便宜的池。"
+      }
+    ],
+    "gang-scheduling": [
+      {
+        "text": "用 default scheduler + 4 个 Pod 的 Job 跑分布式训练，partial scheduling 死锁的具体过程描述一下。",
+        "answer": "Job controller 一次性创建 4 个 Pod，scheduler 一个个调度。前 3 个找到节点上去了，第 4 个因为 GPU 不够 pending。kubelet 看到前 3 个 Pod 已 bind 就启动它们的容器，PyTorch 进程跑 init_process_group 等待 master：world_size=4 但只有 3 个 worker 上线，永远等不到第 4 个。3 个 Pod 占着 GPU 不动，第 4 个 Pod 又抢不到这 3 个占用的资源——死锁。集群里多任务时这种死锁会蔓延，所有任务都 stuck 在 N-1。"
+      },
+      {
+        "text": "PodGroup 的 minAvailable 字段是干嘛的？设成 4 和 设成 3 有什么不同？",
+        "answer": "minAvailable 是'至少多少 Pod 同时被调度才算成功'，调度器只在能凑够 minAvailable 时才同时 bind 它们。设 4 = 必须 4 个一起，设 3 = 允许只调度 3 个（适合容错训练，少一个也能跑）。Volcano / Kueue 都用这个字段实现 gang scheduling，灵活程度取决于训练框架是否允许部分启动。"
+      },
+      {
+        "text": "我已经装了 Volcano 但用 default scheduler 提交 PodGroup 还是死锁，问题在哪？",
+        "answer": "PodGroup 是 Volcano 自己的 CRD，被 Volcano scheduler 才认。default scheduler 看不到 PodGroup 标记，按普通 Pod 一个个调度——绕过了 gang 逻辑。修法：Pod yaml 里加 schedulerName: volcano，明确告诉 K8s 用 Volcano 调度。Training Operator 通常自动加。"
+      }
+    ],
+    "volcano-scheduler": [
+      {
+        "text": "Volcano 的 binpack 插件解决什么问题？什么场景必须开？",
+        "answer": "解决 GPU 集群碎片问题。默认调度倾向'分散'——把任务铺到不同节点。但 GPU 任务越分散越不好（跨节点通信慢、资源碎片），binpack 让调度器优先把任务塞满已有节点而不是分散到新节点。GPU 集群必须开，否则 100 张卡的集群可能因为碎片实际只能跑得动需要 80 张卡的任务。"
+      },
+      {
+        "text": "Volcano 的 fairshare 插件按什么算公平？multi-tenant 场景下它和 kueue 的 cohort 概念是不是一回事？",
+        "answer": "fairshare 通常按 DRF（Dominant Resource Fairness）—— 多个资源维度时按'各 tenant 占自己最紧缺资源的比例'公平分配。和 Kueue cohort 不是一回事：fairshare 是调度时的资源分配算法，cohort 是配额借用模型。两者可以配合，也可以单用。"
+      },
+      {
+        "text": "Volcano 抢占低优先级任务时，被抢的 Pod 是 SIGKILL 立刻杀掉还是有 grace period？训练任务怎么自保？",
+        "answer": "走 K8s 标准 Pod 删除流程：发 deletionTimestamp、preStop hook、SIGTERM、grace period 倒数后 SIGKILL。训练任务自保的方法是配 preStop hook 触发紧急 checkpoint（写到共享存储），同时把 terminationGracePeriodSeconds 设大一些（如 300 秒）让 checkpoint 写完再被杀。"
+      }
+    ],
+    "kueue-queue": [
+      {
+        "text": "Kueue 的 'admission' 和 K8s scheduler 的 'scheduling' 分别在做什么？为什么要分开？",
+        "answer": "Kueue admission 决定 'workload 现在能不能开始排队尝试调度'——基于 ClusterQueue 配额、cohort 借用、优先级。决定能后把 workload 对应的 Job suspend 字段设为 false，default scheduler 才看得到 Pod 并尝试 bind。分开的好处是 Kueue 不替换 scheduler，只控制队列入口，对 K8s 升级和兼容性最友好。"
+      },
+      {
+        "text": "ClusterQueue 和 LocalQueue 的关系是什么？为什么要两层？",
+        "answer": "ClusterQueue 是集群 admin 管理的资源池配置（这里有多少 GPU、CPU、memory），跨 namespace。LocalQueue 是用户在自己 namespace 创建的引用，指向某个 ClusterQueue。两层的原因：admin 集中管资源配额，用户只看自己 namespace 里的 LocalQueue 不需要看集群层。同一个 ClusterQueue 可以被多个 LocalQueue 引用，实现多团队共享一个池。"
+      },
+      {
+        "text": "Kueue 不自己做调度的最大缺点是什么？",
+        "answer": "无法做 gang scheduling 的真实'同时 bind'——Kueue 把 workload 的 Job suspend 设 false 后，default scheduler 仍然是一个个 Pod 尝试，理论上可能 partial。解法是 Kueue 集成 PodGroup（通过 scheduler plugins）或者依赖 Job controller 自己等所有 Pod ready 才开始。最严格的 gang 还是要 Volcano 或者自定义 scheduler 配合。"
+      }
+    ],
+    "training-operator": [
+      {
+        "text": "PyTorchJob 帮你自动注入了 MASTER_ADDR / MASTER_PORT / WORLD_SIZE / RANK 这些环境变量。它是怎么知道 master Pod 的地址的？",
+        "answer": "Operator 创建一个 headless Service 指向 master Pod（用 selector 匹配），这个 Service 的 DNS 名是确定的（如 <jobname>-master-0），所有 worker Pod 通过这个 DNS 解析 master 地址。MASTER_ADDR 注入的就是这个 DNS 名。Pod 重启 IP 变了 DNS 也会更新，不影响。"
+      },
+      {
+        "text": "MPIJob 启动时为什么要在 worker 镜像里装 SSH server？",
+        "answer": "MPI 协议靠 launcher Pod 通过 SSH 远程登录到 worker Pod 启动 mpirun 进程。worker 镜像必须有 sshd 跑起来 + 认证 key 配好（通常 mountKey volume），launcher 才能连过去执行命令。这是和 PyTorchJob（每个 Pod 自启 python 进程，靠 c10d 协议互联）的根本区别。"
+      },
+      {
+        "text": "PyTorchJob 的 worker Pod 挂了一个，Operator 默认会怎么处理？",
+        "answer": "看 spec 里的 restartPolicy。常见值 OnFailure（容器失败重启）、Never（不重启 Pod 失败）、ExitCode（按 exit code 决定）。Operator 检测到 Pod terminate 后按策略要么重建一个新 Pod（带相同 rank），要么把整个 Job 标 Failed。重建后的新 Pod 会重新 join 训练但已经丢了未 checkpoint 的进度——所以 elastic training + checkpoint 才是真正的容错方案。"
+      }
+    ],
+    "nccl-rdma": [
+      {
+        "text": "NCCL_DEBUG=INFO 之后启动训练，日志里出现 'NET/Socket' 而不是 'NET/IB'，意味着什么？怎么修？",
+        "answer": "意味着 NCCL 跨节点退化到了 TCP socket，没用 RDMA。可能原因：(1) Pod 没申请 rdma/ib 资源；(2) Multus 第二张 NIC 没起来；(3) NCCL_IB_HCA 环境变量没设或设错了 HCA 名字；(4) IB driver / OFED 在节点上没装好。修：检查 Pod 内 ibstat / show_gids 看 IB 设备是否可用，再检查 NCCL_IB_HCA / NCCL_SOCKET_IFNAME 等环境变量。"
+      },
+      {
+        "text": "GPUDirect RDMA 比普通 RDMA 又快在哪？",
+        "answer": "普通 RDMA：GPU 内存 → host memory（cudaMemcpy）→ NIC → 网络。GPUDirect RDMA：GPU 内存 → NIC（直接通过 PCIe peer-to-peer）→ 网络。少了一次 GPU↔CPU memory 拷贝和一次 PCIe 反复，延迟低、CPU 开销低、吞吐高。需要 GPU、NIC、PCIe 拓扑都支持 P2P（同 PCIe root complex 下）。"
+      },
+      {
+        "text": "为什么节点内多卡通信不需要 RDMA？",
+        "answer": "节点内卡间走 NVLink 或 PCIe，是物理直连不需要走网络栈。NCCL 在节点内会自动用 SHM（shared memory）或 NVLink P2P 传输，带宽远高于任何网络传输。RDMA 只解决跨节点的'网络'路径性能问题。"
+      }
+    ],
+    "k8s-rdma": [
+      {
+        "text": "Multus 给 Pod 加第二张 NIC 的工作原理是什么？为什么 default CNI 不能直接做？",
+        "answer": "Multus 是 'meta CNI plugin'——它包装真正的 CNI。kubelet 调用 Multus，Multus 读 Pod annotation 里的 NetworkAttachmentDefinition 列表，依次调用每个对应的 CNI（一个负责 eth0 默认网络、一个负责 net1 RDMA 网络）。default CNI 一次只创一张 iface，不支持声明 'Pod 我要 N 张接不同网络的 iface'，所以需要 Multus 这一层。"
+      },
+      {
+        "text": "SR-IOV 的 VF 是什么？为什么用它来给 Pod 提供 RDMA？",
+        "answer": "SR-IOV（Single Root I/O Virtualization）是 PCIe 标准，把一张物理 NIC 切成多个 Virtual Function（VF），每个 VF 在 OS 看来就是一张独立的 PCIe 网卡。Pod 拿到一个 VF 就能直接做 RDMA verbs（绕过 host 内核），相当于'物理网卡的一部分'。比共享一张物理 NIC 性能好（独立队列、独立中断），比给每个 Pod 一张物理卡又便宜。"
+      },
+      {
+        "text": "Pod 启动后用 'ip addr' 看到 eth0 + net1 两张网卡，NCCL 怎么知道要用 net1 走 RDMA 而不是 eth0 走 TCP？",
+        "answer": "通过环境变量 NCCL_SOCKET_IFNAME=net1（明确告诉 NCCL 用哪张 iface 做 socket 通信）+ NCCL_IB_HCA=mlx5_0（告诉 NCCL 用哪个 IB HCA 做 RDMA）。NCCL 会根据这些 env 选传输路径。如果不设默认会按它的 priority 自动尝试。"
+      }
+    ],
+    "checkpoint-elastic": [
+      {
+        "text": "checkpoint 写一次 30 GB 阻塞训练 2 分钟。如果训练总时长 24 小时希望 checkpoint 开销不超过 2%，频率应该多少？",
+        "answer": "2% × 24h = 28.8 分钟。每次 checkpoint 阻塞 2 分钟，所以一天最多 14 次。即每 24/14 ≈ 1.7 小时一次 checkpoint。生产上常 round 成 'every 1 hour'，节奏好记。也可以设 step-based（每 N 个 step）让间隔更稳定。"
+      },
+      {
+        "text": "PyTorch torchrun --elastic 怎么知道现在 worker 数变了？rendezvous 是干什么的？",
+        "answer": "torchrun --elastic 启动后所有 worker 通过 rendezvous（c10d 或 etcd backend）注册自己，rendezvous server 维护当前 alive worker 集合并周期性检查心跳。当成员变化（多了或少了）时 rendezvous 触发一次 'reconfiguration'，所有 worker 重新协商 rank、world_size，从最近的 checkpoint 继续训练。这是 'elastic' 的核心机制。"
+      },
+      {
+        "text": "为什么说 elastic training 一定要配合共享 checkpoint 存储？用本地 nvme 不行吗？",
+        "answer": "elastic 的关键是 worker 数变化后剩余 worker 能从最新 checkpoint 接着跑。如果 checkpoint 写在本地 nvme，挂掉的那个 worker 上的 checkpoint 拿不到了；新加入的 worker 读不到任何 checkpoint。必须是所有 worker 都能读写的共享存储（S3 / 分布式 FS / NFS）才能做到无缝接管。"
+      }
+    ],
+    "gpu-monitoring": [
+      {
+        "text": "DCGM_FI_DEV_GPU_UTIL 是 95% 但训练慢，可能是什么导致的？",
+        "answer": "GPU_UTIL 只衡量'有 kernel 在跑'的时间百分比，不衡量这些 kernel 跑得多充分。常见原因：(1) batch size 太小，每个 kernel 只用了一小部分 SM，SM occupancy 实际很低；(2) memory-bound——kernel 在等显存而不是算；(3) python 主线程在 dataloader 等数据，GPU 处理数据后空转等下一批；(4) 大量小 kernel launch overhead 累积。"
+      },
+      {
+        "text": "DCGM_FI_PROF_SM_OCCUPANCY 和 DCGM_FI_DEV_GPU_UTIL 哪个更能准确反映训练效率？",
+        "answer": "SM_OCCUPANCY 更准。它衡量的是 SM 上活跃 warp 数 / 最大 warp 数，反映了 GPU 算力是否被真正利用。GPU_UTIL 是个粗指标——只要有 kernel 在跑就算，哪怕这个 kernel 只用了 1% 的 SM 也算 100% utilization。生产里看效率应该看 SM_OCCUPANCY + memory bandwidth utilization 组合。"
+      },
+      {
+        "text": "你想做一个 SLI 'PyTorchJob X 的 GPU 实际效率'，DCGM exporter 默认指标里没有 'job 标签'，怎么办？",
+        "answer": "DCGM exporter 默认按 GPU device 或 Pod label 上报。要把 PyTorchJob 的 label 关联进指标，需要：(1) Prometheus 的 kube-state-metrics 也开 Pod label 上报，做 join；(2) Grafana / Prometheus query 用 label_replace 或 group_left 把 Pod 的 'training.kubeflow.org/job-name' label join 进 DCGM 指标；(3) 或者用 NVIDIA GPU Operator 的 dcgm-exporter helm chart，它支持自动 enrich Pod metadata。"
+      }
+    ]
+  }
+}
