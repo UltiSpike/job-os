@@ -1,0 +1,52 @@
+/* ─────────────────────────────────────────
+   Design tokens — Terminal-Editorial
+   黑底米白 · 衬线对比等宽 · 发丝边
+   ───────────────────────────────────────── */
+
+:root {
+  /* canvas */
+  --ink:        #0c0a08;
+  --ink-2:      #14110d;
+  --ink-3:      #1c1814;
+  --paper:      #f4ede4;
+  --paper-2:    #ebe2d4;
+  --paper-3:    #ddd1bd;
+
+  /* type */
+  --bone:       #e8e1d4;
+  --bone-dim:   #aea799;
+  --bone-soft:  #756f63;
+  --char:       #1a1612;
+  --char-dim:   #5a4f42;
+  --char-soft:  #8b7d6a;
+
+  /* accents */
+  --amber:      #c47b2a;
+  --amber-hi:   #e09438;
+  --amber-soft: #6b4514;
+  --rust:       #a8332b;
+  --rust-soft:  #4a1812;
+  --sage:       #6b8e6b;
+  --sage-soft:  #2c3e2c;
+  --slate:      #4a5560;
+  --plum:       #6b3a52;
+
+  /* hairlines */
+  --line:       rgba(232, 225, 212, 0.18);
+  --line-2:     rgba(232, 225, 212, 0.32);
+  --line-3:     rgba(232, 225, 212, 0.5);
+  --line-paper: rgba(26, 22, 18, 0.18);
+  --line-paper-2: rgba(26, 22, 18, 0.34);
+
+  /* fonts */
+  --font-serif: "Fraunces", "Times New Roman", "Songti SC", "Noto Serif CJK SC", serif;
+  --font-mono:  "JetBrains Mono", "SF Mono", "Menlo", "Consolas", monospace;
+
+  /* rhythm */
+  --u: 8px;
+  --col: 1320px;
+
+  /* motion */
+  --ease: cubic-bezier(0.2, 0.7, 0.2, 1);
+  --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+}

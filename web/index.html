@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>job-os ~ 求职操作台</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght,SOFT@0,9..144,300..900,0..100;1,9..144,300..900,0..100&family=JetBrains+Mono:wght@300;400;500;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/styles/tokens.css">
+<link rel="stylesheet" href="/styles/base.css">
+<link rel="stylesheet" href="/styles/views.css">
+</head>
+<body>
+
+<div class="grain"></div>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <div class="brand">
+      <span class="brand-mark">◆</span>
+      <span class="brand-name">job<span class="dim">·</span>os</span>
+      <span class="brand-tag">求职操作台 / v3</span>
+    </div>
+    <nav class="tabs" id="tabs"></nav>
+    <div class="topbar-meta">
+      <span class="clock" id="clock">--:--:--</span>
+      <button class="ghost-btn" data-action="open-settings" title="配置">⚙</button>
+    </div>
+  </div>
+  <div class="cli-bar">
+    <span class="cli-prompt">~/job-os</span>
+    <span class="cli-sep">$</span>
+    <span class="cli-cmd" id="cli-cmd">today</span>
+    <span class="cli-cursor">_</span>
+    <span class="cli-status" id="cli-status">ready</span>
+  </div>
+</header>
+
+<main id="root">
+  <div class="boot">
+    <div class="boot-line">[boot] mounting job-os …</div>
+  </div>
+</main>
+
+<div class="toast-stack" id="toast-stack"></div>
+<div class="modal-host" id="modal-host"></div>
+
+<script type="module" src="/app.js"></script>
+</body>
+</html>

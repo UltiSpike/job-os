@@ -1,0 +1,217 @@
+{
+  "track": {
+    "slug": "k8s",
+    "name": "Kubernetes",
+    "description": "从控制器模型到生产排障的 K8s 体系化课程。覆盖面试中追问最深的几个核心区域，强调'能解释 + 能写 + 能排障'三层。"
+  },
+  "modules": [
+    {
+      "slug": "k8s-core-controllers",
+      "order_index": 1,
+      "name": "核心对象与控制器模型",
+      "description": "K8s 一切设计的根：声明式 API、reconcile loop、各类 workload 控制器的差异与适用边界。这一模块通了，后面所有模块都不再是死记硬背。",
+      "lessons": [
+        {
+          "slug": "declarative-reconcile",
+          "order_index": 1,
+          "name": "声明式 API 与 reconcile loop",
+          "prereq": [],
+          "est_minutes": 25,
+          "concept_md": "K8s 不是一个'执行命令'的系统，而是一个'不断把现实拽向期望'的系统。用户通过 yaml 声明 desired state，控制器在后台跑一个永不停止的循环：观察 actual state → 比较 desired state → 计算 diff → 发起修正动作 → 再观察。这个循环叫 reconcile loop。\n\n关键性质有三个。第一，**level-triggered, not edge-triggered**：控制器不关心'发生了什么事件'，只关心'当前是什么状态'。即使错过 100 个事件，只要最后看到的状态是对的，就能收敛——这是 K8s 高可用的根基。第二，**幂等**：同一个 desired state 反复 reconcile，结果应该一致。第三，**最终一致**：reconcile 是异步的，apply 完不代表立刻生效。\n\n理解这一点，就能解释为什么 `kubectl apply` 不报错不代表成功、为什么删除 namespace 会卡住、为什么 controller 重启后不需要'恢复进度'——因为它本来就不依赖进度，只看当前状态。",
+          "capstone": {
+            "prompt": "用一段话向一个只会写 imperative 脚本的同事解释：为什么 K8s 选择 level-triggered reconcile 而不是 edge-triggered 事件驱动？分别从'丢事件'、'controller 重启'、'多副本控制器'三个角度举例说明 level-triggered 的好处。",
+            "depth": 2
+          }
+        },
+        {
+          "slug": "pod-lifecycle",
+          "order_index": 2,
+          "name": "Pod 生命周期与多容器模式",
+          "prereq": ["declarative-reconcile"],
+          "est_minutes": 30,
+          "concept_md": "Pod 是 K8s 的最小调度单位——但'最小'不等于'单容器'。一个 Pod 是一组共享 network namespace、IPC、（可选的）volume 的容器集合，它们一定被调度到同一个节点。\n\nPod 的生命周期阶段：Pending → Running → Succeeded/Failed，加一个特殊的 Unknown。每次状态推进都会生成 events，是排障第一手材料。但更重要的是 **container** 的生命周期：initContainers 顺序串行执行、全部成功才进入主容器；主容器之间并行启动；postStart hook 在容器启动时触发但**不阻塞** readiness；preStop hook 在删除前触发，与 terminationGracePeriodSeconds 配合决定优雅关闭窗口。\n\n多容器 Pod 三种经典模式：**sidecar**（日志采集、service mesh proxy，与主容器同生命周期）、**ambassador**（代理外部依赖，主容器只跟 localhost 说话）、**adapter**（标准化主容器输出格式）。1.28+ 引入的 native sidecar 实际上是把 sidecar 实现成一个'重启策略为 Always 的 initContainer'，解决了'sidecar 比主容器晚启动 / 早关闭'的老问题。",
+          "capstone": {
+            "prompt": "你有一个主容器需要在启动前等待数据库 schema 迁移完成、运行时需要一个 Envoy 边车做 mTLS、关闭时需要给一个外部注册中心 deregister。请用 yaml 写出这个 Pod 的关键片段（initContainer / native sidecar / preStop hook / terminationGracePeriodSeconds），并解释每一段为什么必须放在它所在的位置。",
+            "depth": 3
+          }
+        },
+        {
+          "slug": "deployment-rollout",
+          "order_index": 3,
+          "name": "ReplicaSet 与 Deployment 滚动更新",
+          "prereq": ["pod-lifecycle"],
+          "est_minutes": 30,
+          "concept_md": "Deployment 不直接管理 Pod，它管理 ReplicaSet，由 ReplicaSet 管理 Pod。这一层间接是滚动更新的基础：每次 `kubectl set image` 或修改 template，Deployment controller 会**新建**一个 ReplicaSet（hash 由 pod template 算出），然后逐步把新 RS 的副本数往上调、旧 RS 的副本数往下调。\n\n两个核心参数：`maxSurge`（更新过程中允许超出 desired replicas 的数量）和 `maxUnavailable`（允许低于 desired 的数量）。两者都可以是绝对数或百分比。举例 replicas=10, maxSurge=25%, maxUnavailable=25%：任意时刻 Pod 总数在 [8, 13] 之间，意味着新旧 RS 副本数可能是 (旧=8,新=2)→(7,3)→...→(0,10)。\n\n滚动失败的常见原因不是 controller 出错，而是新 RS 的 Pod **永远不 ready**——比如 readinessProbe 一直失败，导致 maxUnavailable 算上后无法继续推进。`kubectl rollout status` 卡住时，应该去看新 RS 下 Pod 的 events 而不是 Deployment 本身。回滚 (`kubectl rollout undo`) 的本质是把 spec.template 改回旧 RS 对应的 template hash，于是 controller 又把流量切回旧 RS——旧 RS 默认会保留 `revisionHistoryLimit` 个，超过就被清理。",
+          "capstone": {
+            "prompt": "一个 Deployment 有 10 个副本，maxSurge=2, maxUnavailable=1。新版本镜像有一个 bug：Pod 启动 30 秒后会因为内存泄漏被 OOMKill，但 readinessProbe 在前 20 秒一直返回 200。请按时间顺序描述 rollout 会发生什么、最终会卡在什么状态、kubectl rollout status 会显示什么、为什么 K8s 没能自动止损。然后说明你会如何配置 readinessProbe / startupProbe / progressDeadlineSeconds 来让它能自动止损。",
+            "depth": 3
+          }
+        },
+        {
+          "slug": "statefulset-identity",
+          "order_index": 4,
+          "name": "StatefulSet 的 identity 与有序性",
+          "prereq": ["deployment-rollout"],
+          "est_minutes": 25,
+          "concept_md": "Deployment 假设 Pod 是无状态可替换的——挂一个起一个，名字 ID 都随机。StatefulSet 反过来：每个 Pod 有**稳定的网络身份**（`name-0`, `name-1`, ...）和**稳定的存储**（每个序号绑定独立 PVC，Pod 重建后挂回原来的卷）。\n\n这带来三个独有性质。**有序部署/扩缩**：Pod 0 必须 Ready 后才会创建 Pod 1。**有序滚动更新**：从最大序号往最小序号反向滚动，每个 Pod 必须 Running+Ready 后才动下一个。**稳定 DNS**：搭配 headless Service，每个 Pod 有 `pod-0.svc.namespace.svc.cluster.local` 这种可预测的域名，让 etcd / Kafka / ZooKeeper 这种'成员需要互相寻址'的系统能跑起来。\n\n常见误区：StatefulSet **不**自动备份数据、**不**做 leader election、**不**保证副本之间数据一致——它只保证 identity 的稳定性，剩下的'有状态语义'是应用自己的事。另一个坑：缩容时序号大的先删，但 PVC 默认**不**会被删——这是有意的，防止误操作丢数据。要清掉得手动 `kubectl delete pvc`。",
+          "capstone": {
+            "prompt": "假设你要在 K8s 上部署一个 3 节点的 etcd 集群。请回答：(1) 为什么必须用 StatefulSet 而不是 Deployment；(2) headless Service 在这里起什么作用、不要它会怎样；(3) 如果你 `kubectl scale sts etcd --replicas=2` 缩容到 2 节点，etcd 集群本身会出什么问题？K8s 层面会发生什么、不会发生什么？",
+            "depth": 3
+          }
+        },
+        {
+          "slug": "daemonset-scheduling",
+          "order_index": 5,
+          "name": "DaemonSet 的调度特殊性",
+          "prereq": ["deployment-rollout"],
+          "est_minutes": 20,
+          "concept_md": "DaemonSet 的语义是'每个（符合条件的）节点上跑一份'。典型用途：日志采集 (fluentd)、监控 agent (node-exporter)、CNI/CSI 的 node 组件、kube-proxy 自己。\n\n它的调度路径**历史上**是特殊的——早期版本由 DaemonSet controller 直接绕过 scheduler 创建 Pod，因为'每个节点一个'这个事实不需要调度决策。1.12 之后改由默认 scheduler 调度，通过给 Pod 加 `nodeAffinity` 实现，这样 DS Pod 也能享受 taints/tolerations、preemption、topology 等通用机制。所以现在面试问'DS 是不是不走 scheduler'，标准答案是**早期不走，现在走**。\n\nDS 默认会容忍一组 critical taints（如 `node.kubernetes.io/not-ready`、`unschedulable`），保证节点出问题时关键 agent 仍能运行——这也是 kube-proxy / CNI 必须用 DS 部署的原因。\n\n升级策略两种：`OnDelete`（手动删 Pod 才更新，最保守）和 `RollingUpdate`（按 maxUnavailable 滚）。注意 DS 没有 maxSurge——同一个节点上不可能同时跑两份。这就意味着滚动期间节点上必然有窗口期没有该 agent，对 CNI 这种关键组件需要特别小心。",
+          "capstone": {
+            "prompt": "你的集群里 fluentd 用 DaemonSet 部署，最近有新加入的 GPU 节点上 fluentd Pod 一直 Pending。kubectl describe 显示 'no nodes available, 3 node(s) had untolerated taint'。请解释：(1) 为什么 DS 还是会受 taints 影响——不是说 DS 默认容忍很多 taint 吗？(2) 你会怎么修，给两种方案并说明各自的副作用。",
+            "depth": 2
+          }
+        },
+        {
+          "slug": "job-cronjob",
+          "order_index": 6,
+          "name": "Job / CronJob 与失败语义",
+          "prereq": ["pod-lifecycle"],
+          "est_minutes": 25,
+          "concept_md": "Job 跑一次性任务，关心'跑完'而不是'一直在跑'。三个核心字段决定语义：`completions`（要成功多少次才算 Job 成功）、`parallelism`（同时最多跑多少个 Pod）、`backoffLimit`（失败重试上限，超过就标记 Job Failed）。\n\n三种使用模式：(1) 单次任务 completions=1, parallelism=1，最常见；(2) 固定数量并行 completions=N, parallelism=M，比如要处理 100 个分片，每次跑 10 个；(3) 工作队列模式 completions 不设，parallelism=N，每个 Pod 自己从队列拉任务，全部都 exit 0 才算结束。\n\n失败语义的几个坑。**backoffLimit 计算的是 Pod 失败次数，不是容器**——容器内进程 crash 后 kubelet 会按 restartPolicy 重启，restartPolicy=OnFailure 时 Pod 不算失败、不计入 backoffLimit；只有 restartPolicy=Never 或 Pod 整体被驱逐才计数。**activeDeadlineSeconds** 是 Job 级别的硬超时，到点直接终止所有 Pod 并标 Failed，**优先级高于 backoffLimit**。\n\nCronJob 是 Job 的定时调度器，每次触发就创建一个新 Job。`concurrencyPolicy` 决定上一个还没跑完时怎么办：Allow（默认，并发跑）、Forbid（跳过新的）、Replace（杀掉旧的）。`startingDeadlineSeconds` 控制错过触发时间多久后还要不要补跑——这个值过短会导致 controller 重启时丢掉本该补跑的任务，过长又会一次性补跑一堆。",
+          "capstone": {
+            "prompt": "你需要实现一个数据导入任务：每天凌晨 2 点跑一次，要把 1000 个分片导入 DB，希望并行度 20。任务必须保证'每个分片至少导一次'但允许重复（下游有幂等）。请：(1) 写出 CronJob 的关键 spec（completions/parallelism/backoffLimit/concurrencyPolicy/restartPolicy 都要给出值并说明理由）；(2) 如果某天 controller-manager 挂了 6 小时，错过了凌晨 2 点这次触发，会发生什么？你希望它发生什么？相应的 startingDeadlineSeconds 应该设多少？",
+            "depth": 3
+          }
+        },
+        {
+          "slug": "controller-pattern",
+          "order_index": 7,
+          "name": "Controller 模式：list-watch + workqueue",
+          "prereq": ["declarative-reconcile"],
+          "est_minutes": 35,
+          "concept_md": "所有 controller 的内部结构高度一致，理解一个就理解全部。数据流是：apiserver → informer (list+watch) → 本地 cache + event handler → workqueue → reconcile worker。\n\n**list-watch**：controller 启动时先 list 一次拿全量（建立 baseline），然后开 watch 长连接接增量事件 (ADDED/MODIFIED/DELETED)。watch 用 HTTP chunked 流，每个事件带一个 resourceVersion 单调递增。watch 中断时按最后 RV 重连；如果 RV 太旧 apiserver 已经 compact 掉了，会返回 410 Gone，client 就重新 list（这叫 **relist**）。\n\n**informer + cache**：informer 把所有事件应用到一个本地 thread-safe store（即 lister 背后的 cache），后续 controller 读对象都读 cache 而不是打 apiserver——这是 K8s 能横向扩展的关键，apiserver 不会被 controller 的查询打爆。代价是 cache 有几毫秒到几秒的延迟，所以 controller 写完一个对象**不能**立刻 list 出来——要走 reconcile 重试。\n\n**workqueue**：event handler 不直接做 reconcile，只是把对象的 namespace/name 塞进 workqueue。workqueue 有三个关键性质：去重（同一个 key 入队多次只处理一次）、限速（rate limiter，失败重试用指数退避）、延迟入队（DelayingInterface，支持 'X 秒后再处理'）。worker 从队列取 key，从 cache 拿对象，跑 reconcile。\n\n这套结构解释了几件事：为什么 controller 能水平复制做 leader election（多副本只有 leader 在 reconcile，但所有副本都在 list-watch 维护 cache）、为什么 reconcile 必须幂等（同一个 key 会被处理多次）、为什么 controller 失败重试是指数退避（workqueue 内置）。",
+          "capstone": {
+            "prompt": "请画出（用文字描述也行）一个 Deployment controller 从'用户 kubectl apply' 到 'Pod 被创建'的完整数据流，必须经过：apiserver → informer → cache → event handler → workqueue → reconcile → 写回 apiserver → kubelet 看到 → 启动容器。在每一步指出：(a) 哪一步是异步的，(b) 哪一步可能丢/重，(c) 为什么 reconcile 必须幂等。",
+            "depth": 3
+          }
+        },
+        {
+          "slug": "owner-reference-gc",
+          "order_index": 8,
+          "name": "OwnerReference 与级联 GC",
+          "prereq": ["controller-pattern"],
+          "est_minutes": 20,
+          "concept_md": "K8s 的对象关系不是数据库外键，而是通过 `metadata.ownerReferences` 表达的**软引用**。Deployment 创建 ReplicaSet 时，会在 RS 的 ownerReferences 里写自己；RS 创建 Pod 时同理。这条链让删除 Deployment 能级联删 RS 和 Pod。\n\n执行级联删除的是一个独立的 controller：**garbage collector**。它 watch 所有资源，构建 owner→dependent 的反向索引，当 owner 被删除时，按 propagation policy 处理 dependents：\n\n- **Background**（默认）：apiserver 立刻返回成功，GC 在后台异步删 dependents。\n- **Foreground**：apiserver 给 owner 加 finalizer `foregroundDeletion`，先删完所有 dependents 才真正删 owner——`kubectl delete --cascade=foreground` 触发。\n- **Orphan**：解除 ownerReference，dependents 留着变孤儿——`--cascade=orphan` 触发，常用于'换控制器接管'。\n\nfinalizer 是另一个常被混淆的机制。它不是 GC 的内部实现，而是给**任何**控制器提供的'删除前钩子'——对象进入 deletion 状态后（设置了 deletionTimestamp），只要 finalizers 列表非空就**不会真正删除**。controller 做完清理（比如释放云资源、解绑外部 LB）后自己 patch 把 finalizer 摘掉，对象才消失。这就是为什么 namespace 经常卡在 Terminating——某个 finalizer 永远不会被摘掉。",
+          "capstone": {
+            "prompt": "你 `kubectl delete deployment foo` 之后立刻 `kubectl get pods -l app=foo`，发现 Pod 还在 Running。请回答：(1) 这正常吗？背后发生了什么？(2) 如果你想要'删完 Pod 才返回'，命令该怎么改？(3) 如果你想'保留 Pod 但删掉 Deployment'，命令该怎么改？(4) 半小时后你发现 namespace 卡在 Terminating，怎么排查到底是哪个对象的哪个 finalizer 卡住了？",
+            "depth": 3
+          }
+        }
+      ]
+    },
+    {
+      "slug": "k8s-networking",
+      "order_index": 2,
+      "name": "网络",
+      "description": "K8s 网络是面试追问深度最大的区域。这一模块的目标：能从 Pod IP 一层层下钻到 iptables 规则、再到 CNI 数据面，每一层都能解释为什么这样设计。",
+      "lessons": [
+        {
+          "slug": "pod-network-model",
+          "order_index": 1,
+          "name": "Pod 网络模型与'每 Pod 一 IP'",
+          "prereq": [],
+          "est_minutes": 25,
+          "concept_md": "K8s 网络模型有三条铁律：(1) 每个 Pod 一个独立 IP；(2) 所有 Pod 之间可以直接互通，**不经过 NAT**；(3) 节点上的 agent（kubelet 等）可以直接和该节点上所有 Pod 互通。\n\n这三条听起来朴素，但意味着 K8s **不自己实现网络**——它只规定模型，具体怎么让两个节点上的 Pod 互通，是 CNI 插件的事。这是和 Docker 默认网络（每节点一个 bridge，跨节点要靠 NAT 或 overlay）的根本区别。\n\n'每 Pod 一 IP' 的实现关键是 Pod 内的 **pause 容器**（infra container）：它先创建 network namespace，其他容器加入这个 ns 共享网络栈。所以 Pod 内多容器共享 localhost、共享端口空间——两个容器不能同时监听 8080。\n\n这条模型反推出几件事：(a) Service 不是必须的，理论上你可以直接用 Pod IP 通信；Service 存在是因为 Pod IP 会变。(b) NetworkPolicy 是给这个'默认全通'模型加限制的工具，没有它就是默认互通。(c) hostNetwork=true 的 Pod 直接用宿主机的 network ns，不再有独立 IP，但能直接访问宿主机上的所有端口——常用于 CNI / kube-proxy 这种基础组件。",
+          "capstone": {
+            "prompt": "请用'两个节点上各有一个 nginx Pod，A 上的 curl B 的 Pod IP'这个最小场景，描述包从离开 A Pod 的 eth0 到进入 B Pod 的 eth0 之间，**最少**经过哪些虚拟设备 / 物理设备。然后回答：CNI 插件在这个路径里负责的是哪一段？K8s 自己负责的是哪一段？",
+            "depth": 3
+          }
+        },
+        {
+          "slug": "service-clusterip",
+          "order_index": 2,
+          "name": "Service / ClusterIP 是什么（不是什么）",
+          "prereq": ["pod-network-model"],
+          "est_minutes": 30,
+          "concept_md": "ClusterIP 是 K8s 里最容易被误解的对象。它**不是一个真实存在的 IP**——你 ping 它有时通有时不通，你抓包永远抓不到这个 IP 出现在网线上。它的本质是 **kube-proxy 在每个节点的 netfilter 规则里编程出来的一个'被劫持的虚拟 IP'**。\n\n工作流程：(1) 你创建一个 Service，apiserver 从 service-cluster-ip-range 里分一个 IP；(2) endpoints controller watch 到这个 Service 和它的 selector 匹配的 Pod，把 Pod IP 列表写进 Endpoints（或 EndpointSlice）对象；(3) 每个节点上的 kube-proxy watch Service 和 EndpointSlice，把'目的 IP=ClusterIP 端口=ServicePort 的包，DNAT 到一个随机后端 Pod IP'这条规则写进本地的 iptables / ipvs / nftables。\n\n所以**Service 是一个分布式的 DNAT 规则集**，不是一个进程，不是一个代理（除了 userspace 模式，那个早就废弃了）。这解释了几件事：(a) 抓不到 ClusterIP 上的流量，因为它在 PREROUTING 链里就被改写成 Pod IP 了；(b) Service 没有'故障'的概念——kube-proxy 在每个节点独立工作，挂一个不影响其他节点；(c) Service 不做负载均衡的健康检查，它只看 Endpoints——而 Endpoints 由 readiness probe 驱动。\n\n一个常被忽略的细节：包从 Pod 出去访问 ClusterIP 时，DNAT 发生在**源 Pod 所在节点**的 iptables 上，不是目标 Pod 所在节点。这就是为什么 kube-proxy 必须每个节点都跑。",
+          "capstone": {
+            "prompt": "向一个声称'Service 就是个反向代理'的同事解释他错在哪。请回答：(1) 如果 Service 是反向代理，那这个'代理进程'跑在哪？为什么 `kubectl get pods -A` 看不到？(2) 为什么把所有节点的 kube-proxy 都停了，已经建立的 TCP 连接还能继续，但新连接建不起来？(3) 一个 Pod 访问 ClusterIP，DNAT 发生在源节点还是目标节点？答案影响的是什么场景？",
+            "depth": 3
+          }
+        },
+        {
+          "slug": "kube-proxy-modes",
+          "order_index": 3,
+          "name": "kube-proxy 的 iptables vs ipvs 模式",
+          "prereq": ["service-clusterip"],
+          "est_minutes": 30,
+          "concept_md": "kube-proxy 有三种数据面模式（userspace 已废弃）：iptables（默认）、ipvs、nftables（1.29+ beta）。三者都解决同一个问题：把 ClusterIP+Port 的流量分发到后端 Pod。差异在于规则组织方式和性能特性。\n\n**iptables 模式**：每个 Service 对应一条 KUBE-SERVICES 链规则把流量跳到 KUBE-SVC-XXX 子链，子链里用 statistic match 按概率随机跳到 KUBE-SEP-YYY（每个 endpoint 一条），最终在 KUBE-SEP 链里 DNAT。规则数随 Service × Endpoints 线性增长。问题是 iptables 是**线性匹配**——找一条规则要从头扫到尾，O(n)。在 5000+ Service 的集群里，加一条规则可能要重写整个表，rule update 延迟到秒级。\n\n**ipvs 模式**：把负载均衡逻辑从 iptables 移到内核的 IPVS 子系统。IPVS 用 hash table 做规则查找，O(1)；支持更多 LB 算法（rr/lc/dh/sh/sed/nq）；规则更新是增量的不需要重写。代价是仍然需要少量 iptables 规则做 SNAT 和包标记，所以 ipvs 模式不是'纯 ipvs'。适合大规模集群（千级 Service 以上）。\n\n**nftables 模式**：用 nftables 替代 iptables，nftables 原生支持集合（set）和 map，规则更新和匹配都更快，是未来方向。\n\n**面试常考的点**：(1) iptables 模式的 Service 转发**没有连接亲和**（除非显式 sessionAffinity=ClientIP，那是基于 conntrack 的）；(2) iptables 模式重启 kube-proxy 不会断开已有连接，因为规则是写在内核里的，进程死了规则还在；(3) 切换 ipvs 模式需要节点上加载 ip_vs 内核模块，且 kube-proxy 启动参数要改。",
+          "capstone": {
+            "prompt": "一个集群从 iptables 模式切到 ipvs 模式后，你观察到 Service 访问的尾延迟（p99）下降了。请回答：(1) 这个改善的物理原因是什么？(2) 有没有可能尾延迟反而**上升**？什么场景下？(3) ipvs 模式下你 `iptables -L -t nat` 仍然能看到一些 KUBE- 开头的链——它们还有什么作用？为什么不能彻底去掉？",
+            "depth": 3
+          }
+        },
+        {
+          "slug": "endpointslice",
+          "order_index": 4,
+          "name": "Endpoints → EndpointSlice 的演化",
+          "prereq": ["service-clusterip"],
+          "est_minutes": 20,
+          "concept_md": "原始的 Endpoints 对象有一个致命设计问题：**一个 Service 对应一个 Endpoints 对象**，里面装着这个 Service 全部后端的 IP 列表。当 Service 后端有 5000 个 Pod 时，这一个对象就有 5000 个条目；只要任何一个 Pod 状态变化（新增/删除/readiness 翻转），就要重写整个 Endpoints 对象，然后这个对象会通过 watch 推送给**集群里所有的 kube-proxy**。\n\n后果是 O(N×M) 的爆炸——N 个 endpoint × M 个节点。在大规模集群里，单是 endpoints 同步就能把 apiserver 和 etcd 打到崩溃边缘。\n\nEndpointSlice 的解法是把一个大对象切成多个小对象，每个 slice 默认最多 100 个 endpoint。改一个 Pod 的状态只需要重写它所在的那个 slice（~100 条），变化推送量降低 50 倍。EndpointSlice 用 label `kubernetes.io/service-name` 关联回 Service。\n\n额外好处：EndpointSlice 携带更多元信息，比如 topology hints（让 kube-proxy 优先选同 zone 的后端，做拓扑感知路由）、addressType（v4/v6/FQDN，原生双栈支持）、per-endpoint 的 readiness 状态。\n\n兼容性：旧 Endpoints 对象仍然存在，由一个 mirroring controller 自动从 EndpointSlice 反向生成，保证依赖 Endpoints 的旧组件还能工作。这是 K8s 演进 API 的典型套路——**新对象上线，旧对象通过 controller 派生**。",
+          "capstone": {
+            "prompt": "假设一个 Service 有 3000 个后端 Pod，分布在 100 个节点上，每秒有 5 个 Pod 因为 readiness 翻转状态。请估算 (1) 用 Endpoints 对象时，每秒 apiserver 要推送多少字节的数据到 kube-proxy 们；(2) 用 EndpointSlice（每片 100 个）时是多少。然后解释 EndpointSlice 还引入了 topology hints——这个特性具体解决什么场景的问题，启用它有什么风险？",
+            "depth": 2
+          }
+        },
+        {
+          "slug": "cluster-dns",
+          "order_index": 5,
+          "name": "集群 DNS 与 CoreDNS search path",
+          "prereq": ["service-clusterip"],
+          "est_minutes": 25,
+          "concept_md": "K8s 集群里所有 Service 都自动有一个 DNS 名：`<svc>.<ns>.svc.cluster.local`。这个解析由 CoreDNS（早期是 kube-dns）以一个 Deployment 的形式提供，自己也是一个 Service（通常 ClusterIP 是 service-cluster-ip-range 的第 10 个，比如 10.96.0.10）。kubelet 把这个 IP 写进每个 Pod 的 `/etc/resolv.conf` 的 `nameserver` 行。\n\n关键的是 `/etc/resolv.conf` 的 `search` 行，kubelet 默认写成：\n```\nsearch <ns>.svc.cluster.local svc.cluster.local cluster.local\n```\n这意味着你在 Pod 内 `curl mysvc` 时，resolver 会**依次**尝试：\n1. `mysvc.<ns>.svc.cluster.local`\n2. `mysvc.svc.cluster.local`\n3. `mysvc.cluster.local`\n4. `mysvc`（绝对查询）\n\n这就是为什么短名能工作。但也带来一个著名性能问题：访问外部域名（如 `api.github.com`）时，resolver 会先用 search 拼出三个错误 FQDN 去问 CoreDNS、被告知 NXDOMAIN，**然后才**做正确的查询——一次请求变成四次。解法：用 FQDN 加点结尾（`api.github.com.`）跳过 search，或者在 Pod spec 里设置 `dnsConfig.options ndots:1` 减少 search 触发条件。\n\n**Headless Service**（clusterIP: None）的 DNS 行为不同：它不返回 ClusterIP，而是返回**所有 Endpoint Pod IP** 的 A 记录列表。配合 StatefulSet，每个 Pod 还有 `pod-0.headless-svc.ns.svc.cluster.local` 这种独立 DNS——这是有状态服务做成员发现的基础。",
+          "capstone": {
+            "prompt": "你的应用 Pod 里频繁访问 `api.example.com`，发现 DNS 查询 QPS 异常高，CoreDNS 被打满。请：(1) 用 `/etc/resolv.conf` 解释这个行为；(2) 给出至少两种修复方案，分别说明在什么场景下适用；(3) 如果你想验证修复有效，你会在 Pod 内/CoreDNS 端各看什么指标或日志？",
+            "depth": 2
+          }
+        },
+        {
+          "slug": "ingress-gateway",
+          "order_index": 6,
+          "name": "Ingress 与 Gateway API",
+          "prereq": ["cluster-dns"],
+          "est_minutes": 30,
+          "concept_md": "Service 解决的是'集群内部访问 Pod'，Ingress 解决的是'集群外部 HTTP(S) 流量进来'。Ingress 对象本身只是一份**配置声明**——它说'host=foo.com path=/bar 的请求请转给 service:foo:80'，但**它不提供数据面**。真正干活的是 ingress controller（nginx-ingress、traefik、haproxy-ingress 等），它 watch Ingress 对象，把规则翻译成自己的配置（nginx.conf 之类）然后 reload。\n\n所以集群里没有 ingress controller 时，你 apply Ingress 对象不会报错也不会生效——这是新手常踩的坑。\n\nIngress 的设计有几个长期被诟病的问题：(1) 表达力弱——只能按 host/path 路由，做不了 header / method / weight 路由；(2) 各家 controller 用 annotations 扩展，annotations 没有 schema、不能跨实现迁移；(3) 角色混乱——基础设施团队（搭 controller）和应用团队（写 Ingress）共享同一个对象，没有清晰边界。\n\n**Gateway API** 是 K8s 社区为了解决这些问题做的下一代方案，2023 年 GA。核心是把'网关层'拆成三个对象、对应三种角色：\n- **GatewayClass**（基础设施提供商定义实现，类似 StorageClass）\n- **Gateway**（集群运维选一个 class、声明监听端口和 TLS——这是基础设施侧的事）\n- **HTTPRoute / TCPRoute / GRPCRoute**（应用团队写路由规则，绑定到 Gateway）\n\n表达力上 HTTPRoute 原生支持 header/method/query 匹配、流量切分（weight）、请求/响应改写——这些过去都靠 annotations。Gateway API 不会立刻取代 Ingress，但新项目应该直接上 Gateway API。",
+          "capstone": {
+            "prompt": "你要把一个老服务 v1 的 10% 流量切到 v2 做灰度，按 'header X-Beta=true 的全部走 v2，其余 10% 也走 v2'。请：(1) 解释为什么这件事用原生 Ingress 几乎做不到（不依赖 annotations）；(2) 用 Gateway API 的 HTTPRoute 写出关键 yaml；(3) 这个 HTTPRoute 绑定到的 Gateway 应该由谁创建？为什么不应该由应用团队自己建？",
+            "depth": 3
+          }
+        },
+        {
+          "slug": "network-policy",
+          "order_index": 7,
+          "name": "NetworkPolicy 语义与默认拒绝",
+          "prereq": ["pod-network-model"],
+          "est_minutes": 25,
+          "concept_md": "K8s 默认网络模型是'全通'——任何 Pod 可以访问任何 Pod。NetworkPolicy 是给这个模型加限制的工具。它的核心语义是：**一旦一个 Pod 被任何一条 NetworkPolicy 选中，它就进入'白名单模式'——只有该 policy 显式允许的流量才能通过，其余全部拒绝。**\n\n这条规则有几个推论。(1) 没有任何 policy 选中你 = 完全开放（默认状态）。(2) 一条 policy 选中了你 = 只允许这条 policy 列出的流量，其他全拒。(3) 多条 policy 选中你 = 它们的允许规则**取并集**——所以 policy 之间是 OR 关系，没有'优先级'，没有'拒绝'规则，只有'允许'。\n\nNetworkPolicy 分 ingress（进入 Pod 的）和 egress（Pod 发出的）两个方向，必须分别声明。一个常见错误：写了 ingress 规则就以为关上了出向，其实没有——出向默认仍然全通，要明确加 `policyTypes: [Ingress, Egress]` 才生效。\n\n实现：NetworkPolicy 本身只是声明，**真正执行的是 CNI 插件**。flannel 默认不实现 NetworkPolicy（要配 canal 才行）；calico、cilium 都原生支持。这意味着**你 apply 一条 NetworkPolicy 不报错，不代表它生效**——和 Ingress 一样的坑。\n\n经典模式：**default-deny**。在每个 namespace 里写一条选中所有 Pod 但不允许任何流量的 NetworkPolicy，把这个 namespace 切换成'默认拒绝'，然后再写具体的 allow 规则把需要的连通性补回来。这是生产集群做零信任网络的起点。",
+          "capstone": {
+            "prompt": "你在 namespace `payments` 里写了一条 NetworkPolicy：选中 label `app=api` 的 Pod，allow 来自 label `app=frontend` 的 Pod 的 ingress。apply 之后发现：(1) frontend 还是连不通 api，(2) 同 namespace 里另一个 `app=worker` 的 Pod 之前能访问 api，现在也连不通了。请逐条解释这两个现象的原因，然后写出修复后的 yaml（至少包含'frontend 能访问 api'、'worker 不受影响'、'同时 api 自己能访问外部 DB' 三个目标）。",
+            "depth": 3
+          }
+        },
+        {
+          "slug": "cni-plugins",
+          "order_index": 8,
+          "name": "CNI 插件机制（flannel/calico/cilium 差异点）",
+          "prereq": ["pod-network-model"],
+          "est_minutes": 30,
+          "concept_md": "CNI（Container Network Interface）是一个**规范**而不是一个软件：当 kubelet 创建 Pod 时，它会调用 `/opt/cni/bin/` 下的二进制，传一个 JSON 配置，让插件为这个 Pod 的 network namespace 配 IP、配路由、配 iface。kubelet 自己**不懂网络**，所有网络细节都委托给 CNI 插件。\n\n这个机制让 K8s 在网络层完全可插拔。三个主流插件代表三种思路：\n\n**flannel**：最简单。默认用 VXLAN overlay——每个节点跑一个 flanneld，给本节点分一个子网（比如 10.244.1.0/24），Pod 从这个子网拿 IP；跨节点流量被封装成 VXLAN 包通过节点 IP 转发，到对端再解封。优点：零配置、对底层网络无要求。缺点：overlay 有封装开销；不支持 NetworkPolicy（要配 canal = flannel + calico policy）。\n\n**calico**：默认用 BGP 把每个节点的 Pod 子网路由通告给其他节点和上层路由器，**没有 overlay**（如果底层网络支持 BGP），跨节点 Pod 流量直接走三层路由——性能接近裸金属。如果底层不支持 BGP，可以 fallback 到 IPIP overlay。原生支持 NetworkPolicy（用 iptables/eBPF 实现）。\n\n**cilium**：基于 **eBPF**，把网络转发逻辑直接编译成 eBPF 程序加载到内核，绕过 iptables 和大部分 netfilter 路径。性能最好，可观测性最强（hubble），NetworkPolicy 支持 L7（HTTP method/path），能做透明加密、ServiceMesh、kube-proxy 替换（cilium 可以完全取代 kube-proxy，把 Service 也用 eBPF 实现）。代价是对内核版本有要求，运维复杂度更高。\n\n**怎么选**：小集群、起步阶段、对性能不敏感 → flannel。生产集群、需要 NetworkPolicy 但底层网络受控 → calico。大规模、高性能、要 L7 策略 / 可观测 / 取代 kube-proxy → cilium。",
+          "capstone": {
+            "prompt": "你的团队在评估从 flannel + iptables kube-proxy 迁移到 cilium。请回答：(1) 这次迁移在数据面上具体替换掉了哪些组件、保留了哪些？(2) 性能改善的物理原因是什么——eBPF 比 iptables 快在哪？(3) 迁移过程中最大的风险是什么、怎么灰度？(4) 迁移完成后，原本写的 NetworkPolicy 还能直接用吗？cilium 的 CiliumNetworkPolicy 比标准 NetworkPolicy 多了什么？",
+            "depth": 3
+          }
+        }
+      ]
+    }
+  ]
+}

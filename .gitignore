@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+.env.*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# 本地数据 — 单用户应用，DB 与爬虫产出不入库
+data/app.db
+data/app.db-journal
+data/app.db-wal
+data/app.db-shm
+data/snapshot.json
+data/rejected.json
+
+# 但要保留 curriculum 课程内容（手工维护的资产）
+!data/curriculum/
+
+# Logs
+*.log
+logs/
+
+# Claude / agent 工作区
+.claude/
+
+# Scraper 浏览器 profile（含 cookies / 会话凭据，绝不入库）
+scraper/.auth*/
+scraper/.cache/
+scraper/output/
