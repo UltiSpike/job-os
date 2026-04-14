@@ -251,6 +251,8 @@ CREATE TABLE IF NOT EXISTS lessons (
     order_index INTEGER NOT NULL DEFAULT 0,
     name TEXT NOT NULL,
     concept_md TEXT DEFAULT '',
+    sections_json TEXT DEFAULT '[]',
+    mental_model TEXT DEFAULT '',
     prereq_slugs TEXT DEFAULT '',  -- comma-separated
     est_minutes INTEGER DEFAULT 20,
     capstone_prompt TEXT DEFAULT '',
@@ -399,6 +401,18 @@ def init_db():
         if "first_seen_at" not in q_cols:
             try:
                 conn.execute("ALTER TABLE questions ADD COLUMN first_seen_at TEXT")
+            except Exception:
+                pass
+        # lessons: sections_json + mental_model
+        l_cols = {r["name"] for r in conn.execute("PRAGMA table_info(lessons)").fetchall()}
+        if "sections_json" not in l_cols:
+            try:
+                conn.execute("ALTER TABLE lessons ADD COLUMN sections_json TEXT DEFAULT '[]'")
+            except Exception:
+                pass
+        if "mental_model" not in l_cols:
+            try:
+                conn.execute("ALTER TABLE lessons ADD COLUMN mental_model TEXT DEFAULT ''")
             except Exception:
                 pass
         # 单例 user_profile 默认行

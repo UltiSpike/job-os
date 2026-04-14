@@ -10,6 +10,8 @@ from __future__ import annotations
 import json
 from typing import Any
 
+import json as _json
+
 from .base import now_iso, transaction
 from .db import get_conn
 
@@ -88,6 +90,11 @@ def upsert_module(slug: str, track_slug: str, order_index: int, name: str, descr
 def _row_to_lesson(row: Any) -> dict:
     d = dict(row)
     d["prereq_slugs"] = [s for s in (d.get("prereq_slugs") or "").split(",") if s]
+    raw = d.pop("sections_json", "[]")
+    try:
+        d["sections"] = _json.loads(raw) if raw else []
+    except (_json.JSONDecodeError, TypeError):
+        d["sections"] = []
     return d
 
 
@@ -117,30 +124,35 @@ def upsert_lesson(
     order_index: int,
     name: str,
     concept_md: str = "",
+    sections: list[dict] | None = None,
+    mental_model: str = "",
     prereq_slugs: list[str] | None = None,
     est_minutes: int = 20,
     capstone_prompt: str = "",
     capstone_depth: int = 2,
 ) -> dict:
     prereq_csv = ",".join(prereq_slugs or [])
+    sections_json = _json.dumps(sections or [], ensure_ascii=False)
     with transaction() as conn:
         existing = conn.execute("SELECT slug FROM lessons WHERE slug = ?", (slug,)).fetchone()
         if existing:
             conn.execute(
                 """UPDATE lessons SET module_slug = ?, order_index = ?, name = ?,
-                   concept_md = ?, prereq_slugs = ?, est_minutes = ?,
+                   concept_md = ?, sections_json = ?, mental_model = ?,
+                   prereq_slugs = ?, est_minutes = ?,
                    capstone_prompt = ?, capstone_depth = ?
                    WHERE slug = ?""",
-                (module_slug, order_index, name, concept_md, prereq_csv,
-                 est_minutes, capstone_prompt, capstone_depth, slug),
+                (module_slug, order_index, name, concept_md, sections_json, mental_model,
+                 prereq_csv, est_minutes, capstone_prompt, capstone_depth, slug),
             )
         else:
             conn.execute(
                 """INSERT INTO lessons (slug, module_slug, order_index, name,
-                   concept_md, prereq_slugs, est_minutes, capstone_prompt, capstone_depth, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (slug, module_slug, order_index, name, concept_md, prereq_csv,
-                 est_minutes, capstone_prompt, capstone_depth, now_iso()),
+                   concept_md, sections_json, mental_model,
+                   prereq_slugs, est_minutes, capstone_prompt, capstone_depth, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (slug, module_slug, order_index, name, concept_md, sections_json, mental_model,
+                 prereq_csv, est_minutes, capstone_prompt, capstone_depth, now_iso()),
             )
     return get_lesson(slug)
 

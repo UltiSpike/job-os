@@ -88,6 +88,8 @@ def seed_file(path: Path) -> tuple[int, int, int]:
                 order_index=l.get("order_index", 0),
                 name=l["name"],
                 concept_md=l.get("concept_md", ""),
+                sections=l.get("sections"),
+                mental_model=l.get("mental_model", ""),
                 prereq_slugs=l.get("prereq") or [],
                 est_minutes=l.get("est_minutes", 20),
                 capstone_prompt=cap.get("prompt", ""),
