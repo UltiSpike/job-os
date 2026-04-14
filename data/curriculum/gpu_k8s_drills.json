@@ -1,214 +1,452 @@
 {
-  "comment": "Drill questions for GPU 训练 on K8s track. 3 per lesson, model answer 2-4 sentences.",
+  "comment": "Drill questions for GPU 工程 on Kubernetes track. 3 per lesson, model answer 2-4 sentences.",
   "drills": {
     "device-plugin": [
       {
-        "text": "Device Plugin 通过什么协议向 kubelet 注册资源？资源名为什么是 nvidia.com/gpu 这种带前缀的形式？",
-        "answer": "通过 gRPC，监听 unix socket /var/lib/kubelet/device-plugins/nvidia.sock。资源名带域名前缀（nvidia.com/）是 K8s extended resource 的命名规范，用域名做 namespace 防冲突——AMD 的 plugin 用 amd.com/gpu，避免不同厂商抢同一个名字。"
+        "text": "Device Plugin 向 kubelet 注册时用的是什么协议？注册后 kubelet 如何得知设备数量变化？",
+        "answer": "通过 gRPC，plugin 连接 kubelet 的 /var/lib/kubelet/device-plugins/kubelet.sock 注册。注册后 plugin 进入 ListAndWatch 长连接流式上报——设备数量或健康状态变化时推送新列表给 kubelet，kubelet 更新 node.status.capacity。不是轮询，是 server-streaming RPC。"
       },
       {
-        "text": "Pod yaml 里只写了 'requests.nvidia.com/gpu: 2' 没写 limits，会发生什么？",
-        "answer": "admission 直接拒绝。GPU 是 extended resource，K8s 强制 request == limit，少写一边等价于另一边为 0，调度时不通过。这是为了保证 device 不能被'部分'分配——要 2 卡就必须独占 2 卡。"
+        "text": "CDI（Container Device Interface）相比传统的 NVIDIA_VISIBLE_DEVICES 环境变量注入有什么优势？",
+        "answer": "CDI 通过标准化 JSON spec（/etc/cdi/nvidia.yaml）描述设备挂载，container runtime 原生支持读取。优势：(1) 不依赖特定 runtime hook，CRI-O 和 containerd 都能用；(2) 设备描述更丰富——除环境变量还包括 device node、mount、hook；(3) 多厂商设备统一管理格式。GPU Operator v24.6+ 默认启用 CDI。"
       },
       {
-        "text": "kubelet 调用 Allocate 拿到 device ID 之后，是怎么把这个 ID 让 cuda runtime 看见的？",
-        "answer": "通过环境变量 NVIDIA_VISIBLE_DEVICES（注入到容器 env）+ NVIDIA Container Toolkit（一个 OCI runtime hook）。Toolkit 在容器启动时读这个 env，把对应的 /dev/nvidia* 设备节点和 nvidia driver bind-mount 进容器，cuda runtime 通过 /dev/nvidia0 等节点看到 GPU。"
+        "text": "GPU Operator 和单独部署 k8s-device-plugin 的核心区别是什么？什么场景下你会选后者？",
+        "answer": "GPU Operator 一站式管理 driver、toolkit、device-plugin、DCGM exporter、GFD、MIG manager 等全生命周期，组件间有依赖顺序自动编排。单独部署 device-plugin 适合：(1) 节点已有 pre-installed driver 不想被 Operator 接管；(2) 非 NVIDIA 环境的自定义 device plugin（如 AMD ROCm）；(3) 极简部署只需调度不需监控。"
       }
     ],
     "gpu-resource-semantics": [
       {
-        "text": "为什么 GPU 资源不能像 CPU 一样写 0.5？除了 'integer-only' 这个回答，往下挖一层。",
-        "answer": "因为 device plugin 的 Allocate 接口返回的是整数个 device ID 列表，K8s 的资源核算单位是个数。要支持 0.5 卡需要额外机制：MIG（硬件分一片）、time-slicing（虚拟出多个副本）、vGPU（虚拟化方案）。这些都不是改 K8s 而是改 plugin 的暴露方式——把一张物理卡暴露成多个 device。"
+        "text": "为什么 GPU extended resource 强制 request == limit？从 K8s 代码层面解释。",
+        "answer": "在 pkg/apis/core/validation/validation.go 的 ValidateResourceRequirements 中，extended resource（资源名带 '/' 前缀且非 hugepages）要求 request 必须等于 limit。设计原因是 device 是独占型资源，不存在 burstable 语义——设备一旦 Allocate 就独占，'偶尔多用一个设备' 在硬件层面没有意义。"
       },
       {
-        "text": "为什么 GPU extended resource 不能超售？CPU 可以。",
-        "answer": "CPU 是分时复用的连续资源，K8s 用 cgroups quota 强制限制；超售时假设大家不会同时用满。GPU device 是独占型——一个 cuda context 跑起来就独占整张卡的 SM 和 memory，没有 OS 层面的抢占机制（time-slicing 是软件折中且没有隔离）。所以 K8s 不允许 device 超分，allocate 后不可被另一个 Pod 使用。"
+        "text": "同集群有 A100-80GB 和 T4-16GB 两种 GPU，训练 Pod 只写了 nvidia.com/gpu: 4 没加 nodeSelector，可能发生什么？",
+        "answer": "scheduler 将 Pod 调度到任何有 4 张空闲 GPU 的节点——可能是 T4 节点。如果模型需要 >16GB 显存，启动后 CUDA OOM。正确做法是 nodeSelector 指定 nvidia.com/gpu.product=NVIDIA-A100-SXM4-80GB。gpu-feature-discovery 自动打的 label 就是为这个场景设计的。"
       },
       {
-        "text": "你想跑一个推理服务希望弹性—— '正常 1 卡，需要时弹到 2 卡'。K8s 能直接做吗？为什么？该怎么实现这种弹性？",
-        "answer": "不能直接做。GPU request==limit 强制约束，HPA 也不能改单 Pod 的 GPU 数（只能改副本数）。实现弹性的正确做法是水平扩 Pod 副本——基于 GPU 利用率指标（DCGM_FI_DEV_GPU_UTIL）做 HPA，每个 Pod 固定 1 卡，副本数从 1 弹到 2。"
+        "text": "DRA（Dynamic Resource Allocation）相比 Device Plugin 框架，在 GPU 资源表达上有什么根本提升？",
+        "answer": "Device Plugin 只能表达 '我要 N 个同类设备'（count-based），无法表达拓扑约束。DRA 通过 ResourceClaim + CEL 表达式支持结构化请求：'2 张 GPU 且在同一 NVLink 域'、'一张 GPU 加物理相连的 RDMA NIC'。scheduler 能做拓扑感知分配，而非盲分 N 个 device ID。NVIDIA/k8s-dra-driver 是首个生产实现。"
       }
     ],
     "gpu-topology": [
       {
-        "text": "Topology Manager 的四种 policy 各自适合什么场景？",
-        "answer": "none：不感知拓扑，调度最快但带宽差；best-effort：尽量同 NUMA 但失败也继续，调度成功率高；restricted：必须满足拓扑要求否则 admission 失败，平衡型；single-numa-node：所有资源必须在同一 NUMA node，最严格也带宽最好。生产 GPU 训练通常用 single-numa-node 或 restricted。"
+        "text": "nvidia-smi topo -m 输出中 NV12、PIX、PHB、SYS 各代表什么连接类型？哪个最快？",
+        "answer": "NV12 = NVLink 12 lane（直连，最快），PIX = 同一 PCIe Switch 下（经 Switch 转发），PHB = 同一 PCIe Host Bridge/NUMA node（经 bridge），SYS = 跨 NUMA socket（最慢，经 QPI/UPI 总线）。性能排序 NVLink >> PIX > PHB > SYS。DGX A100 理想状态下所有 GPU 间应是 NV12。"
       },
       {
-        "text": "你跑 nvidia-smi topo -m 看到拓扑里出现 'PXB' 和 'NV4' 两种连接，分别是什么？哪个快？",
-        "answer": "PXB 是 PCIe Switch（Peripheral Component Interconnect Express Bridge），数据走 PCIe 总线；NV4 是 NVLink 4 通道。NVLink 远快于 PCIe——A100 NVLink 单链路 25 GB/s × 12 = 600 GB/s，PCIe gen4 x16 才 32 GB/s。看到 PXB 说明这两张卡之间没有直接 NVLink 连接，要走总线绕路。"
+        "text": "Topology Manager policy restricted 和 single-numa-node 有什么区别？什么时候用哪个？",
+        "answer": "restricted 要求所有 resource hint 交集非空（存在满足拓扑约束的方案），否则 admission 失败；single-numa-node 更严格——所有资源必须在同一个 NUMA node 上。区别在于 restricted 允许跨 NUMA 但要有公共拓扑，single-numa-node 绝对不跨 NUMA。大模型训练用 single-numa-node，通用 GPU 任务用 restricted 即可。"
       },
       {
-        "text": "NVIDIA GPU Operator 给节点打的 label nvidia.com/gpu.product 这种信息是怎么来的？为什么 admin 不需要手写？",
-        "answer": "GPU Operator 的子组件 NFD（Node Feature Discovery）+ GFD（GPU Feature Discovery）扫描节点上的 nvidia-smi 信息，自动把 product / driver version / cuda capability / memory / count 等打成 node label。admin 只需要把 GPU Operator 装上，label 就会自动维护、节点更换 GPU 后 label 也会更新。"
+        "text": "DGX A100 8 卡号称 NVLink 全互联，但实际上有没有'非均匀'的情况？",
+        "answer": "有。8 张 GPU 通过 6 个 NVSwitch 全互联，任意两卡 NVLink 带宽相同（600 GB/s）。但 GPU 0-3 和 GPU 4-7 分别连接不同 CPU socket（NUMA 0 和 NUMA 1），GPU 到本地 CPU 的 PCIe 带宽比到远端 CPU 更高。NVLink 卡间通信是均匀的，但 CPU↔GPU 数据搬运存在 NUMA 不对称。"
       }
     ],
     "mig-partition": [
       {
-        "text": "MIG 1g.5gb 的 '1g' 和 '5gb' 分别什么意思？1g 占整卡多少算力？",
-        "answer": "1g 表示 1 个 GPU compute slice（A100 共 7 个 slice），5gb 表示 5 GB 显存。1g 大约是整卡 1/7 的 SM 算力。完整命名规范是 <计算 slice 数>g.<显存>gb，常见组合 1g.5gb / 2g.10gb / 3g.20gb / 4g.20gb / 7g.40gb。"
+        "text": "nvidia-smi mig -lgip 输出中 1g.10gb 和 1g.10gb+me 有什么区别？'me' 是什么？",
+        "answer": "me 是 Media Extension，即 NVDEC/NVENC 视频编解码引擎。1g.10gb+me 的 MIG 实例除了 1/7 算力 + 10GB 显存，还包含编解码单元，用于视频 AI 推理（如 NVIDIA DeepStream）。普通训练/推理不需要 me，选 1g.10gb 即可。"
       },
       {
-        "text": "为什么一个节点不能同时存在 'MIG 实例' 和 '完整 GPU'？",
-        "answer": "MIG 是 GPU 整卡级的开关，开启 MIG 模式后该卡只能以实例形式被使用，不能同时对外暴露为整卡。所以同一节点上的同一张卡只能二选一。但同节点的不同卡可以独立设置——理论上一节点 8 卡里 4 张 MIG / 4 张整卡是可以的，只是 nvidia plugin 通常配置的粒度是节点级，operator 默认整节点统一。"
+        "text": "用 GPU Operator 的 mig-parted 做声明式 MIG 配置，ConfigMap 里定义什么内容？",
+        "answer": "ConfigMap 定义目标 MIG profile 组合——GPU index → profile 列表的映射，如 'all-1g.10gb'（所有卡切 1g.10gb）或自定义 mixed 配置。GPU Operator 的 MIG Manager 读 ConfigMap，自动执行 drain node → reset GPU → create GI/CI → uncordon 流程。配置变更时 Manager 重走整个流程。"
       },
       {
-        "text": "MIG 实例之间的隔离强度是什么级别？一个实例 OOM 会影响其他实例吗？",
-        "answer": "硬件级隔离。每个 MIG 实例有独立的 SM 子集、独立的 L2 cache 分区、独立的显存控制器和显存切片。一个实例 OOM 只 kill 自己的 cuda context，不影响同卡上其他 MIG 实例的运行。这是和 time-slicing 的根本区别。"
+        "text": "MIG 实例之间能跑 NCCL 通信吗？比如在 2 个 3g.20gb 实例间做 all-reduce？",
+        "answer": "不能高效做。MIG 实例间没有 NVLink 互联——每个实例只能看到自己的 SM 和显存分区，无法 P2P 直接访问另一个实例显存。NCCL 退化到 host memory 中转（SHM），性能极差。MIG 不适合需要多卡通信的训练，定位是单实例独立推理/小模型训练。"
       }
     ],
     "gpu-time-slicing": [
       {
-        "text": "time-slicing 配置 replicas: 4 之后，一张 V100 在 K8s 里看起来是 4 张 GPU。这 4 张'卡'是同一张物理卡还是不同的？",
-        "answer": "同一张物理卡。device plugin 把同一个 device ID 重复注册了 4 次（带不同的 instance index），K8s 调度层把它们当成 4 个独立资源，但实际启动容器时所有 4 个容器都看到的是同一张物理 GPU 上的同一块显存——它们的 cuda context 在硬件上时间片轮转。"
+        "text": "k8s-device-plugin ConfigMap 里 sharing.timeSlicing.replicas 设为 4 后，容器内 nvidia-smi 能看到 4 张虚拟卡吗？",
+        "answer": "不能。nvidia-smi 只显示物理 GPU，感知不到 K8s 层的虚拟化。4 个 replicas 只是 device-plugin 向 kubelet 注册了 4 个相同 device ID 副本，K8s scheduler 认为有 4 个独立资源。容器内部所有 4 个 Pod 都看到同一张物理卡的完整信息——全部显存和算力。"
       },
       {
-        "text": "MIG 和 time-slicing 都能让多个 Pod 共享一张 GPU。除了硬件型号（A100+ vs 老卡），它们最关键的差异是什么？",
-        "answer": "隔离强度。MIG 是硬件级隔离——内存和算力都分区，一个故障不影响别的。time-slicing 是软件级 best-effort 共享——内存全共享（一个 OOM 全崩）、算力时间片抢占（一个跑满会饿死别的）。生产任务用 MIG，开发/notebook 共享用 time-slicing。"
+        "text": "MPS 比 time-slicing 好在哪？为什么不默认用 MPS？",
+        "answer": "Time-slicing 是 CUDA context 时间片轮转——同一时刻只有一个 context 执行。MPS 通过共享 MPS server 把多进程 kernel 合并到一个硬件 context，允许真正并行（填满 SM occupancy）。代价是 MPS server 是单点——crash 后所有 client 进程失败。MPS 适合信任度高的内部工作负载，不适合多租户。"
       },
       {
-        "text": "你给一台 V100 节点开 time-slicing replicas: 4，4 个 Jupyter notebook 都申请 1 卡都调度上了。其中一个 notebook 的代码 import torch 后立刻 OOM 写个 1000GB tensor，其他 3 个会怎样？",
-        "answer": "全部受影响。time-slicing 没有显存隔离——这 4 个 notebook 共享同一张物理卡的全部 16/32GB 显存。一个 notebook 把显存吃光后，另外 3 个的 cuda context 在自己的 kernel 调用里也会 OOM 报错（cudaMalloc failed）。这就是为什么 time-slicing 不能用于生产。"
+        "text": "HAMi（Project-HAMi/HAMi）实现 vGPU 的技术原理是什么？和 NVIDIA vGPU (GRID) 有什么区别？",
+        "answer": "HAMi 通过 LD_PRELOAD 拦截 CUDA API（cudaMalloc 等），在用户态做显存和算力的软件限制——cudaMalloc 超过配额直接返回 OOM。NVIDIA vGPU (GRID) 是 hypervisor 层硬件虚拟化，通过 mediated device 切 vGPU，隔离更强但需商业许可 + 支持 vGPU 的卡型。HAMi 开源免费但隔离是软件级的。"
       }
     ],
     "gpu-quota": [
       {
-        "text": "ResourceQuota 限制 nvidia.com/gpu 总量为 10，team-A 的 namespace 已用 10 卡。团队再提交一个申请 1 卡的 Pod 会发生什么？",
-        "answer": "admission 拒绝。ResourceQuota 是 admission webhook，在 Pod 创建时立即校验该 namespace 的总申请量是否超过 quota，超过直接 403 拒绝创建。Pod 不会进入 pending 队列，是直接失败。客户端能看到清晰的 'exceeded quota' 错误。"
+        "text": "Kueue 的 ClusterQueue nominalQuota、borrowingLimit、lendingLimit 三个字段分别控制什么？",
+        "answer": "nominalQuota 是该队列的基准配额（保证量）；borrowingLimit 限制最多从 cohort 借多少额外资源；lendingLimit 限制最多借出多少给 cohort 内其他队列。例如 nominalQuota=10, borrowingLimit=5, lendingLimit=8 表示'保证 10 卡，最多用 15 卡，至少保留 2 卡不外借'。"
       },
       {
-        "text": "Kueue 的 cohort 借用机制下，A 借了 B 5 张卡正在跑训练，B 突然要回这 5 张。Kueue 怎么处理被 A 占用的训练？",
-        "answer": "通过 preemption。Kueue 检测到 B 的 nominal quota 不足时，找到 A 的'借用 workload'（borrowedQuota > 0），按优先级顺序对其发起 preempt——把对应的 Pod 删掉让 A 的 workload 重新进队列等待。被抢的训练任务如果有 checkpoint 则恢复，没有就丢掉前面的进度。所以借用方应该跑 checkpoint 友好的任务。"
+        "text": "Kueue 的 Workload CRD 和 K8s 的 Job 是什么关系？",
+        "answer": "Workload 是 Kueue 的调度单元，每个 Job/PyTorchJob/RayJob 提交时 Kueue controller 自动创建对应 Workload 对象，记录资源需求、优先级、队列归属、admission 状态。Kueue 决定 admit 后把 Job 的 spec.suspend 从 true 改 false，K8s 才创建 Pod。Workload 是 Kueue 的抽象层，Job 是执行层。"
       },
       {
-        "text": "ResourceQuota 和 Kueue 各自的最大缺陷是什么？为什么生产里两者经常一起用？",
-        "answer": "ResourceQuota 缺陷：硬上限不能借，资源闲置浪费；Kueue 缺陷：admission 在外部，恶意/出 bug 的客户端可能绕过 Kueue 直接创建 Pod，没有强制力。生产组合：用 Kueue 做'弹性借用 + 调度排队'，再用 ResourceQuota 做'最终安全网'防止被绕过。两层防御。"
+        "text": "ResourceQuota 和 Kueue 各自适合什么场景？为什么生产里经常一起用？",
+        "answer": "ResourceQuota 是 K8s 内置硬上限——强制力高（admission webhook 直接拒绝）但不能借用、不能排队。Kueue 提供弹性借用 + 排队 + 优先级抢占，但它是外部准入——绕过 Kueue 直接 kubectl apply 的 Pod 不受控。生产组合：Kueue 做智能调度排队，ResourceQuota 做安全网防绕过。两层防御。"
       }
     ],
     "gpu-node-isolation": [
       {
-        "text": "GPU 节点上的 taint 'nvidia.com/gpu=true:NoSchedule' 起到什么效果？为什么不直接禁止非 GPU Pod 调度？",
-        "answer": "taint 让默认 Pod 调度不上去（除非显式 toleration），但允许带 toleration 的 GPU 任务进来。直接'禁止非 GPU Pod' K8s 没有这种二元开关——taint+toleration 才是声明式的方法。这种设计灵活：有些必须跑在每个节点上的 DaemonSet（如日志、监控）可以加 toleration 跑到 GPU 节点上，普通业务 Pod 默认就被挡住。"
+        "text": "GPU Operator 的 auto-taint 功能在 managed K8s（EKS/GKE/AKS）上表现一致吗？",
+        "answer": "不一致。GKE 在节点就绪时自动加 nvidia.com/gpu=present:NoSchedule（GKE 控制面管理），GPU Operator 的 taint 会和它冲突。EKS 默认不加任何 GPU taint，需在 launch template 的 kubelet 参数里显式配。AKS 通过 node pool 配置 taint。跨云部署必须统一 taint 策略。"
       },
       {
-        "text": "如果某个普通 web Pod 'tolerations' 写得太宽（toleration 了所有 taint）会发生什么？怎么防御？",
-        "answer": "它会被调度到任何节点包括 GPU 节点，浪费机时。防御方法：(1) PodSecurityAdmission / OPA / Kyverno 策略禁止业务 namespace 的 Pod 用 'operator: Exists' 或 toleration GPU taint；(2) ResourceQuota 限制 namespace 不能申请 nvidia.com/gpu（即使有 toleration 也不会调度）；(3) 审计 + 告警监控不该出现的 toleration。"
+        "text": "Karpenter 相比 cluster-autoscaler 在 GPU 节点管理上有什么优势？",
+        "answer": "Karpenter 是 group-less autoscaler——不需预定义节点组，根据 pending Pod 需求 + NodePool requirements 选最合适 instance type。GPU 场景优势：(1) 跨多种 GPU instance type 灵活调度；(2) consolidation 合并碎片节点；(3) drift detection 自动替换过期 AMI。cluster-autoscaler 只能在预定义 ASG 里加减节点。"
       },
       {
-        "text": "cluster-autoscaler 看到 pending 的 GPU Pod 会扩 GPU 节点。它怎么知道'GPU 节点'是哪个节点池？",
-        "answer": "通过 node template label。每个云厂商节点池在 ASG/MIG/scale set 上有 tag，autoscaler 读 tag 知道这个节点池启动后会带哪些 label 和 taint，匹配 pending Pod 的 nodeSelector / toleration / nodeAffinity 决定扩哪个池。也支持 priorityExpander 等策略选最便宜的池。"
+        "text": "推理 Pod 希望'优先 T4，T4 满了 fallback 到 A100'，nodeAffinity 怎么写？",
+        "answer": "用 preferredDuringSchedulingIgnoredDuringExecution（软亲和 weight=100 偏好 nvidia.com/gpu.product=Tesla-T4）+ requiredDuringSchedulingIgnoredDuringExecution（硬约束 nvidia.com/gpu.present=true）。T4 满了 scheduler 退而求其次选 A100。同时 tolerations 需同时容忍 T4 和 A100 节点的 taint。"
       }
     ],
     "gang-scheduling": [
       {
         "text": "用 default scheduler + 4 个 Pod 的 Job 跑分布式训练，partial scheduling 死锁的具体过程描述一下。",
-        "answer": "Job controller 一次性创建 4 个 Pod，scheduler 一个个调度。前 3 个找到节点上去了，第 4 个因为 GPU 不够 pending。kubelet 看到前 3 个 Pod 已 bind 就启动它们的容器，PyTorch 进程跑 init_process_group 等待 master：world_size=4 但只有 3 个 worker 上线，永远等不到第 4 个。3 个 Pod 占着 GPU 不动，第 4 个 Pod 又抢不到这 3 个占用的资源——死锁。集群里多任务时这种死锁会蔓延，所有任务都 stuck 在 N-1。"
+        "answer": "Job controller 创建 4 个 Pod，scheduler 一个个调度。前 3 个找到节点调度上去，第 4 个因 GPU 不够 pending。前 3 个被 kubelet 启动，PyTorch 进程跑 init_process_group 等待 world_size=4 但只有 3 个 worker 上线，永远等不到第 4 个。3 个 Pod 占着 GPU 不动、第 4 个抢不到这 3 个占用的资源——死锁。"
       },
       {
-        "text": "PodGroup 的 minAvailable 字段是干嘛的？设成 4 和 设成 3 有什么不同？",
-        "answer": "minAvailable 是'至少多少 Pod 同时被调度才算成功'，调度器只在能凑够 minAvailable 时才同时 bind 它们。设 4 = 必须 4 个一起，设 3 = 允许只调度 3 个（适合容错训练，少一个也能跑）。Volcano / Kueue 都用这个字段实现 gang scheduling，灵活程度取决于训练框架是否允许部分启动。"
+        "text": "kubernetes-sigs/scheduler-plugins 的 Coscheduling 插件和 Volcano PodGroup 有什么区别？",
+        "answer": "Coscheduling 是 default scheduler 的扩展插件（以 scheduling framework plugin 形式集成），不需要额外的 scheduler 进程。Volcano PodGroup 需要独立的 Volcano scheduler 进程且 Pod 必须指定 schedulerName: volcano。Coscheduling 更轻量但功能较少（没有 queue/fairshare/reclaim），适合只需要 gang scheduling 的场景。"
       },
       {
-        "text": "我已经装了 Volcano 但用 default scheduler 提交 PodGroup 还是死锁，问题在哪？",
-        "answer": "PodGroup 是 Volcano 自己的 CRD，被 Volcano scheduler 才认。default scheduler 看不到 PodGroup 标记，按普通 Pod 一个个调度——绕过了 gang 逻辑。修法：Pod yaml 里加 schedulerName: volcano，明确告诉 K8s 用 Volcano 调度。Training Operator 通常自动加。"
+        "text": "PodGroup 的 minAvailable 设成 3（总共 4 个 Pod）意味着什么？什么训练框架允许这么做？",
+        "answer": "意味着只要 3 个 Pod 能调度就开始训练，允许少 1 个 worker。支持这种弹性的框架包括 PyTorch Elastic（torchrun --elastic --min_replicas=3 --max_replicas=4）和 Horovod Elastic。常规 DDP 不支持——world_size 固定，少一个就 hang。"
       }
     ],
     "volcano-scheduler": [
       {
-        "text": "Volcano 的 binpack 插件解决什么问题？什么场景必须开？",
-        "answer": "解决 GPU 集群碎片问题。默认调度倾向'分散'——把任务铺到不同节点。但 GPU 任务越分散越不好（跨节点通信慢、资源碎片），binpack 让调度器优先把任务塞满已有节点而不是分散到新节点。GPU 集群必须开，否则 100 张卡的集群可能因为碎片实际只能跑得动需要 80 张卡的任务。"
+        "text": "Volcano 的 binpack 插件解决什么问题？GPU 集群为什么必须开？",
+        "answer": "解决 GPU 集群碎片问题。默认调度倾向分散，GPU 任务越分散越不好——跨节点通信慢、资源碎片导致大任务无法调度。binpack 优先塞满已有节点再开新节点。100 卡集群不开 binpack 可能因碎片只能跑 80 卡的任务，20 卡零散浪费。"
       },
       {
-        "text": "Volcano 的 fairshare 插件按什么算公平？multi-tenant 场景下它和 kueue 的 cohort 概念是不是一回事？",
-        "answer": "fairshare 通常按 DRF（Dominant Resource Fairness）—— 多个资源维度时按'各 tenant 占自己最紧缺资源的比例'公平分配。和 Kueue cohort 不是一回事：fairshare 是调度时的资源分配算法，cohort 是配额借用模型。两者可以配合，也可以单用。"
+        "text": "Volcano Queue 的 weight 和 capability 字段分别控制什么？",
+        "answer": "weight 控制 fair-share 比例——weight=2 的队列在资源竞争时获得 weight=1 队列两倍的份额，是软约束。capability 是硬上限——即使资源空闲，队列使用量也不能超过 capability。生产里通常两个都设：weight 做公平分配，capability 做安全阀。"
       },
       {
-        "text": "Volcano 抢占低优先级任务时，被抢的 Pod 是 SIGKILL 立刻杀掉还是有 grace period？训练任务怎么自保？",
-        "answer": "走 K8s 标准 Pod 删除流程：发 deletionTimestamp、preStop hook、SIGTERM、grace period 倒数后 SIGKILL。训练任务自保的方法是配 preStop hook 触发紧急 checkpoint（写到共享存储），同时把 terminationGracePeriodSeconds 设大一些（如 300 秒）让 checkpoint 写完再被杀。"
+        "text": "Volcano 抢占低优先级任务时，被抢的 Pod 有 grace period 吗？训练任务怎么自保？",
+        "answer": "走 K8s 标准删除流程：SIGTERM → terminationGracePeriodSeconds 倒数 → SIGKILL。训练任务自保方法：(1) preStop hook 触发紧急 checkpoint 写入共享存储；(2) terminationGracePeriodSeconds 设大（如 300s）让 checkpoint 写完再被杀。没有 checkpoint 机制的任务被抢后进度全丢。"
       }
     ],
     "kueue-queue": [
       {
-        "text": "Kueue 的 'admission' 和 K8s scheduler 的 'scheduling' 分别在做什么？为什么要分开？",
-        "answer": "Kueue admission 决定 'workload 现在能不能开始排队尝试调度'——基于 ClusterQueue 配额、cohort 借用、优先级。决定能后把 workload 对应的 Job suspend 字段设为 false，default scheduler 才看得到 Pod 并尝试 bind。分开的好处是 Kueue 不替换 scheduler，只控制队列入口，对 K8s 升级和兼容性最友好。"
+        "text": "Kueue 的'admission + scheduling 分离'具体怎么工作？Workload 从提交到 Pod 运行经历了什么？",
+        "answer": "用户提交 Job（spec.suspend=true）→ Kueue controller 自动创建 Workload → Kueue 检查 ClusterQueue 配额、cohort 借用、优先级 → 决定 admit 后将 Job 的 suspend 改为 false → default scheduler 看到 unsuspend 的 Pod 尝试 bind → kubelet 启动容器。Kueue 只管第一道门，调度还是 K8s 原生。"
       },
       {
-        "text": "ClusterQueue 和 LocalQueue 的关系是什么？为什么要两层？",
-        "answer": "ClusterQueue 是集群 admin 管理的资源池配置（这里有多少 GPU、CPU、memory），跨 namespace。LocalQueue 是用户在自己 namespace 创建的引用，指向某个 ClusterQueue。两层的原因：admin 集中管资源配额，用户只看自己 namespace 里的 LocalQueue 不需要看集群层。同一个 ClusterQueue 可以被多个 LocalQueue 引用，实现多团队共享一个池。"
+        "text": "Kueue 的 ResourceFlavor 是干什么的？为什么需要它？",
+        "answer": "ResourceFlavor 描述硬件特征（如 'a100-80gb' flavor 关联 node label nvidia.com/gpu.product=A100-SXM4-80GB），ClusterQueue 按 flavor 配置配额。这样同一个 ClusterQueue 可以管理多种 GPU 类型——10 卡 A100 flavor + 20 卡 T4 flavor，Workload 按需选 flavor。没有 ResourceFlavor 就无法区分不同 GPU 类型的配额。"
       },
       {
-        "text": "Kueue 不自己做调度的最大缺点是什么？",
-        "answer": "无法做 gang scheduling 的真实'同时 bind'——Kueue 把 workload 的 Job suspend 设 false 后，default scheduler 仍然是一个个 Pod 尝试，理论上可能 partial。解法是 Kueue 集成 PodGroup（通过 scheduler plugins）或者依赖 Job controller 自己等所有 Pod ready 才开始。最严格的 gang 还是要 Volcano 或者自定义 scheduler 配合。"
+        "text": "MultiKueue 多集群联邦调度怎么工作？解决什么问题？",
+        "answer": "解决多 K8s 集群间的统一 GPU 调度。管理集群的 Kueue 收到 Workload 后，评估各 worker 集群的可用资源，选最合适的集群创建远端 Workload。远端 Kueue 独立 admit 和调度。核心是 MultiKueueCluster + MultiKueueConfig CRD 描述集群拓扑。适合跨区域/跨云 GPU 资源池化。"
       }
     ],
     "training-operator": [
       {
-        "text": "PyTorchJob 帮你自动注入了 MASTER_ADDR / MASTER_PORT / WORLD_SIZE / RANK 这些环境变量。它是怎么知道 master Pod 的地址的？",
-        "answer": "Operator 创建一个 headless Service 指向 master Pod（用 selector 匹配），这个 Service 的 DNS 名是确定的（如 <jobname>-master-0），所有 worker Pod 通过这个 DNS 解析 master 地址。MASTER_ADDR 注入的就是这个 DNS 名。Pod 重启 IP 变了 DNS 也会更新，不影响。"
+        "text": "PyTorchJob 自动注入的 MASTER_ADDR 是怎么解析到 master Pod 的 IP 的？",
+        "answer": "Operator 创建 headless Service 指向 master Pod（通过 selector 匹配），Service DNS 名确定（如 <jobname>-master-0）。MASTER_ADDR 注入的就是这个 DNS 名。kubelet 通过 CoreDNS 解析到 master Pod IP。Pod 重启 IP 变了 DNS 也更新——这就是为什么用 headless Service 而非硬编码 IP。"
       },
       {
-        "text": "MPIJob 启动时为什么要在 worker 镜像里装 SSH server？",
-        "answer": "MPI 协议靠 launcher Pod 通过 SSH 远程登录到 worker Pod 启动 mpirun 进程。worker 镜像必须有 sshd 跑起来 + 认证 key 配好（通常 mountKey volume），launcher 才能连过去执行命令。这是和 PyTorchJob（每个 Pod 自启 python 进程，靠 c10d 协议互联）的根本区别。"
+        "text": "MPIJob 启动时为什么 worker 镜像需要装 SSH server？和 PyTorchJob 有什么本质区别？",
+        "answer": "MPI 协议靠 launcher Pod 通过 SSH 远程登录 worker Pod 执行 mpirun 命令——worker 必须跑 sshd + 认证 key 配好。PyTorchJob 完全不同：每个 Pod 自启 Python 进程，靠 c10d（TCP/gloo）或 NCCL 协议互联，不需要 SSH。本质区别是 MPI 是 launcher-driven，PyTorch DDP 是 peer-to-peer。"
       },
       {
-        "text": "PyTorchJob 的 worker Pod 挂了一个，Operator 默认会怎么处理？",
-        "answer": "看 spec 里的 restartPolicy。常见值 OnFailure（容器失败重启）、Never（不重启 Pod 失败）、ExitCode（按 exit code 决定）。Operator 检测到 Pod terminate 后按策略要么重建一个新 Pod（带相同 rank），要么把整个 Job 标 Failed。重建后的新 Pod 会重新 join 训练但已经丢了未 checkpoint 的进度——所以 elastic training + checkpoint 才是真正的容错方案。"
+        "text": "Training Operator v2 的 TrainJob + TrainingRuntime 相比 v1 的 PyTorchJob 有什么改进？",
+        "answer": "v1 每种框架一个 CRD（PyTorchJob/MPIJob/...），用户要了解框架细节。v2 统一为 TrainJob（描述'跑什么'）+ TrainingRuntime（可复用模板，描述'怎么跑'）——用户提交 TrainJob 指定 runtime 引用即可，不需要关心底层是 torchrun 还是 mpirun。还原生支持 DeepSpeed、FSDP 等框架的配置字段。"
       }
     ],
     "nccl-rdma": [
       {
-        "text": "NCCL_DEBUG=INFO 之后启动训练，日志里出现 'NET/Socket' 而不是 'NET/IB'，意味着什么？怎么修？",
-        "answer": "意味着 NCCL 跨节点退化到了 TCP socket，没用 RDMA。可能原因：(1) Pod 没申请 rdma/ib 资源；(2) Multus 第二张 NIC 没起来；(3) NCCL_IB_HCA 环境变量没设或设错了 HCA 名字；(4) IB driver / OFED 在节点上没装好。修：检查 Pod 内 ibstat / show_gids 看 IB 设备是否可用，再检查 NCCL_IB_HCA / NCCL_SOCKET_IFNAME 等环境变量。"
+        "text": "NCCL_DEBUG=INFO 启动后日志里出现 'NET/Socket' 而不是 'NET/IB'，意味着什么？怎么修？",
+        "answer": "意味着 NCCL 跨节点退化到 TCP socket，没用 RDMA。可能原因：(1) Pod 没申请 rdma/ib 资源；(2) Multus 第二张 NIC 没起来；(3) NCCL_IB_HCA 设错了 HCA 名；(4) IB 驱动没装好。修：先 ibstat / show_gids 检查 IB 设备可用，再检查 NCCL_IB_HCA / NCCL_SOCKET_IFNAME 环境变量。"
       },
       {
-        "text": "GPUDirect RDMA 比普通 RDMA 又快在哪？",
-        "answer": "普通 RDMA：GPU 内存 → host memory（cudaMemcpy）→ NIC → 网络。GPUDirect RDMA：GPU 内存 → NIC（直接通过 PCIe peer-to-peer）→ 网络。少了一次 GPU↔CPU memory 拷贝和一次 PCIe 反复，延迟低、CPU 开销低、吞吐高。需要 GPU、NIC、PCIe 拓扑都支持 P2P（同 PCIe root complex 下）。"
+        "text": "NCCL 的 Ring 和 Tree 算法分别适合什么场景？NCCL 怎么自动选择？",
+        "answer": "Ring 带宽利用率高（所有链路同时工作），适合大消息的 all-reduce。Tree 延迟低（log(N) 步完成），适合小消息。NCCL 根据消息大小自动选择——小于阈值走 Tree，大于走 Ring。可通过 NCCL_ALGO=Ring/Tree 强制指定。生产中大模型训练以大 gradient 为主，Ring 更常见。"
       },
       {
-        "text": "为什么节点内多卡通信不需要 RDMA？",
-        "answer": "节点内卡间走 NVLink 或 PCIe，是物理直连不需要走网络栈。NCCL 在节点内会自动用 SHM（shared memory）或 NVLink P2P 传输，带宽远高于任何网络传输。RDMA 只解决跨节点的'网络'路径性能问题。"
+        "text": "GPUDirect RDMA 比普通 RDMA 又快在哪？有什么硬件限制？",
+        "answer": "普通 RDMA：GPU→host memory（cudaMemcpy）→NIC→网络。GPUDirect RDMA：GPU→NIC（PCIe P2P 直接传输）→网络——少一次 GPU↔CPU 拷贝。硬件限制：GPU 和 NIC 必须在同一 PCIe root complex 下，跨 PCIe switch 的 GPU-NIC pair 走不了 GPUDirect。nvidia-smi topo -m 可查看亲和关系。"
       }
     ],
     "k8s-rdma": [
       {
-        "text": "Multus 给 Pod 加第二张 NIC 的工作原理是什么？为什么 default CNI 不能直接做？",
-        "answer": "Multus 是 'meta CNI plugin'——它包装真正的 CNI。kubelet 调用 Multus，Multus 读 Pod annotation 里的 NetworkAttachmentDefinition 列表，依次调用每个对应的 CNI（一个负责 eth0 默认网络、一个负责 net1 RDMA 网络）。default CNI 一次只创一张 iface，不支持声明 'Pod 我要 N 张接不同网络的 iface'，所以需要 Multus 这一层。"
+        "text": "Multus 给 Pod 加第二张 NIC 的工作原理？为什么 default CNI 不能直接做？",
+        "answer": "Multus 是 meta-CNI，包装真正的 CNI。kubelet 调用 Multus，Multus 读 Pod annotation 里的 NetworkAttachmentDefinition 列表，依次调用每个对应 CNI（一个创 eth0 默认网络、一个创 net1 RDMA 网络）。default CNI 一次只创一张 iface，不支持声明'我要 N 张接不同网络的 iface'，需要 Multus 这层。"
       },
       {
-        "text": "SR-IOV 的 VF 是什么？为什么用它来给 Pod 提供 RDMA？",
-        "answer": "SR-IOV（Single Root I/O Virtualization）是 PCIe 标准，把一张物理 NIC 切成多个 Virtual Function（VF），每个 VF 在 OS 看来就是一张独立的 PCIe 网卡。Pod 拿到一个 VF 就能直接做 RDMA verbs（绕过 host 内核），相当于'物理网卡的一部分'。比共享一张物理 NIC 性能好（独立队列、独立中断），比给每个 Pod 一张物理卡又便宜。"
+        "text": "SR-IOV 的 VF 是什么？为什么用 VF 而不是让 Pod 直接用物理 NIC？",
+        "answer": "SR-IOV 把一张物理 NIC（PF）切成多个 Virtual Function（VF），每个 VF 是独立 PCIe 设备，有独立队列和中断。Pod 拿到 VF 就能直接做 RDMA verbs。不直接用物理 NIC 是因为 PF 只有一个，只能给一个 Pod；VF 可以切 64-128 个，多 Pod 共享一张物理卡且性能接近。"
       },
       {
-        "text": "Pod 启动后用 'ip addr' 看到 eth0 + net1 两张网卡，NCCL 怎么知道要用 net1 走 RDMA 而不是 eth0 走 TCP？",
-        "answer": "通过环境变量 NCCL_SOCKET_IFNAME=net1（明确告诉 NCCL 用哪张 iface 做 socket 通信）+ NCCL_IB_HCA=mlx5_0（告诉 NCCL 用哪个 IB HCA 做 RDMA）。NCCL 会根据这些 env 选传输路径。如果不设默认会按它的 priority 自动尝试。"
+        "text": "AWS EKS 上用 EFA 做 RDMA 和传统 IB 方案有什么不同？NCCL 需要什么适配？",
+        "answer": "EFA 是 AWS 自研的弹性网络接口，底层不是 InfiniBand 而是 SRD（Scalable Reliable Datagram）协议。NCCL 不能直接用 IB verbs，需要 aws-ofi-nccl 适配层——它把 NCCL 的 net plugin 接口翻译成 libfabric API。Pod 申请 vpc.amazonaws.com/efa 资源而非 rdma/ib。EFA device plugin 由 aws/eks-charts 提供。"
       }
     ],
     "checkpoint-elastic": [
       {
-        "text": "checkpoint 写一次 30 GB 阻塞训练 2 分钟。如果训练总时长 24 小时希望 checkpoint 开销不超过 2%，频率应该多少？",
-        "answer": "2% × 24h = 28.8 分钟。每次 checkpoint 阻塞 2 分钟，所以一天最多 14 次。即每 24/14 ≈ 1.7 小时一次 checkpoint。生产上常 round 成 'every 1 hour'，节奏好记。也可以设 step-based（每 N 个 step）让间隔更稳定。"
+        "text": "torch.save() 和 torch.distributed.checkpoint (DCP) 有什么区别？什么时候用 DCP？",
+        "answer": "torch.save() 在 rank 0 收集全部 state_dict 后一次性写出完整文件——175B 模型约 350GB，单节点写入。DCP 每个 rank 只写自己的 shard，并行写入多个文件，速度更快。且 DCP 支持 resharding——用 4 卡保存的 checkpoint 可以用 8 卡恢复（自动重新分片）。FSDP/DeepSpeed ZeRO 必须用 DCP。"
       },
       {
-        "text": "PyTorch torchrun --elastic 怎么知道现在 worker 数变了？rendezvous 是干什么的？",
-        "answer": "torchrun --elastic 启动后所有 worker 通过 rendezvous（c10d 或 etcd backend）注册自己，rendezvous server 维护当前 alive worker 集合并周期性检查心跳。当成员变化（多了或少了）时 rendezvous 触发一次 'reconfiguration'，所有 worker 重新协商 rank、world_size，从最近的 checkpoint 继续训练。这是 'elastic' 的核心机制。"
+        "text": "异步 checkpoint（如 nebula）的原理？为什么能减少训练阻塞？",
+        "answer": "异步 checkpoint 在训练 step 结束时，先将 GPU 上的 state 快速拷到 CPU pinned memory（~几秒，GPU→CPU PCIe 带宽高），然后在后台线程从 CPU memory 写磁盘——训练在 GPU 拷完后立即继续下一 step 不等磁盘写入完成。阻塞时间从'写完磁盘才继续'（分钟级）降到'拷到 CPU'（秒级）。"
       },
       {
-        "text": "为什么说 elastic training 一定要配合共享 checkpoint 存储？用本地 nvme 不行吗？",
-        "answer": "elastic 的关键是 worker 数变化后剩余 worker 能从最新 checkpoint 接着跑。如果 checkpoint 写在本地 nvme，挂掉的那个 worker 上的 checkpoint 拿不到了；新加入的 worker 读不到任何 checkpoint。必须是所有 worker 都能读写的共享存储（S3 / 分布式 FS / NFS）才能做到无缝接管。"
+        "text": "PyTorch Elastic 的 rendezvous 超时在大规模集群为什么是个问题？",
+        "answer": "c10d rendezvous 默认 timeout 900s。大规模集群（100+ 节点）故障恢复时所有节点几乎同时重启，新 Pod 启动涉及镜像拉取、GPU 初始化、CUDA context 创建，可能总耗时超过 900s。后到的 worker 超时被标记失败，触发再次重启——恶性循环。需调大 TORCH_ELASTIC_RENDEZVOUS_TIMEOUT 或确保快速 Pod 启动。"
       }
     ],
     "gpu-monitoring": [
       {
-        "text": "DCGM_FI_DEV_GPU_UTIL 是 95% 但训练慢，可能是什么导致的？",
-        "answer": "GPU_UTIL 只衡量'有 kernel 在跑'的时间百分比，不衡量这些 kernel 跑得多充分。常见原因：(1) batch size 太小，每个 kernel 只用了一小部分 SM，SM occupancy 实际很低；(2) memory-bound——kernel 在等显存而不是算；(3) python 主线程在 dataloader 等数据，GPU 处理数据后空转等下一批；(4) 大量小 kernel launch overhead 累积。"
+        "text": "DCGM_FI_DEV_GPU_UTIL 是 95% 但训练慢，可能什么原因？",
+        "answer": "GPU_UTIL 只衡量'有 kernel 在跑'的时间百分比，不衡量 kernel 效率。常见原因：(1) batch size 太小，每个 kernel 只用了一小部分 SM，occupancy 低；(2) memory-bound kernel 在等显存而不是算；(3) dataloader 瓶颈——GPU 处理完数据后空转等下一批；(4) 大量小 kernel launch overhead 累积。"
       },
       {
-        "text": "DCGM_FI_PROF_SM_OCCUPANCY 和 DCGM_FI_DEV_GPU_UTIL 哪个更能准确反映训练效率？",
-        "answer": "SM_OCCUPANCY 更准。它衡量的是 SM 上活跃 warp 数 / 最大 warp 数，反映了 GPU 算力是否被真正利用。GPU_UTIL 是个粗指标——只要有 kernel 在跑就算，哪怕这个 kernel 只用了 1% 的 SM 也算 100% utilization。生产里看效率应该看 SM_OCCUPANCY + memory bandwidth utilization 组合。"
+        "text": "XID 48 错误代表什么？检测到后应该怎么处理？",
+        "answer": "XID 48 是 Double Bit ECC Error（DBE）——GPU 显存发生了不可纠正的硬件错误。处理：(1) 立即 cordon 该节点防止新 Pod 调度上来；(2) drain 现有 Pod（训练任务需先 checkpoint）；(3) 通知运维更换或重置 GPU；(4) 自动化方案：Prometheus alert → webhook → 触发 cordon + drain 脚本。DBE 可能导致训练结果静默错误，不能忽略。"
       },
       {
-        "text": "你想做一个 SLI 'PyTorchJob X 的 GPU 实际效率'，DCGM exporter 默认指标里没有 'job 标签'，怎么办？",
-        "answer": "DCGM exporter 默认按 GPU device 或 Pod label 上报。要把 PyTorchJob 的 label 关联进指标，需要：(1) Prometheus 的 kube-state-metrics 也开 Pod label 上报，做 join；(2) Grafana / Prometheus query 用 label_replace 或 group_left 把 Pod 的 'training.kubeflow.org/job-name' label join 进 DCGM 指标；(3) 或者用 NVIDIA GPU Operator 的 dcgm-exporter helm chart，它支持自动 enrich Pod metadata。"
+        "text": "怎么在 Prometheus 里实现 'Pod 级别的 GPU 指标'——知道哪个 Pod 用了哪张卡、利用率多少？",
+        "answer": "DCGM exporter 暴露的指标带 gpu（device index）和 pod label。但如果 pod label 不全，需要用 kube-state-metrics 的 kube_pod_info 做 label join。Prometheus query 示例：DCGM_FI_DEV_GPU_UTIL * on(namespace, pod) group_left(label_job_name) kube_pod_labels。GPU Operator 的 Grafana dashboard 已预配这种 join。"
+      }
+    ],
+    "megatron-deepspeed-parallelism": [
+      {
+        "text": "Megatron-LM 的 Tensor Parallelism 具体怎么切分 Transformer 层？为什么 TP 必须在 NVLink 域内？",
+        "answer": "QKV 投影矩阵做列切分（column-parallel），FFN 第一层列切分、第二层行切分。每个 TP rank 持有矩阵一个分片，前向时需要 all-reduce 同步。TP 通信在每个 Transformer layer 都发生（2 次 all-reduce），延迟必须低——NVLink 600+GB/s 可接受，IB 200Gbps 跟不上。"
+      },
+      {
+        "text": "DeepSpeed ZeRO Stage 1/2/3 各自分片什么？哪个最省内存？哪个通信量最大？",
+        "answer": "Stage 1：分片优化器状态。Stage 2：加分片梯度。Stage 3：连参数也分片。Stage 3 最省内存（全分片到各 rank），但通信量也最大——前向时需要 all-gather 参数、反向时 reduce-scatter 梯度再释放参数。跨节点带宽不足时 Stage 2 反而更快（参数不分片，少一次 all-gather）。"
+      },
+      {
+        "text": "Pipeline Parallelism 的 bubble 比例怎么计算？怎么减小？",
+        "answer": "理想 1F1B schedule 下 bubble ≈ (p-1) / (p-1+m)，p 是 pipeline stage 数，m 是 micro-batch 数。减小 bubble 的方法：增大 m（更多 micro-batch 分批流水线执行）或减小 p（少分几个 stage）。Megatron 的 interleaved schedule 把每个 stage 放到多个层块上进一步减小 bubble，但增加通信次数。"
+      }
+    ],
+    "pytorch-fsdp-k8s": [
+      {
+        "text": "FSDP 的 HYBRID_SHARD 策略是什么？为什么生产首选？",
+        "answer": "HYBRID_SHARD 在节点内做 FULL_SHARD（all-gather/reduce-scatter 走 NVLink 高速通信），节点间做 replicate（只做 all-reduce 同步梯度，通信量远小于 FULL_SHARD 的 all-gather）。兼顾内存节省（节点内 8 卡分片）和跨节点通信效率（不用跨节点 all-gather 参数）。"
+      },
+      {
+        "text": "FSDP 的 auto_wrap_policy 设错了会怎样？太细和太粗分别有什么问题？",
+        "answer": "太细（每个 Linear 层都包）：all-gather 次数暴增，NCCL launch overhead 累积，吞吐下降。太粗（整个模型一个 FSDP unit）：all-gather 一次要恢复全模型参数，内存峰值和纯 DDP 一样，失去分片优势。最佳是按 Transformer block 粒度包——transformer_auto_wrap_policy 指定 block class。"
+      },
+      {
+        "text": "FSDP 和 DeepSpeed ZeRO-3 主要区别是什么？什么时候选 FSDP？",
+        "answer": "FSDP 是 PyTorch 原生（无需额外库），与 torch.compile、DCP、PyTorch ecosystem 深度集成。DeepSpeed ZeRO-3 功能更丰富（offload to CPU/NVMe、混合精度更灵活、配合 Megatron PP/TP）。选 FSDP：纯 DDP/FSDP 场景、需要 torch.compile 加速、Meta 系生态。选 DeepSpeed：需要 3D 并行、ZeRO-Offload、或已有 DeepSpeed 代码。"
+      }
+    ],
+    "training-fault-tolerance": [
+      {
+        "text": "Meta 训练 OPT-175B 时平均故障间隔是多少？主要故障类型有哪些？",
+        "answer": "Meta 公开的训练日志显示 MTBF 约 2-3 小时，175 天训练总共遇到 ~100+ 次硬件故障。主要类型：GPU ECC 错误（显存硬件故障）、InfiniBand 链路闪断、NVLink CRC 错误、OS kernel panic、OOM。其中 GPU ECC 和 IB 故障最常见，占 ~60%。"
+      },
+      {
+        "text": "NCCL timeout 太长和太短分别有什么问题？生产设多少合适？",
+        "answer": "太长（默认 1800s）：一个节点挂了后其他所有节点空等 30 分钟，浪费大量 GPU 时间。太短（如 60s）：正常的 all-reduce 在大 gradient / 网络抖动时可能偶尔超时，导致误杀健康的训练。生产经验：300-600s，配合自定义 watchdog 做快速检测。Meta 用 300s + heartbeat 机制。"
+      },
+      {
+        "text": "Silent data corruption（静默数据损坏）在 GPU 训练中怎么发生？怎么检测？",
+        "answer": "NVLink 或显存的单 bit 错误（ECC 可纠正但可能漏）导致梯度或参数数据被篡改但不触发 crash。模型继续训练但 loss 突然飙升或 NaN。检测方法：(1) 定期 gradient checksum 验证（所有 rank 对比梯度哈希）；(2) 监控 DCGM 的 ECC volatile 错误计数突变；(3) loss spike 自动触发回滚到上一个 checkpoint。"
+      }
+    ],
+    "multi-node-nvlink-fabric": [
+      {
+        "text": "DGX A100 里的 NVSwitch 和 GPU 之间的直连 NVLink 有什么区别？",
+        "answer": "直连 NVLink 是 GPU-to-GPU 的 point-to-point 链路，两张卡之间有固定带宽。NVSwitch 是交换机——所有 8 张 GPU 连到 6 个 NVSwitch 上，NVSwitch 支持任意 GPU pair 同时全速通信（non-blocking fabric），等效全互联。这是 DGX 和普通 PCIe+NVLink 服务器的核心区别。"
+      },
+      {
+        "text": "B200 NVL72 的 72-GPU NVLink 域意味着什么？对 TP 有什么影响？",
+        "answer": "72 张 GPU 通过外部 NVSwitch 交换机构成单一 NVLink 域，任意两卡都有 NVLink 级带宽（~1.8 TB/s 双向）。这意味着 TP 可以跨节点——TP=72 理论可行。传统架构下 TP 限制在 8（单节点），现在 TP 可以设 16/32/72，显著简化超大模型的并行策略。代价是单点故障域扩大到 72 卡。"
+      },
+      {
+        "text": "一个 DGX H100 节点的 NVSwitch 挂了一个（共 4 个），对训练有什么影响？",
+        "answer": "GPU 不会不可用——剩下 3 个 NVSwitch 仍然提供全互联。但 NVLink 带宽降为原来的 3/4（900 → 675 GB/s），all-reduce 性能劣化约 25%。nvidia-smi nvlink -s 可检测 NVLink lane 状态。必须监控 NVSwitch 健康——通过 DCGM 或 GPU Operator 的 health check，发现异常后 cordon 节点维修。"
+      }
+    ],
+    "training-profiling-debug": [
+      {
+        "text": "torch.profiler 分析结果中'CUDA kernel time'和'CPU time'的比例说明什么？",
+        "answer": "如果 CUDA kernel time 远大于 CPU time，说明 GPU 是主要工作者，正常。如果 CPU time 占比高（>30%），说明 CPU 成为瓶颈——可能是 data loading、Python GIL、或 CUDA kernel launch overhead。后者可以用 torch.compile（trace 整个图减少 launch 次数）或 CUDA Graph 解决。"
+      },
+      {
+        "text": "nccl-tests 的 all_reduce_perf 怎么用来做基准带宽测试？",
+        "answer": "运行 all_reduce_perf -b 8 -e 256M -g 8 -n 20（从 8B 到 256MB 消息，8 GPU，20 轮取平均）。看 busBw 列——这是算法带宽（考虑了 all-reduce 的 2(N-1)/N 系数）。DGX A100 8 卡 NVLink 理论 busBw 约 300 GB/s，实测应该 >250 GB/s。低于这个值说明 NVLink/NVSwitch 有问题。"
+      },
+      {
+        "text": "在 K8s 里跑 nsys profiling 需要什么特殊权限？怎么安全地做？",
+        "answer": "nsys 需要 perf_event_open 系统调用，要求 SYS_ADMIN capability 或 --privileged。这和 PodSecurity restricted profile 冲突。安全做法：(1) 创建专用 profiling namespace 并豁免 PodSecurity（enforce=privileged）；(2) 只在该 namespace 跑 profiling Pod，限制 RBAC 权限；(3) 用 securityContext.capabilities.add=[SYS_ADMIN] 而非全 privileged 最小化权限。"
+      }
+    ],
+    "training-data-pipeline": [
+      {
+        "text": "WebDataset 的 tar shard 格式比传统 ImageFolder 格式好在哪？",
+        "answer": "ImageFolder 每个样本一个文件，读取时大量 random read + inode lookup——S3 上一次 GET 延迟 50-200ms。WebDataset 把几千个样本打包成一个 tar 文件，顺序流式读取——一次 GET 拿到大块连续数据，吞吐高 10-50 倍。且 tar 格式天然支持 streaming，不需要先下载全部数据到本地。"
+      },
+      {
+        "text": "K8s 中 DataLoader worker 的 /dev/shm 为什么容易出问题？怎么解决？",
+        "answer": "DataLoader worker 间通过 shared memory（/dev/shm）传递数据。K8s 中 /dev/shm 默认用 emptyDir medium=Memory，sizeLimit 是节点内存 50%。但如果一个节点跑多个训练 Pod，它们共享这个限额——一个 Pod 用太多会让其他 Pod 的 worker 收到 SIGBUS。解决：Pod spec 里 volumes 显式声明 emptyDir medium=Memory sizeLimit=16Gi。"
+      },
+      {
+        "text": "NVIDIA DALI 把什么操作卸载到 GPU？为什么对 vision 训练特别有效？",
+        "answer": "DALI 把 JPEG 解码（用 GPU nvJPEG 库）、resize、crop、normalize、颜色空间转换等增强操作全卸载到 GPU。Vision 训练的数据预处理是 CPU 密集型——传统 num_workers=8 在大 batch 时 CPU 成为瓶颈。DALI 让 GPU 同时做 compute 和 data preprocessing，CPU 只需从磁盘读 raw bytes。"
+      }
+    ],
+    "kserve-architecture": [
+      {
+        "text": "KServe InferenceService 的 predictor、transformer、explainer 三个组件为什么设计为独立 Pod 而非同一 Pod 的多容器？这种设计在 GPU 资源管理上有什么优势？",
+        "answer": "独立 Pod 设计允许三个组件各自独立伸缩和调度：predictor 需要 GPU 而 transformer 通常只需 CPU，放在同一 Pod 会浪费 GPU 资源。独立部署后 transformer 可以快速横向扩展处理突增的前处理请求，而昂贵的 GPU predictor 保持稳定副本数。此外，独立生命周期意味着更新 transformer 逻辑无需重启 predictor（避免模型重新加载）。"
+      },
+      {
+        "text": "KServe 的 Serverless 模式和 RawDeployment 模式分别在什么场景下选用？如果集群没有安装 Istio，能否使用 KServe？",
+        "answer": "Serverless 模式适合流量波动大、需要 scale-to-zero 节省 GPU 成本的场景，但依赖 Knative Serving + Istio，冷启动延迟较高。RawDeployment 模式不依赖 Knative 和 Istio，直接创建 K8s Deployment + Service，运维简单，适合流量稳定、延迟敏感的服务。没有 Istio 时只能使用 RawDeployment 模式，但会失去流量分割（金丝雀发布）和 header-based routing 等高级流量管理能力。"
+      },
+      {
+        "text": "ModelMesh 如何实现在共享 GPU 内存中同时服务数百个小模型？它与 KServe 原生的 multi-model serving 有什么区别？",
+        "answer": "ModelMesh（kserve/modelmesh-serving）在每个 GPU Pod 中运行一个模型管理进程，将多个小模型加载到同一 GPU 显存中，通过 LRU 策略动态换入换出不活跃的模型。请求到达时智能路由到已加载目标模型的 Pod，避免冷加载。与 KServe 原生方式（每个 InferenceService 对应独立 Pod）不同，ModelMesh 多个模型共享同一组 Pod，显著减少 GPU 碎片浪费，适合模型数量多但单个模型较小（< 5GB）的场景。"
+      }
+    ],
+    "triton-inference-server": [
+      {
+        "text": "Triton 的 Dynamic Batching 中，max_queue_delay_microseconds 和 preferred_batch_size 两个参数如何协同工作？调大 max_queue_delay 对延迟和吞吐分别有什么影响？",
+        "answer": "Triton 的 Dynamic Batching 在两种条件下触发组批：请求数达到 preferred_batch_size，或队列等待时间达到 max_queue_delay_microseconds。调大 max_queue_delay 意味着等待更长时间凑更大的 batch，吞吐提升（GPU 并行效率更高）但单请求延迟增加（排队等待时间变长）。对延迟敏感的在线服务建议 max_queue_delay 设在 100-500μs，对吞吐优先的离线服务可设到 5000-50000μs。"
+      },
+      {
+        "text": "Triton 的 Ensemble Model 和 BLS（Business Logic Scripting）分别适合什么场景？如果推理流水线中有条件分支逻辑（根据模型 A 的输出决定是否调用模型 B），应该用哪种方式？",
+        "answer": "Ensemble Model 是声明式 DAG，通过 config.pbtxt 定义模型间的输入输出连接，适合线性或固定拓扑的流水线（如 tokenize → encode → decode）。BLS 使用 Python Backend 编写编排逻辑，可以包含 if/else 分支、循环、动态路由等复杂逻辑。条件分支场景必须使用 BLS，因为 Ensemble 只支持静态 DAG，无法在运行时根据中间结果改变执行路径。"
+      },
+      {
+        "text": "Triton 部署到 K8s 时，为什么应该用 startupProbe 而不是 livenessProbe 来处理模型加载阶段？如果两个 Probe 都配置了，它们的执行顺序是什么？",
+        "answer": "Kubernetes 在 startupProbe 成功之前不会执行 livenessProbe 和 readinessProbe。Triton 加载大模型时 HTTP 端口未就绪，如果只配 livenessProbe，其 failureThreshold 耗尽后 kubelet 会杀掉容器重启，形成无限重启循环。startupProbe 提供了独立的宽容期（failureThreshold × periodSeconds），在此期间 livenessProbe 被抑制。正确做法是 startupProbe 设置足够长的超时覆盖最慢的模型加载时间，livenessProbe 用较短间隔检测运行时异常。"
+      }
+    ],
+    "vllm-on-k8s": [
+      {
+        "text": "vLLM 的 PagedAttention 如何解决传统 KV Cache 的内存碎片化问题？与操作系统的虚拟内存机制有什么类比关系？",
+        "answer": "传统实现为每个请求预分配最大序列长度的连续 KV Cache 显存，短序列浪费大量空间且无法被其他请求复用（内部碎片）。PagedAttention 将 KV Cache 分成固定大小的 block（类似内存页），每个请求按需分配 block，通过 block table（类似页表）映射逻辑位置到物理显存地址。请求结束后 block 立即回收，新请求可复用任意空闲 block，消除了碎片化。这与 OS 虚拟内存的 page + page table + demand paging 机制直接类比。"
+      },
+      {
+        "text": "vLLM 的 tensor parallelism 在 K8s 部署中为什么要求所有 GPU 在同一节点？如果需要部署超过单节点 GPU 数量的模型（如 8 卡节点部署需要 16 卡的模型），有什么替代方案？",
+        "answer": "推理场景的 tensor parallelism 每个 forward pass 需要多次 all-reduce 通信，跨节点走网络的延迟（即使是 RDMA 也有微秒级）会严重拖慢逐 token 生成速度，不像训练可以靠大 batch 摊薄通信占比。如果模型需要超过单节点 GPU 数量，可以使用 pipeline parallelism（PP）替代：将模型按层分段放到不同节点，PP 通信量远小于 TP。vLLM 支持 --pipeline-parallel-size 参数，但会引入 pipeline bubble 降低效率，需要在延迟和硬件成本间权衡。"
+      },
+      {
+        "text": "vLLM 的 --gpu-memory-utilization 参数设为 0.9 和 0.85 在高并发场景下有什么实质性区别？如何通过监控指标判断当前设置是否合理？",
+        "answer": "该参数决定 vLLM 预分配多少比例的 GPU 显存给 KV Cache page pool。0.9 意味着更大的 page pool，能同时服务更多并发请求，但剩余 10% 显存需要覆盖模型权重之外的所有临时分配（CUDA context、activation 等）。高并发突增时如果 page pool 仍然耗尽，新请求会排队；若临时分配超出剩余空间则 OOM。设为 0.85 牺牲约 5% 并发容量换取安全边际。关键监控指标：vllm:gpu_cache_usage_perc（KV Cache 使用率持续 > 95% 说明需要扩容或降低 utilization）、vllm:num_requests_waiting（排队请求数）。"
+      }
+    ],
+    "inference-autoscaling": [
+      {
+        "text": "为什么 GPU 利用率（DCGM_FI_DEV_GPU_UTIL）不是推理服务自动伸缩的好指标？相比之下，请求队列深度或并发数有什么优势？",
+        "answer": "GPU 利用率是采样型滞后指标：当推理请求持续到达时 GPU 利用率始终接近 100%，无论排队 10 个还是 1000 个请求，利用率看起来一样，无法区分负载是否过饱和。而请求队列深度（如 triton_request_queue_count）或并发数直接反映待处理的工作量，是领先指标——队列增长说明当前容量不足，可以在延迟恶化之前触发扩容。基于并发数伸缩还天然支持 scale-to-zero（并发降为 0 即可缩容）。"
+      },
+      {
+        "text": "KEDA 的 ScaledObject 与 Kubernetes 原生 HPA 有什么核心区别？为什么 GPU 推理场景更推荐 KEDA？",
+        "answer": "HPA 只支持 resource metrics 和通过 custom-metrics-apiserver 注册的指标，且无法 scale-to-zero（HPA minReplicas 最低为 1）。KEDA 直接对接 Prometheus、Kafka、RabbitMQ 等 50+ 事件源，支持复杂的 PromQL 查询作为触发条件，且原生支持 scale-to-zero（通过 ScaledObject 的 minReplicaCount: 0）。GPU 推理场景需要基于业务指标（队列深度、P99 延迟）而非资源指标伸缩，KEDA 的 Prometheus scaler 能直接编写 PromQL 表达式，无需额外部署 prometheus-adapter。"
+      },
+      {
+        "text": "Knative KPA 的 concurrency-based autoscaling 中，target concurrency 设为 1 意味着什么？对推理服务来说这个值应该设多少？",
+        "answer": "target concurrency 为 1 表示每个 Pod 期望同时处理 1 个请求，超过 1 个并发就触发扩容。对推理服务这通常太激进——GPU 推理通过 batching 处理多个并发请求效率更高，target 设为 1 会导致过度扩容浪费 GPU。合理值应接近单 Pod 的最优 batch size，例如 Triton 配置 preferred_batch_size 为 8，则 target concurrency 设为 8 左右，让每个 Pod 在最高效的 batch 大小附近工作。"
+      }
+    ],
+    "model-versioning-canary": [
+      {
+        "text": "KServe 的 canaryTrafficPercent 字段在底层是如何实现流量分割的？如果不使用 Istio，金丝雀发布还能工作吗？",
+        "answer": "KServe Controller 监听 InferenceService 的 canaryTrafficPercent 字段，据此创建或更新 Istio VirtualService，在 route 中为 default revision 和 canary revision 设置不同的 weight。例如 canaryTrafficPercent: 10 会生成 default weight: 90 和 canary weight: 10 的路由规则。如果不使用 Istio（RawDeployment 模式），KServe 不会创建 VirtualService，原生的金丝雀流量分割不可用。此时需要借助 Argo Rollouts 或 Nginx Ingress 的 canary annotation 等替代方案实现流量分割。"
+      },
+      {
+        "text": "为什么 LLM 的金丝雀发布不能仅依赖延迟和错误率来判断是否晋升？推荐用什么替代方案来评估新版本质量？",
+        "answer": "LLM 的延迟和错误率只反映运行时健康度，不反映输出质量：新版本可能延迟正常、无错误，但生成内容质量下降（幻觉增多、逻辑不连贯、特定语言退化）。质量指标（BLEU、ROUGE、GPT-eval、人工评测）反馈周期长且噪声大，不适合实时判定。推荐先用 Istio mirror 模式将生产流量复制到新版本做 shadow traffic，对新旧版本的输出进行离线对比评测。通过质量评估后再进入正式的金丝雀流量切换，以 token 速度和首 token 延迟作为快速回滚信号。"
+      },
+      {
+        "text": "DVC 和 OCI artifact registry（如 oras）管理模型版本各有什么优劣？对于 70B 级别的大模型，你更推荐哪种方案？",
+        "answer": "DVC 将模型 hash 存入 Git，实际文件在远端存储（S3/GCS），通过 Git tag 实现版本与代码对齐，优点是与 Git 工作流紧密集成，缺点是 dvc pull 大文件依赖网络带宽且无增量下载。OCI artifact registry（oras）将模型打包为 OCI image layer，复用容器 registry 的分发网络和缓存机制，支持 content-addressable layer dedup。对 70B 模型推荐 OCI 方案：容器 runtime 原生支持 layer 缓存和 lazy pulling（如 Stargz/Nydus），模型镜像只需拉取变更 layer，且与 K8s 镜像分发基础设施统一管理。"
+      }
+    ],
+    "inference-optimization": [
+      {
+        "text": "AWQ 和 GPTQ 同为 INT4 量化方案，它们的核心算法区别是什么？在 vLLM 中使用时性能表现有何不同？",
+        "answer": "GPTQ 使用逐层的二阶近似（Hessian 矩阵）来最小化量化误差，量化过程需要校准数据集，计算成本较高但量化质量稳定。AWQ 的核心思想是保护对输出影响最大的权重通道（salient channels），通过 per-channel scaling 让显著权重获得更高有效精度。在 vLLM 中，AWQ 模型通常推理速度略快于 GPTQ（因为 AWQ kernel 更适合 GPU 并行），且量化过程更快。两者在主流 LLM 上的质量损失都 < 1%，但具体任务可能有差异，需要实测。"
+      },
+      {
+        "text": "TensorRT engine 为什么与 GPU 架构绑定？如果你的集群同时有 A100 和 H100 节点，应该如何在 CI/CD 中管理 engine 构建？",
+        "answer": "TensorRT 在编译时将模型优化为特定 GPU 架构的 CUDA kernel（SM 版本、Tensor Core 代数、显存带宽等参数不同），生成的 engine 包含架构特定的指令序列，无法跨架构运行（如 SM 80 engine 不能在 SM 90 上执行）。CI/CD 中应为每种 GPU 架构设置独立的构建 job：在对应 GPU 节点上运行 trtllm-build，产出以架构命名的 engine artifact（如 model-llama70b-sm80.engine、model-llama70b-sm90.engine）。部署时通过 nodeSelector 或 runtimeClassName 匹配正确的 engine 版本。"
+      },
+      {
+        "text": "CUDA Graphs 在推理中的优化原理是什么？它对什么类型的推理负载效果最显著？有什么限制？",
+        "answer": "CUDA Graphs 在第一次执行时录制整个计算图的 kernel 调用序列，后续执行直接 replay 录制好的图，跳过 CPU 端的 kernel launch overhead（每次 launch 约 5-10μs，密集小算子场景开销占比大）。对小 batch size 的推理效果最显著——因为此时 GPU 计算时间短，kernel launch 开销占总延迟比例高。限制是图录制后形状固定，不支持动态 shape（不同 batch size 或序列长度需要分别录制多个 graph），且图内不能有条件分支或动态控制流。"
+      }
+    ],
+    "gpu-cluster-capacity": [
+      {
+        "text": "A100 SXM 和 A100 PCIe 的核心区别是什么？什么场景下选 PCIe 版本更合适？",
+        "answer": "核心区别是卡间互联：SXM 封装通过 NVLink 互联（A100 为 600GB/s），PCIe 封装只有 PCIe Gen4（64GB/s），带宽差约 10 倍。但 PCIe 版本便宜约 30%。单卡推理、小模型 fine-tuning 等不需要多卡高速通信的场景选 PCIe 更划算；多卡分布式训练（DDP/FSDP）因为 all-reduce 严重依赖卡间带宽，必须选 SXM。"
+      },
+      {
+        "text": "GPU 集群容量规划时，为什么不能按 100% 利用率来算卡数？生产中合理的利用率目标是多少？",
+        "answer": "因为实际存在多种开销：checkpoint 写入阻塞（占 1-3% 时间）、Job 排队间隙、节点维护和故障（GPU 节点月故障率 2-5%）、调度碎片等。生产中合理的利用率目标是 60-80%。以 70% 为例，如果工作负载需要 100 GPU-hours，实际需要规划 100/0.7 ≈ 143 GPU-hours 的容量，再加上 N+1 冗余节点应对故障。"
+      },
+      {
+        "text": "自建 GPU 集群 vs 全上云，break-even point 大约在什么条件下？关键变量有哪些？",
+        "answer": "以 DGX A100（约 $200K）为例，对标 AWS p4d.24xlarge on-demand（$32.77/hr），自建在利用率 >70% 时约 18-24 个月回本。关键变量有三个：(1) 利用率——低于 50% 自建永远比云贵；(2) 使用年限——GPU 硬件每 2-3 年换代，超过 3 年可能需要换代投入；(3) 运维成本——自建需要 IDC 机柜、电力（8×A100 功耗约 6.5kW）、网络、运维团队等隐性成本，这些加起来可占硬件成本的 30-50%。"
+      }
+    ],
+    "dra-dynamic-resource": [
+      {
+        "text": "Device Plugin 的'基于数量分配'模型有什么根本缺陷？举一个它无法表达的真实调度需求。",
+        "answer": "Device Plugin 只支持 count-based 分配——'给我 N 个 nvidia.com/gpu'，无法表达设备之间的拓扑关系或属性约束。典型无法表达的需求：'给我 2 张在同一 NVLink domain 的 GPU'。Device Plugin 的 Allocate 接口返回的 device ID 列表是 kubelet 随机选的，可能把两张跨 PCIe Switch 的卡分给同一个 Pod，导致训练通信带宽骤降。同理，'给我一张 GPU 和它直连的那张 RDMA NIC'也无法表达。"
+      },
+      {
+        "text": "DRA 的 ResourceClaim 和传统的 resource requests 有什么本质区别？为什么 DRA 用 CEL 表达式而不是简单的数量？",
+        "answer": "传统 resource requests 是标量——'nvidia.com/gpu: 2' 只表达数量。ResourceClaim 是结构化的——它描述'我需要什么属性的设备'，通过 CEL 表达式如 `device.attributes['memory'].compareTo(quantity('40Gi')) >= 0` 表达属性约束。用 CEL 是因为设备属性维度多样（型号、显存、互联拓扑、NUMA 位置），简单数量模型无法覆盖，而 CEL 提供了灵活且可扩展的表达能力，scheduler 可以在不修改核心代码的情况下理解新属性。"
+      },
+      {
+        "text": "从 Device Plugin 迁移到 DRA 时，为什么两者不能同时管理同一个 GPU 设备？迁移的正确步骤是什么？",
+        "answer": "因为 Device Plugin 和 DRA 各自独立维护设备的分配状态——如果同时运行，一个 GPU 可能被 Device Plugin 分配给 Pod A，同时又被 DRA 分配给 Pod B，造成设备冲突。正确步骤是分批 rolling 迁移：先选一个节点池，drain 所有 GPU Pod，停掉该节点池的 nvidia device plugin DaemonSet，部署 NVIDIA DRA driver（NVIDIA/k8s-dra-driver），验证 `kubectl get resourceslices` 能看到设备信息后，将新 Pod 的 YAML 改为使用 ResourceClaim 方式申请 GPU，再逐步扩展到其他节点池。"
+      }
+    ],
+    "slurm-k8s-hybrid": [
+      {
+        "text": "Slurm 的 sbatch/srun 模型和 K8s 的 Job/Pod 模型在调度粒度上有什么关键差异？这在混合编排中造成什么困难？",
+        "answer": "Slurm 以节点为调度单位——`sbatch --nodes=4` 拿到 4 台完整物理机，进程通过 srun 在节点内自行分配。K8s 以 Pod 为调度单位——每个 Pod 是一个调度实体，可能被分配到不同节点。混合编排时，如果一个 Slurm 作业要 4 节点×8 GPU=32 GPU，对应到 K8s 可能变成 32 个单卡 Pod 分散在 8 个节点上，拓扑和通信效率完全不同。必须用 gang scheduling + topology-aware scheduling 才能在 K8s 侧还原出'整节点分配'的效果。"
+      },
+      {
+        "text": "NVIDIA Pyxis + Enroot 解决了 Slurm 集群的什么问题？和直接在 K8s 上跑容器有什么区别？",
+        "answer": "Pyxis 是 Slurm 的容器插件，Enroot 是无特权容器运行时。两者组合让 Slurm 作业可以拉取 Docker/NGC 镜像在裸金属上运行，解决了 HPC 环境的'环境一致性'问题——研究人员不用再在每个节点上手动装 CUDA、PyTorch。和 K8s 容器的区别是：Pyxis/Enroot 跑在裸金属上没有 overlay 网络、没有 cgroup namespace 额外开销，训练性能更接近裸跑；但代价是失去了 K8s 的服务发现、自动伸缩、声明式管理等能力。"
+      },
+      {
+        "text": "Slurm 集群通常依赖 Lustre/GPFS 共享文件系统。如果要和 K8s 集群做混合调度，存储层怎么打通？",
+        "answer": "需要让 K8s Pod 也能挂载同一个共享文件系统。常见方案：(1) 用 Lustre CSI driver 把 Lustre 文件系统挂载为 K8s PV，Pod 通过 PVC 访问和 Slurm 节点相同的数据路径；(2) 用 NFS 做中间层——Slurm 和 K8s 节点都挂载同一个 NFS server；(3) 用对象存储（S3）做数据桥接，两侧各自上传/下载。方案 1 性能最好但需要 K8s 节点和 Lustre 网络互通，方案 3 最解耦但有数据搬运延迟。"
+      }
+    ],
+    "gpu-finops": [
+      {
+        "text": "GPU Spot 实例被中断时，K8s 侧发生了什么？从中断信号到训练恢复的完整链路是怎样的？",
+        "answer": "云厂商提前约 2 分钟发出中断通知 → node 被标记为不可调度（cordon）→ kubelet 向 Pod 发送 SIGTERM → Pod 的 preStop hook 触发紧急 checkpoint 写入共享存储 → terminationGracePeriodSeconds 倒计时结束后 Pod 被删除 → Kueue 检测到 workload 失败自动 re-queue → Karpenter 或 cluster-autoscaler 从其他 AZ 补充新 Spot 节点 → Pod 重新调度到新节点 → 训练从最近的 checkpoint 恢复。整个链路的瓶颈是 checkpoint 写入速度，2 分钟窗口对大模型可能不够。"
+      },
+      {
+        "text": "opencost 和 kubecost 在 GPU 成本归因上分别怎么工作？能做到 per-Job 的 GPU 成本拆分吗？",
+        "answer": "opencost（CNCF 开源项目）和 kubecost（商业版本基于 opencost）都通过读取 K8s resource requests/limits + 云厂商账单 API 来计算成本。GPU 成本归因原理：读取 Pod 的 `nvidia.com/gpu` 请求量 × 对应实例类型的 GPU 单价 × 运行时长。配合 Pod label（如 `job-name`、`team`），可以做到 per-Job、per-namespace 的 GPU 成本拆分。局限是它们基于 allocation 而非 utilization——一个 Pod 申请了 1 卡但只用了 10%，成本仍按 1 卡算，这就是为什么要同时看 utilization 指标。"
+      },
+      {
+        "text": "为什么说'不要用 A100 跑 T4 能搞定的推理任务'？怎么用监控数据判断一个推理服务应该降级到哪种卡？",
+        "answer": "A100 on-demand $3.5/hr，T4 仅 $0.526/hr，差 7 倍。如果一个推理服务的实际显存使用 <12GB、单次推理不需要 A100 的算力，用 A100 就是浪费。判断方法：用 DCGM_FI_DEV_FB_USED 监控实际显存峰值，用 DCGM_FI_DEV_GPU_UTIL 看算力利用率。如果显存峰值 <14GB 且利用率 <30%，说明 T4（16GB）就够了；如果显存 <22GB 且不需要多卡，A10G（24GB）是更好的选择。持续监控 1-2 周取峰值作为决策依据。"
+      }
+    ],
+    "gpu-observability-platform": [
+      {
+        "text": "DCGM Exporter 的 GPU 指标默认只有 device 维度（gpu=0/1/2...），怎么关联到具体的 Pod 和 Job？写出关键的 PromQL。",
+        "answer": "需要用 Prometheus 的 group_left 将 DCGM 指标和 kube-state-metrics 的 Pod 标签做 join。关键 PromQL：`DCGM_FI_DEV_GPU_UTIL * on(namespace, pod) group_left(label_job_name) kube_pod_labels{label_job_name=~\".+\"}`。前提是 kube-state-metrics 配置了暴露 Pod labels，且 DCGM Exporter 的指标中包含 pod 和 namespace label（GPU Operator 部署时默认启用 Pod 级别 label enrich）。如果 label 名不一致需要先用 label_replace 对齐。"
+      },
+      {
+        "text": "XID 48 和 XID 74 分别代表什么 GPU 故障？看到这两种错误应该怎么处理？",
+        "answer": "XID 48 是 Double-Bit ECC Error（不可纠正的显存错误），意味着 GPU 显存出现硬件级损坏，该卡上运行的所有 CUDA 程序会立即失败。XID 74 是 NVLink Error，说明卡间 NVLink 互联出现通信故障。处理方式：XID 48 需要立即 cordon 该节点、drain 上面的 Pod、向硬件供应商报修更换 GPU；XID 74 先检查 NVLink 物理连接，如果持续出现也需要下线检修。两者都应配置为 critical 级别告警并自动触发节点排水。"
+      },
+      {
+        "text": "一个 200 节点 × 8 GPU 的集群，DCGM 指标会产生多少 Prometheus 时间序列？怎么防止高基数问题拖垮 Prometheus？",
+        "answer": "200 节点 × 8 GPU = 1600 个设备，DCGM 默认暴露约 50+ 指标，再乘以 Pod 维度（假设每 GPU 对应 1 个 Pod），约 1600 × 50 = 80000 基础 series。如果加上 histogram 或 label 变体可能翻倍。解决方案：(1) 用 recording rules 预聚合——比如 `gpu:namespace:utilization_avg` 按 namespace 聚合，减少 dashboard 查询时的 series 扫描量；(2) 只采集必要指标——DCGM Exporter 支持通过 ConfigMap 配置只暴露关键 field ID；(3) 合理设置 scrape interval 为 15-30s（GPU 指标不需要秒级精度）；(4) 对历史数据用 Thanos/Cortex 做降采样。"
       }
     ]
   }

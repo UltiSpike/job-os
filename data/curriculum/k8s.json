@@ -212,6 +212,326 @@
           }
         }
       ]
+    },
+    {
+      "slug": "k8s-storage",
+      "order_index": 3,
+      "name": "存储与数据面",
+      "description": "K8s 存储抽象从 PV/PVC 到 CSI，是连接计算和数据的桥梁。在 AI 场景中，存储选型直接决定训练吞吐——checkpoint 写入慢可以让千卡训练白等，数据加载 I/O 不够可以让 GPU 利用率跌到 50%。这一模块从核心抽象到高性能存储对接，全部用 AI 工作负载场景驱动。",
+      "lessons": [
+        {
+          "slug": "pv-pvc-lifecycle",
+          "order_index": 1,
+          "name": "PV / PVC 生命周期与 Reclaim 策略",
+          "prereq": ["declarative-reconcile"],
+          "est_minutes": 25,
+          "concept_md": "PV（PersistentVolume）是集群级的存储资源对象，由管理员或动态供给创建；PVC（PersistentVolumeClaim）是用户对存储的声明式请求——我要多大、什么 access mode、什么 StorageClass。PV 和 PVC 的 binding 是一次性配对：controller-manager 里的 PV controller 扫描未绑定的 PVC，找到满足 capacity ≥ requested 且 access mode 兼容的 PV，双向写入 claimRef/volumeName 完成绑定。\n\nAccess Modes 三种：RWO（单节点读写）、ROX（多节点只读）、RWX（多节点读写）。注意这是**节点**级别不是 Pod 级别——RWO 意味着同一节点上的多个 Pod 可以同时挂载。AI 训练场景中数据集卷通常 ROX（多 worker 只读同一份数据），checkpoint 卷通常 RWO（单 writer）。\n\nReclaim Policy 决定 PVC 删除后 PV 的命运：**Delete** 连底层存储一起删除（动态供给的默认值，危险：训练完删 PVC 就丢 checkpoint）；**Retain** 保留 PV 和数据但标记为 Released 不再可绑定，需管理员手动清理 claimRef 后才能重新绑定；Recycle 已废弃。\n\n一个容易被忽略的字段：`volumeBindingMode: WaitForFirstConsumer`。默认 Immediate 模式下 PVC 创建即绑定 PV，PV 可能被供给在 zone-a，但 Pod 被调度到 zone-b——跨 zone 挂载要么失败要么延迟极高。WaitForFirstConsumer 让 PV 的创建/绑定推迟到 Pod 调度阶段，scheduler 先选节点再让 provisioner 在同 zone 创建 PV。GPU 集群中这个配置是标配——GPU 节点通常只在特定 zone，存储必须跟着走。",
+          "capstone": {
+            "prompt": "你的团队在 GPU 集群上跑分布式训练，每次训练结束后删除 Job 和对应的 PVC。运维发现上个月的 checkpoint 数据全丢了。请分析：(1) 最可能的原因是什么？从 PV 的 reclaim policy 和动态供给的默认行为解释；(2) 如何在不改应用代码的前提下防止这类事故？给出至少两种方案并说明各自适用场景；(3) 如果集群 GPU 节点分布在 zone-a 和 zone-b，但存储只在 zone-a 有，你还需要注意什么？",
+            "depth": 3
+          }
+        },
+        {
+          "slug": "storageclass-dynamic",
+          "order_index": 2,
+          "name": "StorageClass 与动态供给",
+          "prereq": ["pv-pvc-lifecycle"],
+          "est_minutes": 25,
+          "concept_md": "手动创建 PV 在大规模集群中不可行——几百个训练 Job 各自要一个卷，管理员不可能提前预创建。StorageClass 解决这个问题：PVC 引用一个 StorageClass 名，controller 发现没有可绑定的 PV 时，调用该 SC 关联的 provisioner 自动创建 PV。这就是动态供给（dynamic provisioning）。\n\nStorageClass 的三个核心字段：**provisioner**（谁来创建卷，如 ebs.csi.aws.com、pd.csi.storage.gke.io）、**parameters**（传给 provisioner 的参数，如 type=gp3、iops=16000、throughput=1000）、**reclaimPolicy**（供给出的 PV 默认的回收策略）。同一个集群可以有多个 SC，对应不同性能档位。\n\nAI 集群的典型 SC 设计：三档存储。**高 IOPS 档**（io2/gp3 高配）：给 checkpoint 写入——千卡训练每个 epoch 写一次 checkpoint，几十 GB 数据要在分钟级写完，IOPS 和吞吐都不能低。**高吞吐档**（st1 或 Lustre-backed）：给训练数据集——顺序读为主，要 GB/s 级带宽。**廉价档**（gp3 默认配置）：给日志、metrics 等非关键数据。\n\n`allowedTopologies` 字段约束 provisioner 只在指定 zone/region 创建卷——配合 WaitForFirstConsumer 使用，确保 PV 创建在 GPU 节点所在 zone。`volumeBindingMode` 在 SC 上设置而不是 PVC 上。\n\n一个实践陷阱：集群中如果设了 default StorageClass（annotation `storageclass.kubernetes.io/is-default-class: true`），所有不指定 SC 的 PVC 都会用它。如果默认 SC 的 reclaimPolicy=Delete，开发者不知情地用了默认 SC 存 checkpoint，删 PVC 就丢数据——这就是为什么 AI 集群的默认 SC 应该设成 Retain。",
+          "capstone": {
+            "prompt": "你需要为一个 100 节点的 GPU 训练集群设计 StorageClass 方案。需求：checkpoint 需要高 IOPS 低延迟写入、训练数据集需要高吞吐顺序读、日志需要低成本存储。请：(1) 设计三个 StorageClass 的 yaml（provisioner/parameters/reclaimPolicy/volumeBindingMode 都要写）；(2) 解释为什么默认 SC 不应该是高 IOPS 档；(3) 如果一个新同事创建了 PVC 但没指定 SC，会发生什么？你如何从制度和技术两个层面防止误用？",
+            "depth": 3
+          }
+        },
+        {
+          "slug": "csi-architecture",
+          "order_index": 3,
+          "name": "CSI 插件架构 Controller/Node/Identity",
+          "prereq": ["storageclass-dynamic"],
+          "est_minutes": 30,
+          "concept_md": "CSI（Container Storage Interface）是 K8s 存储的插件标准，把'创建卷、挂载卷'这件事从 K8s 核心代码中解耦出来。CSI 驱动由三组 gRPC 服务组成：\n\n**Identity Service**：最简单，只负责报告插件名称、版本、能力（GetPluginInfo/GetPluginCapabilities/Probe）。所有 CSI 组件都实现它。\n\n**Controller Service**：处理卷的生命周期——CreateVolume/DeleteVolume（创建删除底层存储）、ControllerPublishVolume/ControllerUnpublishVolume（把卷 attach 到节点，对应云平台的 AttachDisk API）、CreateSnapshot/DeleteSnapshot。通常以 Deployment（1-2 副本）方式部署，因为它操作的是集群级资源，不需要在每个节点上跑。\n\n**Node Service**：处理节点本地操作——NodeStageVolume（把块设备格式化/挂载到节点的 staging 目录）、NodePublishVolume（从 staging 目录 bind mount 到 Pod 的 volume 目录）、NodeUnpublishVolume/NodeUnstageVolume。**必须以 DaemonSet 部署**，因为它要操作宿主机的 mount namespace——每个节点都需要。\n\n这些 gRPC 服务不是 K8s 直接调用的。中间有一层 sidecar 容器桥接：**external-provisioner**（watch PVC → 调 CreateVolume）、**external-attacher**（watch VolumeAttachment → 调 ControllerPublish）、**external-resizer**（watch PVC capacity 变更 → 调 ExpandVolume）、**external-snapshotter**（watch VolumeSnapshot → 调 CreateSnapshot）、**node-driver-registrar**（向 kubelet 注册 CSI 驱动路径）。\n\nGPU 节点为什么需要额外关注 CSI DaemonSet：GPU 节点的 Node 组件 Pod 需要 mount 宿主机目录、可能需要特权模式，且如果 Node Pod 挂了，该节点上所有新 Pod 的卷挂载都会失败——训练 Job 的 Pod 会卡在 ContainerCreating。所以 CSI Node DaemonSet 的健康监控和快速恢复在 GPU 集群中是 P0 优先级。",
+          "capstone": {
+            "prompt": "你的 GPU 集群上一个 CSI 驱动的 Node DaemonSet Pod 在某个节点上 OOMKilled 了。请分析：(1) 这个节点上已经在运行的、已经挂载好卷的 Pod 会受影响吗？为什么？(2) 这个节点上新调度过来的、需要挂载卷的 Pod 会怎样？(3) 如果 Controller Deployment 的 Pod 也同时挂了，影响范围会扩大到什么程度？(4) 你会怎么设计监控来第一时间发现 CSI 组件异常？",
+            "depth": 3
+          }
+        },
+        {
+          "slug": "volume-expansion-snapshot",
+          "order_index": 4,
+          "name": "Volume 扩容、快照与克隆",
+          "prereq": ["csi-architecture"],
+          "est_minutes": 25,
+          "concept_md": "在线扩容（Online Volume Expansion）需要三个条件同时满足：StorageClass 设置 `allowVolumeExpansion: true`、CSI 驱动支持 ControllerExpandVolume 和 NodeExpandVolume、底层存储支持在线扩展。扩容过程分两步：先由 external-resizer 调用 Controller 扩展底层卷容量（如 AWS 的 ModifyVolume），再在 Pod 所在节点由 kubelet 调用 Node 扩展文件系统（resize2fs/xfs_growfs）。整个过程 Pod 不需要重启，对应用透明。\n\nAI 场景的典型需求：训练跑到一半发现 100GB 的 checkpoint 卷不够了，需要在线扩容到 500GB。注意：扩容是单向的——只能扩不能缩，缩容要走创建新卷 + 数据迁移的流程。\n\nVolumeSnapshot 是存储快照的 K8s 抽象，需要三个组件：VolumeSnapshot CRD + snapshot-controller（watch VolumeSnapshot 对象）+ CSI snapshotter sidecar（调用 CSI 驱动的 CreateSnapshot）。用法：创建 VolumeSnapshot 引用一个 PVC，底层存储做快照（通常是 COW 或 ROW）。从快照恢复：创建 PVC 时设置 `dataSource.kind=VolumeSnapshot`，provisioner 从快照创建新卷。\n\nAI 训练中快照的用途：每个 epoch 结束后做一次 snapshot，训练崩溃后可以从最近的 snapshot 恢复 checkpoint，不用从头训练。快照比全量复制快一个量级（底层是 COW）。\n\nClone 是快照的语法糖——PVC 的 dataSource 直接引用另一个 PVC（`kind: PersistentVolumeClaim`），底层实现通常先隐式做快照再从快照创建卷。好处是不需要显式管理 VolumeSnapshot 对象，适合'从已有数据集卷克隆一份给新训练 Job'的场景。",
+          "capstone": {
+            "prompt": "你的 AI 平台每天跑 50 个训练 Job，每个 Job 需要从同一个 2TB 数据集卷读取数据。请设计方案：(1) 用 Clone 还是 Snapshot + Restore？各自的优缺点和底层实现差异；(2) 训练过程中 checkpoint 卷从 100GB 扩容到 500GB 的完整步骤，需要注意什么（文件系统类型的影响）？(3) 如果底层是 EBS，50 个 clone 同时创建会遇到什么限制？你怎么解决？",
+            "depth": 3
+          }
+        },
+        {
+          "slug": "ephemeral-projected-volume",
+          "order_index": 5,
+          "name": "Ephemeral Volume 与 Projected Volume",
+          "prereq": ["pv-pvc-lifecycle"],
+          "est_minutes": 20,
+          "concept_md": "不是所有存储都需要持久化。K8s 提供多种临时和投射卷类型，覆盖'Pod 级别临时空间'和'把配置/凭证注入 Pod'两类需求。\n\n**emptyDir**：Pod 创建时分配的空目录，Pod 删除时数据消失。默认用节点磁盘，设置 `medium: Memory` 则用 tmpfs（内存盘，速度快但占节点内存配额）。AI 推理场景：Pod 启动时从 S3 拉模型文件到 emptyDir 做本地缓存，推理时直接读本地——避免每次请求都走网络。**sizeLimit** 字段非常重要：不设的话 emptyDir 可以撑爆节点磁盘，触发 eviction。设了 sizeLimit，超限时 kubelet 会驱逐 Pod。\n\n**configMap/secret volume**：把 ConfigMap 或 Secret 的内容挂载为文件。kubelet 会定期（默认 60s）同步更新——修改 ConfigMap 后卷中的文件会自动更新（但应用需要自己 reload，K8s 不会通知进程）。secret volume 默认 tmpfs 挂载，不落盘。\n\n**downwardAPI volume**：把 Pod 的 metadata（labels/annotations/resource limits）暴露为文件。常用于让应用知道自己被分配了多少 GPU 而不用硬编码。\n\n**projected volume**：把上述多种源（configMap/secret/downwardAPI/serviceAccountToken）合并挂载到同一个目录。最常用的场景是注入 projected SA token——可以设置 audience 和 expirationSeconds，比传统的 static SA token 更安全，是 OIDC 联邦（IRSA/Workload Identity）的基础。\n\n**Generic Ephemeral Volume**（CSI 临时卷）：用 CSI 驱动提供的临时卷，生命周期绑定 Pod。和 emptyDir 的区别是可以用高性能存储（如本地 NVMe），并且受 StorageClass 管理。适合'需要本地 NVMe 速度但不需要跨 Pod 持久化'的场景。",
+          "capstone": {
+            "prompt": "你有一个推理服务 Pod，需要：(a) 启动时从 S3 拉 10GB 模型到本地高速存储；(b) 挂载一个包含模型配置的 ConfigMap；(c) 注入 ServiceAccount token 用于访问 S3（audience 限定为 sts.amazonaws.com）；(d) 让应用知道自己被分配了几个 GPU。请写出 Pod spec 中 volumes 和 volumeMounts 的关键片段，每个卷说明选型理由。emptyDir 的 sizeLimit 应该设多少？为什么？",
+            "depth": 2
+          }
+        },
+        {
+          "slug": "high-perf-storage-csi",
+          "order_index": 6,
+          "name": "高性能存储对接：Lustre CSI / JuiceFS / Alluxio",
+          "prereq": ["csi-architecture"],
+          "est_minutes": 30,
+          "concept_md": "标准块存储（EBS/PD）在 AI 训练场景中往往不够——千卡训练的数据加载需要 GB/s 级聚合带宽，单卷 EBS 的 IOPS 和吞吐有硬上限。解决方案是用高性能并行/分布式文件系统，通过 CSI 接口对接 K8s。\n\n**Lustre CSI**：Lustre 是 HPC 领域的老牌并行文件系统，单集群可达 TB/s 级聚合带宽。Lustre CSI 的工作方式是在 Pod 内直接 mount Lustre client——Node 组件调用 mount.lustre 把 Lustre 文件系统挂进 Pod 的 mount namespace。优点：性能最强，POSIX 完全兼容，大量 HPC 存量用户。缺点：需要自建 Lustre 集群（MDS+OSS），运维复杂度高；Lustre client 内核模块和节点内核版本耦合，GPU 驱动升级可能破坏 Lustre。AWS 的 FSx for Lustre 提供托管方案。\n\n**JuiceFS**：POSIX 兼容的云原生分布式文件系统，元数据存在 Redis/TiKV/MySQL，数据存在 S3/OSS/GCS 等对象存储，本地用 NVMe 做缓存加速。对 K8s 友好——JuiceFS CSI 支持动态供给、Mount Pod 模式（每个使用 JuiceFS 的 Pod 旁边起一个 mount 进程 Pod）。cache 预热（warmup）机制可以在训练前把数据集预拉到节点本地 NVMe；cache group 让同一组节点共享缓存。性价比高——计算和存储彻底分离，存储用对象存储降成本。\n\n**Alluxio**：定位是数据编排层而非文件系统。FUSE mount 对应用透明，后端可以是 S3/HDFS/NFS/Lustre 等多种存储——提供统一视图。核心价值是缓存加速和多数据源联邦。K8s 上通常以 DaemonSet 部署 worker、Deployment 部署 master。适合'数据散落在多个存储系统'的场景。\n\n选型决策树：自建 HPC 集群、已有 Lustre → Lustre CSI；云上、追求性价比、需要弹性 → JuiceFS；多数据源需要统一视图 → Alluxio；纯云原生小规模 → EFS/Filestore + CSI 也够用。",
+          "capstone": {
+            "prompt": "你的公司有一个 200 GPU 的 K8s 训练集群跑在 AWS 上，训练数据 50TB 存在 S3，每次训练需要读取其中 5TB。当前方案是每个 Pod 启动时从 S3 拉数据到 emptyDir，启动时间 30 分钟不可接受。请：(1) 比较 FSx for Lustre、JuiceFS、Alluxio 三种方案的架构差异和适用场景；(2) 推荐一种并说明理由；(3) 如何利用缓存预热把训练启动时间降到 5 分钟以内？(4) 如果明天又要接入一份存在 HDFS 上的数据集，你的方案还能 work 吗？",
+            "depth": 3
+          }
+        }
+      ]
+    },
+    {
+      "slug": "k8s-scheduling",
+      "order_index": 4,
+      "name": "调度与拓扑感知",
+      "description": "调度器决定 Pod 在哪里跑——在 GPU 集群中这直接影响训练性能。把 worker 调度到跨 NUMA 的节点可以让 NCCL 通信慢 30%，把推理 Pod 全堆一个 zone 可以让可用性归零。这一模块从亲和性到 DRA，覆盖面试追问最深的调度话题。",
+      "lessons": [
+        {
+          "slug": "affinity-topology-spread",
+          "order_index": 1,
+          "name": "Node Affinity/Anti-Affinity 与 Pod Topology Spread",
+          "prereq": ["declarative-reconcile"],
+          "est_minutes": 25,
+          "concept_md": "调度约束分两类：**节点亲和性**（Pod 和节点的关系）和 **Pod 间亲和/反亲和**（Pod 和其他 Pod 的关系）。\n\nNode Affinity 替代了 nodeSelector，分 `requiredDuringSchedulingIgnoredDuringExecution`（硬约束，不满足就不调度）和 `preferredDuringSchedulingIgnoredDuringExecution`（软约束，尽量满足但不强制）。表达式支持 In/NotIn/Exists/DoesNotExist/Gt/Lt 操作符。'IgnoredDuringExecution' 意味着 Pod 已经在跑了，即使节点 label 变了也不驱逐——这是有意的，防止 label 抖动触发大规模重调度。\n\nPod Anti-Affinity 常用于 HA：'不要把同一个 Deployment 的两个 Pod 放在同一个节点/zone 上'。`topologyKey: kubernetes.io/hostname` 表示'同一节点'，`topology.kubernetes.io/zone` 表示'同一 zone'。注意 Pod affinity/anti-affinity 的计算复杂度是 O(N×M)——N 个 candidate 节点 × M 个已有 Pod，大规模集群性能差。\n\n**TopologySpreadConstraints** 是更精确的分布控制。核心参数：`maxSkew`（允许的最大不均衡度）、`topologyKey`（按什么拓扑维度分布）、`whenUnsatisfiable`（DoNotSchedule 硬约束 / ScheduleAnyway 软约束）。\n\nAI 场景两种典型策略：推理副本用 topologySpreadConstraints 按 zone 均匀分布（maxSkew=1, topologyKey=zone），保证单 zone 故障不丢过半流量；训练 worker 反过来，用 node affinity 把所有 worker 集中到同一 rack/zone，减少 NCCL allreduce 的跨 rack 流量——拓扑感知不是越分散越好，而是看工作负载特征。",
+          "capstone": {
+            "prompt": "你有一个推理服务 6 副本分布在 3 个 zone，同时有一个 8 GPU 的分布式训练 Job 需要所有 worker 在同一个 rack。请分别写出两者的调度约束 yaml 片段（用 topologySpreadConstraints 和 node affinity），并解释：(1) 推理服务的 maxSkew=1 和 maxSkew=2 的区别在故障场景下的影响；(2) 训练 Job 如果用 pod affinity 而不是 node affinity 来实现'同一 rack'，有什么问题？",
+            "depth": 2
+          }
+        },
+        {
+          "slug": "taints-tolerations-advanced",
+          "order_index": 2,
+          "name": "Taints/Tolerations 进阶",
+          "prereq": ["affinity-topology-spread"],
+          "est_minutes": 25,
+          "concept_md": "Taint 是节点的'排斥标记'——带 taint 的节点会拒绝所有不 tolerate 这个 taint 的 Pod。和 affinity 是互补关系：affinity 是 Pod 说'我要去哪'，taint 是节点说'你不能来'。\n\nTaint 三要素：key=value:effect。**effect** 决定排斥力度：**NoSchedule**（不调度新 Pod，已有的不管）、**PreferNoSchedule**（尽量别调度，但实在没地方了可以）、**NoExecute**（不调度 + 驱逐已有 Pod）。Toleration 匹配 taint 用 operator：**Equal**（key+value+effect 都匹配）、**Exists**（只要 key 匹配，忽略 value）。\n\nNoExecute 有一个重要参数 `tolerationSeconds`：Pod 可以 tolerate 这个 taint，但只持续 N 秒——到时间就驱逐。典型用途：节点出现 `node.kubernetes.io/not-ready` 这个 NoExecute taint 时，默认 tolerationSeconds=300，Pod 在节点失联 5 分钟后才被驱逐——给瞬时网络问题一个恢复窗口。\n\nAI 集群中 taints 的典型设计：GPU 节点打 `nvidia.com/gpu=present:NoSchedule`——只有 GPU 工作负载（带 toleration 的）才能调度上来，防止普通 Pod 占用 GPU 节点资源。Spot/Preemptible 实例打 `cloud.google.com/gke-preemptible=true:NoSchedule`，只有能承受抢占的工作负载才用 spot 节点。更进一步：训练节点打 `workload=training:NoSchedule`、推理节点打 `workload=inference:NoSchedule`——物理隔离训练和推理工作负载，防止推理的延迟敏感 Pod 被训练的大批量 Pod 抢资源。\n\n系统预留 taints（`node.kubernetes.io/*`）由 node lifecycle controller 自动管理——节点 NotReady、内存/磁盘压力、PID 压力、网络不可用时自动打上。DaemonSet 的 Pod 默认 tolerate 大部分系统 taints，这是 DS 能在异常节点上继续运行的原因。",
+          "capstone": {
+            "prompt": "你的集群有三类节点：普通 CPU 节点、GPU 训练节点（8×A100）、GPU 推理节点（2×T4）。请设计完整的 taint 方案：(1) 每类节点应该打什么 taint？(2) 训练 Job、推理 Deployment、监控 DaemonSet 各自需要什么 tolerations？(3) 如果一个 GPU 训练节点的 GPU 驱动崩溃了，你希望上面的训练 Pod 在多长时间后被驱逐？如何实现？(4) 为什么 DaemonSet 的 tolerations 设计和普通 Pod 不同？",
+            "depth": 3
+          }
+        },
+        {
+          "slug": "priority-preemption",
+          "order_index": 3,
+          "name": "Priority/Preemption 与训练任务分级",
+          "prereq": ["taints-tolerations-advanced"],
+          "est_minutes": 25,
+          "concept_md": "当集群资源不够时，谁该优先跑？PriorityClass 给 Pod 分配一个整数优先级（值越大越优先），scheduler 在没有可用节点时会尝试驱逐低优先级 Pod 来给高优先级 Pod 腾地方——这就是 preemption。\n\nPriorityClass 有两个关键字段：`value`（-2^31 到 10^9，系统组件通常用 2000000000）和 `preemptionPolicy`。preemptionPolicy 有两个值：**PreemptLowerPriority**（默认，可以抢占低优先级 Pod）和 **Never**（即使优先级高也不抢占别人，只能等资源自然释放）。\n\nPreemption 的过程：scheduler 发现 Pod unschedulable → 遍历节点，模拟移除低优先级 Pod 后是否能放进去 → 选择'需要驱逐的 Pod 数量最少'的节点 → 给被选中的 Pod 设置 deletionTimestamp 触发优雅关闭 → 等 Pod 终止后再调度新 Pod。注意：preemption 不保证成功——被驱逐的 Pod 可能有 PDB 保护、可能 finalizer 卡住、可能 gracePeriod 过长。\n\nAI 集群的分级设计：**P0 系统组件**（kube-system, monitoring）value=1000000——永远不被抢占。**P1 大型训练 Job**（千卡级，成本高，中断代价大）value=100——可以抢占推理和小任务。**P2 推理服务**（面向用户，延迟敏感）value=50, preemptionPolicy=Never——优先级中等但不抢占别人，避免推理服务驱逐其他推理服务导致级联故障。**P3 实验性任务**（探索、调参）value=10——随时可以被抢占，用 spot 实例跑。\n\n一个陷阱：如果多个 PriorityClass 的值设得太近，preemption 的行为容易混乱——确保不同级别之间有足够 gap。另外 preemption 只看 PriorityClass value，不看 Pod 已经运行了多久——一个跑了 3 天的低优先级训练照样会被新来的高优先级任务驱逐。要防止这种情况需要配合 Kueue 的公平调度。",
+          "capstone": {
+            "prompt": "你的 GPU 集群资源紧张，一个 value=100 的大型训练 Job 需要 32 GPU，但集群只剩 16 GPU 空闲——另外 16 GPU 被 value=50 的推理服务占着，推理服务设了 preemptionPolicy=Never。请分析：(1) scheduler 会尝试 preempt 推理服务吗？为什么？(2) 推理服务的 preemptionPolicy=Never 是保护自己不被抢占还是自己不去抢占别人？很多人搞混——请准确解释；(3) 如果训练 Job 最终因为资源不足 Pending，你有哪些手段让它跑起来，但又不影响线上推理？",
+            "depth": 3
+          }
+        },
+        {
+          "slug": "dra-structured-request",
+          "order_index": 4,
+          "name": "Dynamic Resource Allocation (DRA)",
+          "prereq": ["priority-preemption"],
+          "est_minutes": 30,
+          "concept_md": "传统的 Device Plugin 机制用计数模型管理设备资源——`nvidia.com/gpu: 8` 意味着节点有 8 个 GPU，Pod 请求 2 个就分配 2 个。但计数模型有致命局限：它不关心 GPU 的**拓扑关系**。'给我 2 个 GPU' 和 '给我同一个 NVLink domain 上的 2 个 GPU' 是完全不同的需求——后者的通信带宽可能是前者的 10 倍。Device Plugin 做不到这种细粒度匹配。\n\nDynamic Resource Allocation（DRA）是 K8s 1.26 引入的新资源模型，用声明式的方式描述'我需要什么样的设备'。核心概念：\n\n**DeviceClass**：描述一类设备的能力和配置（类似 StorageClass），由管理员创建。比如 `gpu-a100-nvlink` 表示带 NVLink 的 A100 GPU。\n\n**ResourceClaim**：用户的设备请求（类似 PVC），引用一个 DeviceClass，用 CEL 表达式描述精确需求。比如 `device.driver == 'gpu.nvidia.com' && device.attributes['memory'].compareTo(quantity('80Gi')) >= 0`——请求 80GB 显存以上的 GPU。\n\n**ResourceClaimTemplate**：每个 Pod 自动创建独立 ResourceClaim 的模板（类似 VolumeClaimTemplate）。\n\n关键能力：**结构化参数**让 scheduler 理解设备拓扑——'2 个 GPU 在同一个 NVLink domain + 关联的 RDMA NIC' 可以在一个 ResourceClaim 中表达。scheduler 在调度时能感知这些约束，做出拓扑最优的分配。这是 Device Plugin 做不到的。\n\nNVIDIA 的 k8s-dra-driver 是 DRA 的参考实现——它暴露 GPU 的 NVLink 拓扑、MIG 分区、RDMA 设备信息，让 scheduler 能做拓扑感知分配。例如：一个 8 GPU 节点上两个 NVLink domain 各 4 GPU，Pod 请求 4 GPU 时 DRA 保证分配在同一个 domain 而不是跨 domain。\n\nDRA 目前（1.31）仍在迭代中，但在 GPU 集群场景中已经是 device plugin 的明确替代方向——面试中被问到 'K8s 怎么管理 GPU 的拓扑' 就指向这里。",
+          "capstone": {
+            "prompt": "一个 8 GPU 节点有两个 NVLink domain（GPU 0-3 和 GPU 4-7），每个 domain 关联一个 RDMA NIC。你需要为一个分布式训练 Pod 请求 4 GPU + 1 RDMA NIC，且必须在同一个 NVLink domain 上。请：(1) 解释为什么 device plugin 的 `nvidia.com/gpu: 4` 无法满足这个需求；(2) 用 DRA 的 ResourceClaim 描述这个请求（写出关键 yaml）；(3) scheduler 在分配时需要知道什么信息？这些信息是谁提供的？",
+            "depth": 3
+          }
+        },
+        {
+          "slug": "karpenter-gpu-scaling",
+          "order_index": 5,
+          "name": "Karpenter 与 GPU 节点弹性供给",
+          "prereq": ["affinity-topology-spread"],
+          "est_minutes": 25,
+          "concept_md": "Cluster Autoscaler（CA）的模型是预定义 Node Group——每个 group 固定一种实例类型、固定 min/max，CA 在 Pod unschedulable 时扩 group 的节点数。这对 GPU 集群有三个问题：(1) GPU 实例类型多（p4d/p4de/p5/g5/g6），每种都要建一个 node group；(2) spot 实例需要跨多种类型做 fallback，CA 的单 group 单类型模型不灵活；(3) 扩缩容决策慢——CA 每 10s 扫一次 pending pods。\n\nKarpenter 的模型完全不同——它**没有 Node Group**。核心对象是 **NodePool**（定义约束：允许的实例类型、zone、架构、容量类型 on-demand/spot）和 **NodeClass**（定义节点模板：AMI、安全组、子网、用户数据）。当 Pod pending 时，Karpenter 直接计算'用什么实例类型能最高效地跑这些 pending pods'，然后调用云 API 创建节点——可以跨实例类型选择，甚至在一次决策中混合不同类型。\n\n**Consolidation**：Karpenter 持续监控节点利用率，如果发现可以把多个低利用率节点的 Pod 迁移到更少的节点上，会主动缩容——比 CA 的缩容更积极、更智能。GPU 节点很贵，consolidation 直接省钱。\n\n**Drift Detection**：当 NodeClass 更新（比如新 AMI、新安全组）时，Karpenter 检测已有节点是否'漂移'了，自动触发节点替换——不需要手动 drain。对 GPU 节点的驱动更新非常有用。\n\nGPU 场景的 NodePool 设计：训练 NodePool（instance types 限 p5/p4d，capacity type 只 on-demand，因为训练中断代价大）+ 推理 NodePool（instance types 限 g5/g6/inf2，capacity type 允许 spot with on-demand fallback）+ 通用 NodePool（CPU 实例，spot 优先）。每个 NodePool 可以设 limits 控制总开销。",
+          "capstone": {
+            "prompt": "你的 AI 平台需要支持两种工作负载：长期运行的训练 Job（需要 p5.48xlarge, 8×H100）和突发的推理请求（可以用 g5.xlarge, 1×A10G）。请：(1) 设计 Karpenter 的 NodePool 和 NodeClass 配置（关键 yaml），训练用 on-demand、推理用 spot with fallback；(2) 训练 Job 完成后节点怎么回收？Karpenter 的 consolidation 在这个场景下的行为是什么？(3) 和 Cluster Autoscaler 相比，Karpenter 在这个场景下的具体优势在哪三个点上？",
+            "depth": 3
+          }
+        },
+        {
+          "slug": "custom-scheduler-framework",
+          "order_index": 6,
+          "name": "自定义 Scheduler 与 Scheduling Framework",
+          "prereq": ["dra-structured-request"],
+          "est_minutes": 30,
+          "concept_md": "K8s 默认 scheduler 已经很强，但有些场景它做不到——比如'一个训练 Job 的 8 个 Pod 必须同时调度成功，否则全不调度'（gang scheduling）、或者'调度时考虑 GPU 的 NUMA 拓扑和 NVLink 连接'。这时需要扩展或替换 scheduler。\n\nScheduling Framework 是 K8s 1.19 引入的插件化调度架构，把调度过程拆成多个**扩展点**（extension points），每个点可以插入自定义逻辑：\n\n**PreFilter/Filter**：过滤不满足条件的节点。Filter 是硬约束——不满足就排除。自定义 Filter 示例：排除 GPU 驱动版本不匹配的节点。\n\n**PreScore/Score**：给通过 Filter 的节点打分。默认 Score 插件考虑资源均衡（LeastAllocated）、节点亲和性等。自定义 Score 示例：给'GPU 在同一 NVLink domain 上有空闲'的节点更高分。\n\n**Reserve**：Pod 调度决策确认后，预留资源。如果后续步骤失败会 Unreserve 回滚。\n\n**Permit**：调度决策最后的'审批'环节。可以 approve、deny、或 **wait**——wait 是 gang scheduling 的关键：Pod 调度决策完成后不立刻绑定，而是等同一 gang 的所有 Pod 都完成调度决策后再一起 approve。\n\n**Bind**：把 Pod 绑定到节点（写 pod.spec.nodeName）。默认是直接写 apiserver，自定义 Bind 可以做额外操作。\n\n**CoScheduling 插件**实现 gang scheduling：用 PodGroup CRD 定义一组 Pod 的 minMember，在 Permit 阶段让已调度的 Pod 等待，直到 minMember 个 Pod 都调度成功后一起 approve。如果超时（任一 Pod 调度不上），全部 reject 释放资源。这比 Volcano 轻量——Volcano 是独立 scheduler，CoScheduling 是默认 scheduler 的插件。\n\n实际部署时可以跑多个 scheduler（通过 Pod 的 schedulerName 字段指定），但要注意多 scheduler 之间可能产生资源竞争——推荐方式是用 Scheduling Framework 扩展默认 scheduler 而不是部署多个。",
+          "capstone": {
+            "prompt": "你需要为 GPU 集群实现两个调度需求：(1) 分布式训练 Job 的所有 Pod 必须同时调度成功（gang scheduling）；(2) 单 Pod 内的 GPU 分配要考虑 NVLink 拓扑。请分别说明这两个需求各自对应 Scheduling Framework 的哪个扩展点、实现逻辑是什么。然后比较 CoScheduling 插件和 Volcano 的 Gang Scheduling：架构差异、部署复杂度、适用场景各是什么？",
+            "depth": 3
+          }
+        }
+      ]
+    },
+    {
+      "slug": "k8s-security",
+      "order_index": 5,
+      "name": "安全与多租户",
+      "description": "GPU 集群天然是多租户的——硬件太贵不可能一个团队独占。但多租户意味着隔离、权限、配额全要做对。这一模块从 RBAC 到多租户架构，覆盖 GPU 共享集群的安全实践。",
+      "lessons": [
+        {
+          "slug": "rbac-model",
+          "order_index": 1,
+          "name": "RBAC 模型 Role/ClusterRole/Binding",
+          "prereq": [],
+          "est_minutes": 25,
+          "concept_md": "K8s 的 RBAC 是基于'角色'的访问控制——先定义角色（一组权限），再把角色绑定给用户/组/ServiceAccount。四个核心对象：\n\n**Role**：namespace 级别的权限集，定义'在某个 namespace 里可以对哪些 resources 做哪些 verbs'。verbs 包括 get/list/watch/create/update/patch/delete/deletecollection。resources 可以精确到 subresource（如 pods/log、pods/exec）。\n\n**ClusterRole**：集群级别的权限集——可以作用于 non-namespaced resources（如 nodes、PV、CRD 本身）、或者作为'跨 namespace 的通用角色模板'。K8s 内置了一组 ClusterRole：cluster-admin（超级管理员）、admin/edit/view（namespace 级别的预定义角色）。\n\n**RoleBinding**：把 Role 或 ClusterRole 绑定给 subjects，作用于特定 namespace。注意：ClusterRole 通过 RoleBinding 绑定时，权限**降级为该 namespace 范围**——这是复用 ClusterRole 做模板的常见模式。\n\n**ClusterRoleBinding**：把 ClusterRole 绑定给 subjects，作用于整个集群。\n\nSubjects 三种：**User**（外部认证提供，K8s 本身不存储用户）、**Group**（同上，由认证系统提供 group claim）、**ServiceAccount**（K8s 原生对象，namespace 级别）。\n\n**Aggregated ClusterRole** 是一个容易被忽略的特性：通过 `aggregationRule.clusterRoleSelectors` 自动聚合其他 ClusterRole 的规则。内置的 admin/edit/view 就是 aggregated 的——当你安装一个 CRD 并创建对应的 ClusterRole 带 label `rbac.authorization.k8s.io/aggregate-to-admin: true` 时，admin 角色自动获得该 CRD 的权限。\n\nAI 集群的 RBAC 设计：每个团队一个 namespace + 一个 ServiceAccount + 一个 RoleBinding 到 edit ClusterRole。团队成员只能在自己 namespace 创建 Job/Pod，看不到其他 namespace。但 edit 允许创建 DaemonSet——这对多租户是危险的（DaemonSet 会占所有节点资源），所以要额外用 admission policy 拦截。",
+          "capstone": {
+            "prompt": "你的 GPU 集群有 5 个团队共享，每个团队一个 namespace。需求：(1) 团队成员可以创建 Job/Pod/ConfigMap/Secret，但不能创建 DaemonSet 和 ClusterRole；(2) 团队的 CI/CD ServiceAccount 只能 apply 特定 label 的资源；(3) 集群管理员可以跨所有 namespace 操作。请设计 RBAC 方案：需要创建哪些 Role/ClusterRole/Binding？内置的 edit ClusterRole 为什么不能直接用——它多给了什么权限？",
+            "depth": 2
+          }
+        },
+        {
+          "slug": "serviceaccount-oidc",
+          "order_index": 2,
+          "name": "ServiceAccount Token 投射与 OIDC",
+          "prereq": ["rbac-model"],
+          "est_minutes": 25,
+          "concept_md": "早期 K8s 的 ServiceAccount token 是一个永不过期的 JWT，存在每个 namespace 的 Secret 里，自动挂载到 Pod 的 `/var/run/secrets/kubernetes.io/serviceaccount/token`。这有三个安全问题：(1) 永不过期——一旦泄露永久有效；(2) audience 不限——拿到 token 可以访问 apiserver，也可以冒充 Pod 访问任何服务；(3) 所有 Pod 共享同一个 token。\n\n**Projected ServiceAccount Token** 解决这些问题：通过 projected volume 注入每个 Pod 独立的、有过期时间的、有 audience 限定的 token。kubelet 负责在 token 过期前自动 rotate（通常设 expirationSeconds=3600，kubelet 在 80% 生命周期时刷新）。\n\n关键配置：`serviceAccountToken` projected source 的 `audience` 字段限定 token 的受众——只有能验证这个 audience 的服务才接受此 token。`expirationSeconds` 控制有效期。\n\n**OIDC 联邦**是 projected token 的杀手级应用。原理：K8s apiserver 本身就是一个 OIDC provider（暴露 `/.well-known/openid-configuration` 和 JWKS endpoint），它签发的 SA token 是标准 JWT。云平台的 IAM 可以配置信任这个 OIDC provider——当 Pod 拿着 SA token 去访问云 API 时，IAM 验证 JWT 签名（通过 JWKS）和 audience，确认合法后换发云平台的临时凭证。\n\n具体实现：EKS 上叫 **IRSA**（IAM Roles for Service Accounts）——给 SA 加 annotation 关联 IAM Role，Pod 自动获得该 Role 的 AWS 临时凭证。GKE 上叫 **Workload Identity**——SA 映射到 GCP SA。两者本质相同：SA token → OIDC 验证 → 临时云凭证。\n\nAI 场景：推理服务访问 S3 上的模型仓库、训练 Job 写 checkpoint 到 S3、向量数据库的凭证——全部用 OIDC 联邦，不再需要在 Secret 里存 AWS_ACCESS_KEY_ID。这消除了静态凭证泄露风险，且每个 Pod 的权限可以精确到单个 S3 bucket。",
+          "capstone": {
+            "prompt": "你的推理服务 Pod 需要从 S3 拉模型文件，当前方案是把 AWS_ACCESS_KEY_ID 和 SECRET 存在 K8s Secret 里。请设计迁移到 IRSA 的完整方案：(1) 需要在 AWS IAM、EKS、K8s 三侧分别做什么配置？(2) Pod 里的应用代码需要改吗？AWS SDK 是怎么自动发现 projected token 的？(3) 迁移过程中如何做到零停机——旧 Pod 用 Secret、新 Pod 用 IRSA 同时工作？",
+            "depth": 3
+          }
+        },
+        {
+          "slug": "pod-security-standards",
+          "order_index": 3,
+          "name": "Pod Security Standards Baseline/Restricted",
+          "prereq": ["rbac-model"],
+          "est_minutes": 25,
+          "concept_md": "Pod Security Standards（PSS）是 K8s 内置的 Pod 安全策略框架，替代了已废弃的 PodSecurityPolicy。它定义三个安全级别：\n\n**Privileged**：无限制——允许一切，适用于系统组件（kube-system）。\n\n**Baseline**：阻止已知的提权路径——禁止 privileged containers、hostNetwork/hostPID/hostIPC、危险的 capabilities（如 SYS_ADMIN/NET_RAW）、hostPath 挂载特定目录。允许大多数常见工作负载。\n\n**Restricted**：最严格——在 Baseline 基础上要求 runAsNonRoot、drop ALL capabilities（只保留 NET_BIND_SERVICE）、seccompProfile 必须设为 RuntimeDefault 或 Localhost、不允许 privilege escalation（allowPrivilegeEscalation=false）。\n\n通过 namespace label 启用：`pod-security.kubernetes.io/<mode>: <level>`。三种 mode：**enforce**（违反直接拒绝创建）、**audit**（允许创建但记录 audit log）、**warn**（允许创建但返回 warning）。最佳实践：新 namespace 先 warn + audit 观察，确认无误后切 enforce。\n\nAI 集群的挑战：GPU Pod 需要访问 NVIDIA 设备文件（`/dev/nvidia*`），这要求 container 有设备访问权限。在 device plugin / DRA 模式下，设备是通过 env + mount 注入的，**不需要 privileged 模式**——这是一个常见误解。Pod 可以在 Baseline 甚至 Restricted 级别下使用 GPU，只要 device plugin 正确配置了设备挂载。但如果用了某些需要 `SYS_ADMIN` capability 的工具（如 nvidia-smi 的某些调试功能、GPU MPS、MIG 动态配置），就必须在 Baseline 下加特定 capability 豁免。\n\n处理方式：namespace 整体设 Baseline enforce，对需要特殊权限的 Pod 用 RuntimeClass + admission exemption 精准豁免，而不是把整个 namespace 降级到 Privileged。",
+          "capstone": {
+            "prompt": "你的 GPU 集群有两个 namespace：gpu-training（跑训练 Job）和 gpu-inference（跑推理服务）。安全团队要求所有 namespace 至少 Baseline enforce。但训练 Job 的 Pod 需要使用 NVIDIA MPS（需要 SYS_PTRACE capability），推理服务不需要。请：(1) 两个 namespace 各设什么 PSS level + mode？(2) 训练 namespace 如何在 Baseline enforce 下给 MPS Pod 豁免？有哪些方式？(3) 一个开发者提交了一个 privileged: true 的 Pod 到 gpu-inference namespace，会发生什么？audit log 里能看到什么？",
+            "depth": 2
+          }
+        },
+        {
+          "slug": "secret-external-secrets",
+          "order_index": 4,
+          "name": "Secret 管理与 External Secrets Operator",
+          "prereq": ["serviceaccount-oidc"],
+          "est_minutes": 25,
+          "concept_md": "K8s Secret 的 base64 编码**不是加密**——这是最常见的安全误解。`kubectl get secret -o yaml` 直接看到 base64 内容，decode 一下就是明文。Secret 存在 etcd 里，默认也是明文（base64）。第一层防护：**etcd encryption at rest**——在 apiserver 配置 EncryptionConfiguration，用 AES-CBC/AES-GCM/KMS provider 加密 etcd 中的 Secret 数据。第二层：**RBAC 限制 Secret 的 get/list 权限**——大多数开发者不需要直接读 Secret，只需要 Pod 通过 volume/env 消费。\n\n但即使做了这两层，Secret 的管理仍有痛点：(1) Secret 的值写在 yaml 里提交到 git——明文在 git 历史中永久存在；(2) Secret 的 rotation 需要重新 apply + 重启 Pod；(3) 多集群/多环境同步困难。\n\n**External Secrets Operator（ESO）** 是社区标准方案：它从外部密钥管理服务（Vault、AWS Secrets Manager、GCP Secret Manager、Azure Key Vault）同步密钥到 K8s Secret。核心对象：\n\n**SecretStore/ClusterSecretStore**：定义连接外部 provider 的配置（endpoint、认证方式）。认证推荐用 IRSA/Workload Identity 而不是静态凭证。\n\n**ExternalSecret**：定义'从外部哪个 key 同步到 K8s 的哪个 Secret 的哪个 field'。支持 refreshInterval 定期同步——外部 rotate 了，K8s Secret 自动更新。\n\nAI 集群需要管理的 secrets 典型清单：HuggingFace token（拉模型权重）、云存储凭证（S3/GCS access key，但更推荐 OIDC 替代）、向量数据库连接串（Pinecone/Weaviate API key）、模型 API key（OpenAI/Anthropic 用于评估）、Docker registry 凭证（拉私有镜像）。这些全部应该存在 Vault/SM 里，通过 ESO 同步，git 里只有 ExternalSecret 的引用而不是值。",
+          "capstone": {
+            "prompt": "你的 AI 平台有 20 个 Secret（HF token、DB 连接串、API key 等），目前全部以 base64 yaml 存在 git 仓库里。安全审计要求整改。请设计迁移方案：(1) 选择 AWS Secrets Manager + ESO，画出数据流（Secret 从哪创建、怎么同步、Pod 怎么消费）；(2) ESO 自己怎么认证到 AWS SM？推荐方式和不推荐方式各是什么？(3) 如果一个 Secret 在 AWS SM 里 rotate 了，ESO 多久能同步到 K8s Secret？Pod 里的应用怎么感知到新值？需要重启吗？",
+            "depth": 3
+          }
+        },
+        {
+          "slug": "admission-opa-kyverno",
+          "order_index": 5,
+          "name": "准入控制 OPA Gatekeeper/Kyverno",
+          "prereq": ["pod-security-standards"],
+          "est_minutes": 30,
+          "concept_md": "RBAC 控制'谁能做什么操作'，但不控制'做出来的东西长什么样'——你有权限创建 Pod，但 RBAC 不管你创建的 Pod 是不是 privileged、有没有 resource limits、是不是用了禁止的镜像。这一层控制由 **Admission Controller** 实现。\n\nK8s 的 admission 分两阶段：**Mutating**（修改请求，如注入 sidecar、设默认值）和 **Validating**（校验请求，不满足就拒绝）。内置 admission controller 有几十个（如 LimitRanger、ResourceQuota、PodSecurity），但自定义策略需要 webhook：**ValidatingAdmissionWebhook** 和 **MutatingAdmissionWebhook**。\n\n**OPA Gatekeeper** 和 **Kyverno** 是两个主流的策略引擎，都通过 webhook 实现。\n\nGatekeeper 用 **Rego** 语言写策略。核心对象：**ConstraintTemplate**（用 Rego 定义策略逻辑的模板）和 **Constraint**（实例化模板并指定参数和作用范围）。优点：Rego 表达力强、OPA 生态成熟（不只是 K8s）。缺点：Rego 学习曲线陡峭。\n\nKyverno 用 **YAML** 写策略——**ClusterPolicy** 里直接用 match/exclude/validate/mutate/generate 声明规则，不需要额外语言。validate 可以用 pattern matching、CEL 表达式、甚至 Kubernetes API lookups。mutate 可以设默认值、注入 label。generate 可以根据一个资源自动创建另一个（如新 namespace 自动创建 NetworkPolicy）。优点：YAML native、K8s 用户零学习成本。缺点：复杂策略的表达力不如 Rego。\n\nAI 集群的典型策略集：(1) 所有 GPU Pod 必须有 `resources.limits` 和 `nodeSelector`——防止 GPU Pod 调度到 CPU 节点；(2) 所有 Pod 必须有 team label——用于成本分摊和 quota；(3) 单个 Pod 请求不能超过 8 GPU——超过需要走审批流程（Kyverno 可以 deny + message 提示走审批）；(4) 禁止使用 latest tag 镜像；(5) 新 namespace 自动创建 default NetworkPolicy（deny all ingress）。",
+          "capstone": {
+            "prompt": "你需要为 GPU 集群实施两条策略：(a) 所有 Pod 必须设置 resources.requests 和 resources.limits 且必须有 label 'team'；(b) 请求 GPU 数量 > 8 的 Pod 必须有 annotation 'approved-by' 才能创建。请分别用 Gatekeeper（ConstraintTemplate + Constraint）和 Kyverno（ClusterPolicy）写出两条策略的关键 yaml。然后比较：在运维复杂度、策略表达力、故障影响（webhook 挂了怎么办）三个维度上各自的优劣。",
+            "depth": 3
+          }
+        },
+        {
+          "slug": "multi-tenancy-gpu",
+          "order_index": 6,
+          "name": "多租户隔离模型",
+          "prereq": ["admission-opa-kyverno"],
+          "est_minutes": 30,
+          "concept_md": "100 GPU 集群给 5 个团队共享——这是典型的 GPU 多租户场景。隔离需要覆盖五个维度：**API 权限**（RBAC）、**资源配额**（ResourceQuota + Kueue）、**网络**（NetworkPolicy）、**安全**（PSS + Admission）、**计算/存储**（namespace + taint）。单独做好任一维度都不够——没有 quota 的 RBAC 意味着一个团队可以占满所有 GPU。\n\n**Namespace 隔离**是最基础的模型：每团队一个 namespace，通过 RBAC 限制跨 namespace 访问，通过 ResourceQuota 限制每个 namespace 的 GPU/CPU/内存上限，通过 default NetworkPolicy 禁止跨 namespace 网络访问。优点：简单成熟。缺点：namespace 是 K8s 的管理边界不是安全边界——共享同一个 apiserver、etcd、kubelet，恶意租户理论上有逃逸风险。\n\n**Hierarchical Namespaces（HNC）**：允许 namespace 有父子关系——父 namespace 的 RBAC/NetworkPolicy/ResourceQuota 自动传播到子 namespace。适合'部门→团队→项目'的层级结构。\n\n**Capsule**：多租户 operator，引入 Tenant CRD——一个 Tenant 包含多个 namespace，统一管理 quota/network/RBAC。比裸 namespace 隔离更结构化。\n\n**vCluster**：虚拟集群——每个团队拿到一个'看起来像独立集群'的虚拟 K8s，有自己的 apiserver 和 etcd（跑在宿主集群的 Pod 里），Pod 最终还是调度到宿主集群节点上。隔离最强（租户有 cluster-admin 权限也只影响自己的 vCluster），但资源开销最大（每个 vCluster 要跑一套控制面）。\n\n选型决策：团队间信任度高、运维简单 → namespace + ResourceQuota + Kueue。需要层级管理 → HNC/Capsule。团队需要 cluster-admin 或安装自己的 CRD → vCluster。GPU 集群通常从 namespace 模型开始，配合 Kueue 做公平调度和 quota borrowing——Kueue 允许团队在 quota 未满时借用其他团队的空闲 GPU，比 ResourceQuota 的硬上限灵活得多。",
+          "capstone": {
+            "prompt": "你管理一个 100 GPU（A100）集群，5 个团队各分配 20 GPU 的 quota。问题是：团队 A 经常只用 5 GPU 但不释放 quota，团队 B 有紧急训练需要 40 GPU 却申请不到。请：(1) 纯 ResourceQuota 为什么解决不了这个问题？(2) 引入 Kueue 后的 quota borrowing 机制如何工作？ClusterQueue/LocalQueue/ResourceFlavor 各是什么角色？(3) 除了 quota，你还需要在哪些维度做隔离？给出完整的多租户技术栈清单。(4) 如果安全团队要求'任何一个团队的 cluster-admin 不能影响其他团队'，你的方案够吗？不够的话怎么升级？",
+            "depth": 3
+          }
+        }
+      ]
+    },
+    {
+      "slug": "k8s-operations",
+      "order_index": 6,
+      "name": "生产运维与弹性",
+      "description": "集群不是搭完就完了。GPU 集群的运维复杂度远高于普通集群——驱动版本矩阵、千卡训练的故障爆炸半径、推理服务的延迟敏感伸缩。这一模块覆盖从自动伸缩到故障排查的生产运维全链路。",
+      "lessons": [
+        {
+          "slug": "hpa-vpa",
+          "order_index": 1,
+          "name": "HPA/VPA 原理与局限",
+          "prereq": ["declarative-reconcile"],
+          "est_minutes": 25,
+          "concept_md": "Horizontal Pod Autoscaler（HPA）根据指标自动调整 Pod 副本数。HPA v2 支持三类指标源：**Resource**（CPU/Memory 利用率，由 metrics-server 提供）、**Custom**（Pod 级别的自定义指标，如 QPS/队列深度，由 Prometheus adapter 提供）、**External**（集群外部的指标，如云消息队列深度，由 external metrics provider 提供）。\n\n核心算法：`desiredReplicas = ceil(currentReplicas × (currentMetricValue / targetMetricValue))`。如果当前 CPU 利用率 80%、目标 50%，则 desired = ceil(current × 80/50)。多指标时取各指标算出的最大值。`stabilizationWindowSeconds` 防止缩容抖动——在窗口期内取建议副本数的最大值，避免'刚缩容又扩容'。\n\nVertical Pod Autoscaler（VPA）调整 Pod 的 resource requests/limits。三种模式：**Off**（只推荐不修改，看 VPA 的 status.recommendation）、**Initial**（只在 Pod 创建时设置，不修改运行中的 Pod）、**Auto**（修改运行中的 Pod，通过重建实现——先驱逐再用新 requests 创建）。\n\nHPA 和 VPA 的冲突：两者都作用于 CPU 指标时，HPA 看到 CPU 高 → 加副本 → CPU 降下来 → VPA 觉得 request 太高要降低 → request 降低 → CPU 又升高 → HPA 又加副本。解决方案：让 HPA 用 custom metrics（如 QPS）而不是 CPU，CPU 相关的交给 VPA。\n\nAI 推理场景：HPA 基于 custom metric `gpu_request_queue_depth` 伸缩推理 Pod——队列深度 > 10 则扩容、< 2 则缩容。metrics-server 不提供 GPU 指标，需要 DCGM exporter + Prometheus + Prometheus adapter 打通链路。VPA 用 Off 模式观察推理 Pod 的真实资源消耗，辅助调整 requests 而不自动修改——推理服务对重启敏感，不适合 Auto 模式。",
+          "capstone": {
+            "prompt": "你有一个 GPU 推理服务，想基于 'GPU 请求队列深度' 做 HPA。请：(1) 从指标采集到 HPA 消费，完整链路需要哪些组件（DCGM exporter → ? → ? → HPA）？每个组件的角色是什么？(2) 如果队列深度指标有 30 秒延迟，HPA 的行为会怎样？stabilizationWindowSeconds 应该怎么设？(3) 同时你发现推理 Pod 的 CPU request 设高了导致浪费，想用 VPA 优化。如何避免 VPA 和 HPA 冲突？",
+            "depth": 2
+          }
+        },
+        {
+          "slug": "keda-event-scaling",
+          "order_index": 2,
+          "name": "KEDA 事件驱动伸缩",
+          "prereq": ["hpa-vpa"],
+          "est_minutes": 25,
+          "concept_md": "HPA 的局限：它不支持 scale-to-zero（最少 1 个副本），且自定义指标需要自己搭 Prometheus adapter。KEDA（Kubernetes Event-Driven Autoscaling）解决这两个问题——它是一个 operator，提供 60+ 种内置 trigger，支持 scale-from-zero。\n\n核心对象 **ScaledObject**：绑定一个 Deployment/StatefulSet，定义一组 triggers（指标源）和伸缩参数。KEDA 根据 trigger 指标创建和管理 HPA——所以 KEDA 不是替代 HPA，而是在 HPA 之上加了一层。当所有 trigger 的值为 0 时，KEDA 直接把副本数设为 0（HPA 做不到）；当值从 0 变为正数时，KEDA 先把副本数设为 1，然后交给 HPA 接管后续扩缩。\n\nTrigger 类型丰富：**消息队列**（Kafka topic lag、RabbitMQ queue depth、AWS SQS/SNS、Redis streams）、**Prometheus**（任意 PromQL 查询）、**Cron**（按时间表伸缩）、**HTTP**（基于请求量，需要 KEDA HTTP add-on）。多个 trigger 可以组合——取最大值。\n\n关键参数：`cooldownPeriod`（缩容冷却时间，默认 300 秒，防止抖动）、`pollingInterval`（检查 trigger 的间隔，默认 30 秒）、`minReplicaCount`（最少副本数，设 0 启用 scale-to-zero）、`maxReplicaCount`（最大副本数）。\n\n**ScaledJob** 是 KEDA 对 Job 的支持——根据 trigger 动态创建 Job 而不是伸缩 Deployment。适合'消息队列里有多少消息就跑多少 Job'的场景。\n\nAI 场景：Agent worker pool（处理用户的 AI 请求）按 RabbitMQ 队列深度伸缩——凌晨没请求时 scale-to-zero 省成本（GPU 实例按秒计费），白天高峰时 scale-to-N。冷启动时间是关键问题——GPU Pod 拉镜像 + 加载模型可能要 5 分钟，所以 minReplicaCount 通常设 1 而不是 0（保留一个热副本），或者用 Karpenter 预热节点。",
+          "capstone": {
+            "prompt": "你有一个 AI agent worker pool，用 GPU 处理用户请求，请求通过 RabbitMQ 队列分发。白天高峰 QPS=1000，凌晨 QPS=0。GPU 实例 $3/小时。请：(1) 设计 ScaledObject 的 yaml——trigger 类型、pollingInterval、cooldownPeriod、min/maxReplicaCount 怎么设？(2) scale-to-zero 省钱但冷启动 5 分钟——用户第一个请求等 5 分钟不可接受。你怎么解决？至少给两种方案；(3) 如果队列积压突然从 0 跳到 10000，KEDA 的扩容行为是什么？会不会一次性创建太多 Pod 压垮集群？怎么控制？",
+            "depth": 3
+          }
+        },
+        {
+          "slug": "etcd-operations",
+          "order_index": 3,
+          "name": "etcd 运维与灾备",
+          "prereq": [],
+          "est_minutes": 30,
+          "concept_md": "etcd 是 K8s 的唯一持久化存储——所有 API 对象、Secret、ConfigMap、RBAC 规则都存在 etcd 里。etcd 挂了 = 集群瘫了。理解 etcd 的运维是 K8s 管理员的必修课。\n\n**Compaction**：etcd 是 MVCC 存储——每次写操作创建新版本而不是覆盖旧值。版本堆积导致数据库膨胀。compaction 清理旧版本：apiserver 默认每 5 分钟触发一次 compaction（`--etcd-compaction-interval`），保留最近一个版本。compaction 只是标记空间可回收，不释放磁盘。\n\n**Defragmentation**：释放 compaction 后的碎片空间。需要显式触发 `etcdctl defrag`。注意：defrag 期间该 etcd 成员会**阻塞所有读写**——在 3 节点集群中逐个 defrag，不要同时操作。\n\n**Snapshot/Restore**：`etcdctl snapshot save` 做全量快照——这是灾备的基础。建议每小时一次，存到集群外部（S3/GCS）。恢复时 `etcdctl snapshot restore` 会创建全新的数据目录——原有的 cluster membership 信息被重置，需要重新初始化集群。\n\n**性能调优关键参数**：`--quota-backend-bytes`（默认 2GB，大集群建议 8GB，超过 quota etcd 进入 alarm 状态拒绝写入）、`--snapshot-count`（每多少次写触发一次 WAL snapshot，默认 100000）、`--heartbeat-interval` 和 `--election-timeout`（心跳和选举超时，网络延迟高的环境需要调大）。\n\n**关键监控指标**：`etcd_server_slow_apply_total`（apply 延迟超过 100ms 的请求数——增长说明磁盘 I/O 瓶颈）、`etcd_disk_wal_fsync_duration_seconds`（WAL fsync 延迟——应 < 10ms）、`etcd_server_leader_changes_seen_total`（leader 切换次数——频繁切换说明网络或负载问题）、`etcd_mvcc_db_total_size_in_bytes`（数据库大小——接近 quota 要预警）。\n\n大规模集群（10K+ objects）的 watch 压力：每个 controller 的 informer 都在 watch etcd（通过 apiserver 代理），对象越多 watch event 越密集。apiserver 的 watch cache 是关键缓冲层——调大 `--watch-cache-size` 减少 apiserver 向 etcd 的请求压力。",
+          "capstone": {
+            "prompt": "你的生产集群 etcd 报了 NOSPACE alarm——所有写操作被拒绝，集群无法创建新 Pod。请按优先级排列恢复步骤：(1) 怎么解除 alarm 让集群恢复写入？(2) 解除后怎么防止再次发生？(3) 如果你做了 defrag 但空间还是不够，说明什么问题？怎么诊断？(4) 事后你要建立什么监控和自动化来防止这类事故？",
+            "depth": 3
+          }
+        },
+        {
+          "slug": "drain-pdb",
+          "order_index": 4,
+          "name": "节点 drain 与 PDB",
+          "prereq": ["hpa-vpa"],
+          "est_minutes": 25,
+          "concept_md": "节点维护（内核升级、GPU 驱动更新、硬件维修）需要安全地迁移 Pod。`kubectl drain` 做两件事：(1) **cordon**——标记节点为 unschedulable，新 Pod 不再调度上来；(2) **evict**——调用 eviction API 逐个驱逐节点上的 Pod。\n\n注意 evict 不是 delete——eviction API 会检查 **PodDisruptionBudget（PDB）**。PDB 定义'在主动中断（drain/upgrade/preemption）过程中，一组 Pod 最少保持多少可用'。两个互斥字段：`minAvailable`（至少保持 N 个可用）和 `maxUnavailable`（最多允许 N 个不可用）。\n\n如果驱逐某个 Pod 会违反 PDB，eviction API 返回 429 Too Many Requests，drain 命令会重试直到 PDB 条件满足或超时。这就是为什么 drain 有时候卡住——因为 PDB 不允许再驱逐了。\n\nPDB 只保护**主动中断**（voluntary disruption）：drain、rolling update、preemption。**非主动中断**（involuntary disruption）不受 PDB 保护：节点宕机、OOM kill、kernel panic——这些情况 Pod 直接消失，PDB 管不了。所以 PDB 不是 HA 的全部保障，还需要 topology spread + multi-zone 部署。\n\nAI 集群的 drain 场景：GPU 节点需要更新 NVIDIA 驱动。PDB 设 `maxUnavailable: 1`——保证 8 worker 的分布式训练最多少一个 worker。但更重要的是 **preStop hook**：训练 Pod 收到 SIGTERM 后，preStop hook 触发 checkpoint 保存，把当前训练状态写到持久化存储，然后 Pod 优雅退出。`terminationGracePeriodSeconds` 要设得足够长——checkpoint 写入可能需要 5-10 分钟（大模型几十 GB 参数），如果 grace period 太短 kubelet 会 SIGKILL 强制杀掉进程，checkpoint 写了一半就废了。\n\n一个运维陷阱：`kubectl drain --ignore-daemonsets --delete-emptydir-data` 是标准 flags——DaemonSet Pod 不需要驱逐（drain 会跳过），emptyDir 数据主动放弃。如果不加这两个 flag，drain 会卡住或报错。",
+          "capstone": {
+            "prompt": "你需要对一个正在跑 8 worker 分布式训练的 GPU 节点做驱动更新。请设计完整的 drain 流程：(1) drain 前需要准备什么（PDB 怎么设、preStop hook 做什么、grace period 设多久）？(2) drain 命令的完整 flags？(3) 如果 drain 卡住了（超过 10 分钟），可能的原因有哪些？你怎么排查和处理？(4) 驱动更新完成后 uncordon 节点，训练 Job 怎么恢复到 drain 前的状态？",
+            "depth": 3
+          }
+        },
+        {
+          "slug": "cluster-upgrade",
+          "order_index": 5,
+          "name": "集群升级策略",
+          "prereq": ["drain-pdb"],
+          "est_minutes": 30,
+          "concept_md": "K8s 集群升级是最高风险的运维操作之一——控制面和数据面版本耦合、API 废弃、行为变更都可能导致生产事故。GPU 集群的升级更复杂：NVIDIA driver/toolkit 有版本矩阵，DRA 等新特性需要 feature gate。\n\n**版本偏差策略**：apiserver 可以比 kubelet 高最多 3 个 minor 版本（1.31 apiserver + 1.28 kubelet 可以工作），但反过来不行。升级顺序：先控制面（apiserver → controller-manager → scheduler → etcd），再节点（kubelet + kube-proxy）。同一集群不要跨 2 个以上 minor 版本升级——1.28→1.30 可以但 1.28→1.31 不推荐。\n\n**升级策略**：\n\n**In-place rolling**：逐个节点 drain → 升级 kubelet → uncordon。优点：节约资源。缺点：过程中集群容量下降，drain 触发 Pod 迁移产生扰动，回滚困难（kubelet 降级不被官方支持）。\n\n**Blue-green（node pool replacement）**：创建新版本 node pool，把 workload 迁移过去，然后删除旧 pool。优点：回滚简单（切回旧 pool），过程中容量不降低。缺点：需要双倍资源——GPU 节点很贵，100 节点集群临时再开 100 个不现实。折中：分批 blue-green，每次替换 20% 节点。\n\n**GPU 集群的额外复杂性**：(1) NVIDIA driver 和 CUDA toolkit 有版本矩阵——升级 K8s 可能需要同步升级 driver，driver 升级需要节点重启。(2) 新 K8s 版本的 feature gate（如 DRA 从 beta 到 GA）可能改变 GPU 调度行为——升级前必须在 staging 集群验证。(3) GPU operator 的版本也要匹配——K8s 1.31 + GPU Operator 23.x 可能不兼容。(4) Container runtime 升级（containerd 版本）影响 NVIDIA container runtime hook。\n\n升级 checklist：(1) 读 release notes 的 **deprecations** 和 **API removals**——比如 1.25 移除了 PodSecurityPolicy，1.29 移除了 in-tree cloud providers。(2) 用 `kubent`（kube-no-trouble）扫描集群中使用了已废弃 API 的资源。(3) staging 集群先升，跑完 GPU 训练/推理 e2e 测试。(4) 生产集群按 node pool 分批升，每批验证 NVIDIA driver + CSI + 训练 Job 正常。",
+          "capstone": {
+            "prompt": "你需要把一个 50 GPU 节点的生产集群从 1.28 升级到 1.30（跨两个 minor 版本）。集群上跑着 24/7 的推理服务和间歇性的训练 Job。请：(1) 升级路径是 1.28→1.29→1.30 还是直接 1.28→1.30？为什么？(2) 控制面和节点的升级顺序和方法？(3) GPU 相关组件（driver/toolkit/operator/container runtime）需要怎么处理？(4) 如果升级到一半发现推理服务延迟飙升，你的回滚方案是什么？能完全回滚吗？",
+            "depth": 3
+          }
+        },
+        {
+          "slug": "troubleshooting-methodology",
+          "order_index": 6,
+          "name": "故障排查方法论",
+          "prereq": [],
+          "est_minutes": 25,
+          "concept_md": "K8s 故障排查不是靠经验拼运气，而是有系统的方法论。核心思路：**从 Pod 状态出发，按阶段定位**。Pod 的生命周期对应不同的故障域：\n\n**Pending 阶段**——Pod 创建了但没被调度。三大原因：(1) **资源不足**——`kubectl describe pod` 看 Events 里的 FailedScheduling 消息，关注 'Insufficient cpu/memory/nvidia.com/gpu'。(2) **Taint/Toleration 不匹配**——'N node(s) had untolerated taint'，检查节点 taint 和 Pod toleration。(3) **PVC 绑定失败**——'unbound PersistentVolumeClaims'，检查 PVC 状态和 StorageClass。GPU 场景特有：节点有 GPU 但被 device plugin 报告的数量为 0——device plugin Pod 挂了或 NVIDIA driver 没装好。\n\n**ImagePull 阶段**——Pod 调度成功但拉不了镜像。`ErrImagePull` / `ImagePullBackOff`。原因：(1) 镜像名/tag 写错（最常见）；(2) 私有 registry 需要 imagePullSecrets 但没配；(3) registry 限流（Docker Hub 匿名用户 100 pulls/6h）。GPU 镜像通常很大（10-20GB），超时也会导致 ImagePull 失败——调整 kubelet 的 `--image-pull-progress-deadline`。\n\n**CrashLoopBackOff**——容器启动后反复崩溃。`kubectl logs <pod> --previous` 看上一次崩溃的日志。常见原因：(1) **OOMKilled**——`kubectl describe pod` 看 lastState.terminated.reason=OOMKilled，需要调高 memory limits 或修内存泄漏。(2) **配置错误**——环境变量/ConfigMap/Secret 缺失或格式错。(3) **依赖不可用**——启动时连不上 DB/Redis 就退出。GPU 特有：CUDA 版本和 driver 不匹配——容器内 CUDA 12 但宿主机 driver 只支持到 CUDA 11，nvidia-smi 报错 'Failed to initialize NVML'。\n\n**Running 但不工作**——Pod 在跑但服务不可用。(1) **Readiness probe 失败**——Pod 不在 Endpoints 里，流量到不了。(2) **Service selector 不匹配**——label 写错导致 Endpoints 为空。(3) **DNS 解析失败**——CoreDNS Pod 是否正常、Pod 的 /etc/resolv.conf 是否正确。(4) **NetworkPolicy 阻断**——有 policy 存在但没有 allow 规则。\n\n排查工具链：`kubectl describe`（Events 是第一手信息）→ `kubectl logs`（容器日志）→ `kubectl get events --sort-by=.lastTimestamp`（namespace 级事件）→ `kubectl exec` 进 Pod 验证网络/DNS → `crictl`（节点上直接检查容器状态）。",
+          "capstone": {
+            "prompt": "你的 GPU 训练 Pod 状态是 Pending，已经 Pending 了 30 分钟。请给出完整的排查流程：(1) 第一步看什么命令、看什么字段？(2) 如果 Events 显示 'Insufficient nvidia.com/gpu'——但你确认集群有空闲 GPU 节点，接下来排查什么？给出至少三种可能原因。(3) 如果 Events 显示 '0/10 nodes are available: 5 node(s) had untolerated taint, 5 node(s) didn't match pod topology spread constraints'——你怎么解读、怎么修？(4) Pod 终于 Running 了但 CrashLoopBackOff，日志显示 'Failed to initialize NVML: Driver/library version mismatch'——根因是什么？怎么修？",
+            "depth": 3
+          }
+        }
+      ]
     }
   ]
 }

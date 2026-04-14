@@ -1,0 +1,369 @@
+{
+  "comment": "GPU Operator track drills — 26 lessons x 3 questions",
+  "drills": {
+    "operator-why": [
+      {
+        "text": "在 GPU Operator 出现之前，用 DaemonSet 手动管理 driver + toolkit + device-plugin 最痛的三个点是什么？",
+        "answer": "(1) 启动顺序无法声明式表达——driver Pod ready 前 toolkit 不能起，toolkit 没改 containerd config 前 device-plugin 起了也注册失败，只能靠 initContainer 探测 /dev/nvidia0 或 sleep 硬扛；(2) driver 升级要手动 cordon → drain → unload kmod → reboot，几十节点并发会撞 maxUnavailable；(3) MIG 切片、DCGM metrics、GFD label 每个组件独立 Helm chart，版本矩阵（driver 535 + toolkit 1.14 + plugin 0.14）组合爆炸，升级一个就要全跑一遍兼容性。Operator 把这些收敛到一个 ClusterPolicy CR。"
+      },
+      {
+        "text": "什么场景下你会明确推荐不用 GPU Operator？",
+        "answer": "(1) 节点 OS 镜像里已经烘焙了特定版本 driver（如 HPC 场景 bare-metal image 里预装 535.104.05），Operator 接管反而会尝试加载 driver 容器与 host 模块冲突——应该 driver.enabled=false 只装 toolkit + plugin；(2) 单节点开发机或 Minikube，不需要生命周期管理，直接 nvidia-container-toolkit + k8s-device-plugin 更轻；(3) Air-gap 且无法镜像全套 operand image 的环境，手动部署 driver .run 包反而可控；(4) 使用 Bottlerocket 等不可变 OS，driver 由 OS vendor 统一管。"
+      },
+      {
+        "text": "EKS/GKE 的 managed GPU node pool（已预装 driver）和 GPU Operator 的职责边界怎么切？",
+        "answer": "Cloud-managed 方案通常只预装 driver + nvidia-container-runtime（AMI 层面），不含 DCGM/GFD/MIG manager。推荐做法是 ClusterPolicy 里 driver.enabled=false、toolkit.enabled=false，只开 devicePlugin、dcgmExporter、gfd、migManager 这几个。判断依据看 node 上 `nvidia-smi` 是否已可用、`/usr/bin/nvidia-container-runtime` 是否存在。EKS Optimized GPU AMI 和 GKE COS 都需要这种裁剪式部署，否则 driver DaemonSet 会卡在 node-feature-discovery.node.kubernetes.io/pci-10de.present label 后面试图加载模块失败。"
+      }
+    ],
+    "operator-pattern": [
+      {
+        "text": "GPU Operator 的 9 个 operand（driver/toolkit/device-plugin/dcgm/dcgm-exporter/gfd/mig-manager/node-status-exporter/validator）启动依赖顺序是怎样的？",
+        "answer": "严格串行链：NFD label 节点 → driver DaemonSet（加载 kmod，产出 /run/nvidia/driver rootfs）→ driver-validator（initContainer 探测 nvidia-smi）→ toolkit（安装 nvidia-container-runtime，改 containerd config 并 SIGHUP）→ toolkit-validator → device-plugin + gfd + dcgm-exporter + mig-manager 并行起来 → plugin-validator 确认 nvidia.com/gpu 资源暴露。每个 operand Pod 用 initContainer 探测前置产物（如 toolkit 的 init 会 `until [ -f /run/nvidia/validations/driver-ready ]; do sleep 5; done`），Operator 本身不做编排，靠 validator 写 sentinel 文件串联。"
+      },
+      {
+        "text": "为什么 NFD（Node Feature Discovery）在 GPU Operator 里是作为独立 sub-operator 部署而不是内嵌？",
+        "answer": "NFD 是 K8s SIG 的通用组件，Network Operator、Intel Device Plugin 等也依赖它，多个 operator 同时装会打架。GPU Operator 的 nfd.enabled 默认 true 但会先检测集群里是否已有 NFD（通过 nfd-master deployment label），有就复用，没有才装自己的一份。安装时传 --set nfd.enabled=false 是典型做法——当集群已经通过 OLM 或独立 Helm 装过 NFD。子 operator 模式让 NFD 可以独立升级，不绑 GPU Operator 发版节奏。"
+      },
+      {
+        "text": "operator-in-operator 场景下（GPU Operator 装了 NFD），两个 operator 的 CR 都 own 同一个 Deployment，ownerReferences 怎么设计避免 GC 误删？",
+        "answer": "GPU Operator 只在 NFD 不存在时才创建 NFD operator 的 Subscription 或 Deployment，并把 owner 设为 ClusterPolicy——ClusterPolicy 删除时级联删 NFD。但如果用户事后手动装了独立 NFD，GPU Operator 不应接管——通过 controller-runtime 的 SetControllerReference 只在 create 时设，update 时检查 metadata.ownerReferences 非空就跳过。排查 GC 误删常看 kube-controller-manager 日志 `garbage collector deleted ...`；修复手段是把 nfd.enabled=false 并手动 kubectl patch 掉残留 ownerReferences 的 controller:true 字段。"
+      }
+    ],
+    "clusterpolicy-crd": [
+      {
+        "text": "ClusterPolicy 里 driver.useOpenKernelModules=true 具体做了什么？和 GSP firmware 是什么关系？",
+        "answer": "切换到 NVIDIA/open-gpu-kernel-modules（GPL dual-licensed 的 nvidia.ko/nvidia-uvm.ko），driver 容器里的 kmod build 从闭源 blob 切到 open 源码编译。前提是 GPU 代次 ≥ Turing（sm_75+），且 GSP（GPU System Processor）firmware 必须启用——因为 open kmod 把调度/电源管理 offload 给 GPU 内部的 GSP RISC-V 核，不像闭源 driver 自己在 host CPU 跑。Ampere 以上（A100/H100）强制启用。影响：nvidia-smi 看 `GSP Firmware Version` 非 N/A；kernel log 会有 `NVRM: GSP firmware loaded`；Secure Boot 更友好因为 open 模块可自己签。"
+      },
+      {
+        "text": "想让同一集群的 DGX 节点用 mixed MIG strategy、普通 A100 节点用 single strategy，ClusterPolicy 怎么配？",
+        "answer": "ClusterPolicy 是集群级单例，mig.strategy 只能选一个值。正确做法是 mig.strategy=mixed（最兼容），然后用 node label nvidia.com/mig.config 指定每个节点的 profile 组合——DGX 节点打 `nvidia.com/mig.config=all-3g.40gb` 或自定义 custom profile，普通节点打 `all-disabled` 或 `all-1g.10gb`。MIG Manager 读 node label + ConfigMap `default-mig-parted-config` 映射到实际 mig-parted spec。命令：`kubectl label node dgx-01 nvidia.com/mig.config=all-balanced --overwrite`，然后 MIG Manager 会自动 drain → 重配 → uncordon。"
+      },
+      {
+        "text": "ClusterPolicy status.state 卡在 'notReady' 或 'Reconciling' 长时间不推进，排查步骤？",
+        "answer": "(1) `kubectl describe clusterpolicy cluster-policy` 看 status.conditions 哪个 operand 失败；(2) `kubectl get pods -n gpu-operator` 找 CrashLoopBackOff 或 Init 卡住的 Pod，重点看 nvidia-driver-daemonset 的 initContainer `k8s-driver-manager` 日志——通常是旧 driver 未 unload（lsmod 有进程占用）；(3) `kubectl logs -n gpu-operator -l app=gpu-operator` 看 controller 的 reconcile loop 报错；(4) 节点上 `chroot /run/nvidia/driver` 进 driver 容器 rootfs 跑 `dmesg | grep -i nvrm` 看 kmod 加载失败原因（常见是 kernel header 缺失、Secure Boot 拒签、GSP firmware 版本不匹配）；(5) 检查 NFD 是否给节点打上 `feature.node.kubernetes.io/pci-10de.present=true`，没打 operand 根本不会调度。"
+      }
+    ],
+    "operator-deploy": [
+      {
+        "text": "helm upgrade gpu-operator --reuse-values 和 --reset-values 在升级 GPU Operator 时分别有什么陷阱？",
+        "answer": "--reuse-values 沿用历史 values.yaml，问题是新版本 chart 加入的新 default（如 v23.9 新增的 cdi.enabled、v24.6 默认开 CDI）不会生效，停留在旧值；--reset-values 把所有自定义覆盖全丢，driver.version/nodeSelector/tolerations 等产线定制全被 reset 成 chart default，极易引发 driver 版本倒退、DaemonSet 调度错节点。正确做法：升级前 `helm get values gpu-operator -n gpu-operator -o yaml > current.yaml`，diff 新 chart 的 values.yaml 手动合并，用 `-f current.yaml` 显式传参，既不丢自定义也能看到新字段。"
+      },
+      {
+        "text": "GPU Operator 装完后如何用一个 Pod 快速验证端到端链路通了？",
+        "answer": "跑官方 sample：`kubectl run nvidia-smi --rm -it --restart=Never --image=nvcr.io/nvidia/cuda:12.2.0-base-ubuntu22.04 --overrides='{\"spec\":{\"containers\":[{\"name\":\"nvidia-smi\",\"image\":\"nvcr.io/nvidia/cuda:12.2.0-base-ubuntu22.04\",\"command\":[\"nvidia-smi\"],\"resources\":{\"limits\":{\"nvidia.com/gpu\":\"1\"}}}]}}' --`。预期输出 nvidia-smi 表格。失败排查点：(1) Pod Pending → `kubectl describe` 看 Insufficient nvidia.com/gpu，说明 device-plugin 没注册，查 `kubectl get node -o json | jq '.items[].status.capacity'`；(2) Pod CreateContainerError → toolkit 没生效，节点上 `cat /etc/containerd/config.toml | grep nvidia`；(3) Pod Running 但 nvidia-smi 报 `couldn't communicate with NVIDIA driver` → driver kmod 没装上。Operator 自带 nvidia-operator-validator Pod 也会跑一遍 cuda-validator + plugin-validator。"
+      },
+      {
+        "text": "用 OLM 装 GPU Operator 时 InstallPlan approvalPolicy 选 Manual 还是 Automatic？",
+        "answer": "产线一定选 Manual。Automatic 模式下 Operator catalog 一刷新新版本就会自动走 InstallPlan → 触发 ClusterPolicy reconcile → driver DaemonSet rolling restart → 所有训练 Pod 被驱逐，哪怕凌晨也不留情。Manual 模式下 InstallPlan 会 pending 等人工 approve（`kubectl patch installplan <name> -p '{\"spec\":{\"approved\":true}}' --type=merge`），可在变更窗口里配合 maintenance window + cordon 分批升。开发/测试环境可以 Automatic 快速追新。另一个理由：Operator 新版可能引入 ClusterPolicy schema 变更（如 v24.x 加了 sandboxWorkloads 字段），Automatic 升级会因 CRD conversion 失败卡住。"
+      }
+    ],
+    "driver-modes": [
+      {
+        "text": "driver container 的 precompiled / on-demand build / pre-installed 三种模式如何选型？",
+        "answer": "(1) precompiled（driver.version=535.104.05-signed-ubuntu22.04）：NVIDIA 预编译好的 driver image，包含针对特定 kernel 版本的 ko 文件，启动秒级就绪，Secure Boot 友好（已签名）——缺点是必须和节点 kernel 完全匹配，kernel 升级就失配；(2) on-demand build（默认模式）：driver 容器里带 kernel-headers 和 DKMS，启动时 `make modules` 编译，耗时 3-5 分钟，兼容任意 minor kernel 版本——缺点是每次节点重启或 driver Pod 重建都要重编；(3) pre-installed（driver.enabled=false）：host OS 已装 driver，Operator 只管上层——用于 cloud-managed AMI 或 HPC 自运维镜像。生产大规模集群推荐 precompiled，通过 kernel 统一基线（如 Ubuntu 22.04 + 5.15.0-generic）来保证匹配。"
+      },
+      {
+        "text": "什么场景必须用 open-gpu-kernel-modules，闭源 driver 不行？",
+        "answer": "(1) H100/H200/B100 等 Hopper/Blackwell 代次 GPU 的 GB200 NVL72 架构，新特性（如 confidential computing MIG、multicast）只在 open kmod 实现；(2) Grace Hopper GH200 统一内存架构，需要 open driver 配合 arm64 + GSP 的 coherent memory；(3) 内核版本 ≥ 6.8 的发行版（如 Ubuntu 24.04），闭源 driver 对新 kernel API（如 folio）跟进慢，open 版本社区直接 patch；(4) Secure Boot + FIPS 环境，企业自签 kmod 需要源码可见——闭源 blob 无法通过合规审查。Turing 之前（P100/V100）硬件不支持 GSP，只能用闭源。"
+      },
+      {
+        "text": "Secure Boot 集群上部署 GPU Operator，kmod 签名流程是怎样的？",
+        "answer": "Secure Boot 要求所有加载入 kernel 的 .ko 必须被 MOK（Machine Owner Key）链信任的密钥签名。流程：(1) 生成 MOK 密钥对 `openssl req -new -x509 -newkey rsa:2048 -keyout MOK.priv -out MOK.der -nodes -days 36500 -subj \"/CN=GPU Operator MOK/\"`；(2) `mokutil --import MOK.der` 在每个节点注册并 reboot 进 MokManager 确认；(3) 把 MOK.priv + MOK.der 打包成 K8s Secret：`kubectl create secret generic mok -n gpu-operator --from-file=MOK.priv --from-file=MOK.der`；(4) ClusterPolicy 设 driver.kernelModuleConfig.name 指向 Secret 或用 driver-precompiled 已签名镜像。验证：节点上 `mokutil --list-enrolled | grep 'GPU Operator'`，加载后 `modinfo nvidia | grep signer`。"
+      }
+    ],
+    "driver-container": [
+      {
+        "text": "nvidia-peermem（GPUDirect RDMA 的 peer memory module）是在 driver 容器里还是独立组件？",
+        "answer": "在 driver 容器里，作为 driver DaemonSet 的一部分加载，不是独立 operand。具体路径：driver 容器 entrypoint 加载完 nvidia.ko/nvidia-uvm.ko/nvidia-modeset.ko 之后，若检测到 Mellanox mlx5_core 已加载（通过 `lsmod | grep mlx5_core`），会接着 `insmod nvidia-peermem.ko`。ClusterPolicy 里通过 `driver.rdma.enabled=true` 开关，同时要求节点装了 MOFED（通常配合 Network Operator 一起部署）。依赖顺序很关键：MOFED DaemonSet 必须先于 driver 起（Network Operator 的 nicclusterpolicy 和 GPU Operator 的 clusterpolicy 靠 NFD label 互相等待）。验证 `lsmod | grep -E 'nvidia_peermem|ib_core'` 都在即 GPUDirect RDMA 就绪。"
+      },
+      {
+        "text": "升级 driver 时 nvidia-driver-daemonset 新 Pod 卡住，日志报 'nvidia_uvm module is still in use'，根因和解法？",
+        "answer": "根因是旧 driver kmod 被用户进程或遗留容器持有引用计数 > 0，rmmod 失败。常见来源：(1) 还在运行的 CUDA Pod（被 cordon 了但 drain 没驱逐 DaemonSet/static Pod）；(2) 容器退出了但 nvidia-persistenced 还持有设备；(3) fabric-manager 进程（NVSwitch 机型）。解法：(1) 确认节点上 `fuser -v /dev/nvidia*` 看谁在占，kill 掉或驱逐其所属 Pod；(2) 停 persistenced：`nvidia-smi -pm 0`；(3) 按序 rmmod：`rmmod nvidia_uvm && rmmod nvidia_drm && rmmod nvidia_modeset && rmmod nvidia`；(4) k8s-driver-manager 的环境变量 `DRAIN_USE_FORCE=true` 和 `DRAIN_DELETE_EMPTYDIR_DATA=true` 可绕过 PDB 硬驱逐。终极手段 reboot 节点。"
+      },
+      {
+        "text": "k8s-driver-manager（driver 容器的 sidecar/init）和 cordon/drain 是什么关系？",
+        "answer": "k8s-driver-manager 是 driver DaemonSet 升级时的协调器，运行在 initContainer 阶段。流程：(1) 检测到需要 driver 版本升级（image tag 变了）；(2) 调 K8s API 把本节点 cordon（NoSchedule taint）；(3) drain 节点上所有使用 GPU 的 Pod——通过 resource request 带 nvidia.com/gpu 过滤；(4) 执行 rmmod 卸载旧 kmod；(5) 新 driver 容器加载新 kmod；(6) validator 验证通过后 uncordon。关键 ClusterPolicy 字段：`driver.upgradePolicy.autoUpgrade=true`、`drain.enable=true`、`drain.force=false`（尊重 PDB）、`drain.timeoutSeconds=300`、`podDeletion.force=true`。超时未 drain 完，节点会卡在 `Upgrade-in-progress` annotation，需手动介入。"
+      }
+    ],
+    "container-toolkit-cdi": [
+      {
+        "text": "nvidia-container-toolkit 的 legacy hook 模式和 CDI 模式在容器启动路径上有什么差异？",
+        "answer": "Legacy hook：containerd/CRI-O 走 OCI prestart hook，`nvidia-container-runtime`（包装 runc）在容器 create 阶段被调用，读 env `NVIDIA_VISIBLE_DEVICES=0,1`，调 libnvidia-container 动态 mount /dev/nvidia0 /dev/nvidia1 和 driver library 到容器 rootfs。问题：hook 执行失败难排查，错误只在 containerd.log 里；不同 runtime 实现不一致。CDI 模式：预先生成 `/etc/cdi/nvidia.yaml` 声明式描述每张 GPU 的 deviceNodes/mounts/hooks，Pod 通过 `nvidia.com/gpu=gpu0` 这种 fully qualified device name 请求，containerd 原生读 CDI spec 完成注入。优势：声明式、可预览（`cat /etc/cdi/nvidia.yaml`）、跨 runtime（Kata/Firecracker 也支持）、静态设备列表更早被调度器感知。v24.6+ 默认 CDI。"
+      },
+      {
+        "text": "/etc/cdi/nvidia.yaml 在什么时机被重新生成？内容变更了容器需要重启吗？",
+        "answer": "nvidia-cdi-refresh（toolkit DaemonSet 里的 sidecar 或 systemd timer）在以下时机重生成：(1) 节点启动时；(2) GPU 热插拔或 MIG reshape 后（监听 `nvidia-smi -q -d COMPUTE` 或 inotify /dev/nvidia*）；(3) driver 升级后 library 路径变更；(4) 手动 `nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml`。内容变更对已运行容器无影响——CDI spec 只在容器 create 时读一次，写入 OCI spec 的 mounts/devices 后就固化。新 Pod 才会拿到新配置。典型坑：MIG reshape 后旧 Pod 还绑在已删除的 MIG instance 上，必须 delete Pod 让它用新 CDI spec 重建。"
+      },
+      {
+        "text": "GPU Operator 修改了 /etc/containerd/config.toml 后如何确认生效？回滚怎么做？",
+        "answer": "(1) 节点上 `grep -A5 nvidia /etc/containerd/config.toml` 应看到 `[plugins.\"io.containerd.grpc.v1.cri\".containerd.runtimes.nvidia]` 段；(2) 看 default_runtime_name 是否被改为 nvidia（ClusterPolicy 的 `toolkit.env[].name=CONTAINERD_SET_AS_DEFAULT`）；(3) containerd 需要 reload，toolkit 容器会发 SIGHUP：`systemctl status containerd` 看 reload 时间；(4) CDI 模式额外看 `enable_cdi = true` 和 `cdi_spec_dirs = [\"/etc/cdi\"]`。回滚：toolkit 容器 stop 时会执行 cleanup——通过保存的 `.backup` 文件还原，但依赖 toolkit 正常退出。强删 Pod 可能留残留——手动 `cp /etc/containerd/config.toml.backup /etc/containerd/config.toml && systemctl restart containerd`。建议在 config.toml 加入 GitOps 纳管避免漂移。"
+      }
+    ],
+    "driver-upgrade": [
+      {
+        "text": "driver.upgradePolicy.maxParallelUpgrades=3 在 100 节点集群升级时对训练任务的影响？",
+        "answer": "同一时刻最多 3 个节点进入 drain + rmmod + reload 流程，意味着 3 个节点上的 GPU Pod 被驱逐。对训练的影响：(1) 分布式训练作业（如 8 节点 DDP）如果 3 个节点里有自己的 worker，作业直接挂——除非用 torchrun --max-restarts 配合 checkpoint；(2) PDB 保护：通过 `PodDisruptionBudget` minAvailable 保训练作业不被同时驱逐；(3) 推理服务影响小，只要 replicas > 3 且反亲和。调优建议：大集群 maxParallelUpgrades 设为总节点数的 5-10%，配合 `drain.timeoutSeconds` 给长任务时间 checkpoint。极端情况可以设 `maxParallelUpgrades=1` + `upgradePolicy.waitForCompletion.timeoutSeconds=1800` 做严格串行。"
+      },
+      {
+        "text": "driver 升级前在 canary 节点上验证，具体看哪些指标才算通过？",
+        "answer": "Canary 节点（打 label `nvidia.com/gpu-driver-upgrade-state=upgrade-done-waiting-for-validation`）跑一套 smoke test：(1) `nvidia-smi` 成功返回且 GPU Health=OK；(2) `nvidia-smi -q | grep -i 'ECC Errors'` 各项为 0；(3) DCGM 健康检查 `dcgmi diag -r 3`（level 3 含 memory/pcie/nvlink 压测）全绿；(4) 跑一个标准 NCCL all-reduce benchmark（`nccl-tests/build/all_reduce_perf -b 8 -e 4G -g 8`）带宽达到 NVLink 理论 85% 以上；(5) 启一个代表性训练 Pod（如 PyTorch ResNet50）跑 100 步，loss 下降正常；(6) `nvidia-smi nvlink -s` 所有 link active；(7) Prometheus 查 `DCGM_FI_DEV_XID_ERRORS` 升级后 15 分钟内无新 Xid。全部通过才把 label 改成 `upgrade-done` 触发下一批。"
+      },
+      {
+        "text": "某个节点卡在 annotation `nvidia.com/gpu-driver-upgrade-state=upgrade-required`，怎么清？",
+        "answer": "这 annotation 由 k8s-driver-manager 写入，表示检测到新版本但 drain/upgrade 未推进。排查顺序：(1) `kubectl describe node <node>` 看所有 nvidia.com/gpu-* annotation 和 taint；(2) `kubectl logs -n gpu-operator <nvidia-driver-daemonset-pod> -c k8s-driver-manager` 看 drain 是否被 PDB 阻塞或 evict 超时；(3) 有 Pod 拒绝 evict 就 `kubectl delete pod --force --grace-period=0`；(4) 手动清 annotation：`kubectl annotate node <node> nvidia.com/gpu-driver-upgrade-state- nvidia.com/gpu-driver-upgrade.requested-by-` 然后 uncordon；(5) 极端情况整个 DaemonSet Pod 删掉让 operator 重建。注意不要同时清多个节点，避免大批量 driver reload 冲击。"
+      }
+    ],
+    "sharing-strategies": [
+      {
+        "text": "time-slicing / MPS / MIG 在 fault isolation（故障隔离）和 memory isolation 上的差异？",
+        "answer": "(1) time-slicing：全无隔离——所有 replica 共享同一 CUDA context，一个进程 OOM 把整卡显存撑爆所有邻居都 OOM，一个进程非法访问内存触发 Xid 31 整卡挂，所有 replica 全死；(2) MPS：部分隔离——MPS server 是共享单点，client crash 不影响别人，但 server crash（或 Xid）所有 client 一起完蛋；显存层面仅在 Volta+ 支持 `CUDA_MPS_PINNED_DEVICE_MEM_LIMIT` 软限，不是硬隔离；(3) MIG：硬件级强隔离——每个 GI 有独立的 SM partition、L2 cache slice、memory controller，一个 GI 的 GPU fault（如 Xid 74）不影响其他 GI，ECC 错误也按分区上报。安全多租户只能选 MIG。"
+      },
+      {
+        "text": "MIG mixed strategy 下 scheduler 看到什么资源名？Pod spec 怎么写才能精确挑 profile？",
+        "answer": "Mixed strategy 把每种 MIG profile 暴露为独立 extended resource：`nvidia.com/mig-1g.10gb`、`nvidia.com/mig-2g.20gb`、`nvidia.com/mig-3g.40gb`、`nvidia.com/mig-7g.80gb` 等。Pod 写 `resources.limits.nvidia.com/mig-3g.40gb: 1` 精确请求一个 3g.40gb 实例。对比 single strategy：所有 MIG 实例统一暴露为 `nvidia.com/gpu`，不区分 profile，只能靠 nodeSelector 挑节点。Mixed 的代价是 scheduler 需要同时考虑多种资源，bin-packing 复杂度上升；single 简单但灵活度差。另外 mixed 下 GFD 会打 label `nvidia.com/mig.strategy=mixed` 和具体 profile 的 capable label。"
+      },
+      {
+        "text": "时间片共享下 DCGM 上报的 GPU utilization 口径怎么理解？多个 replica 的使用率加起来会超过 100% 吗？",
+        "answer": "DCGM 上报的 `DCGM_FI_DEV_GPU_UTIL` 是物理卡级别（hardware SM active ratio 的采样平均），不区分 replica——一张卡就一个数值，0-100%。多个 Pod 共享时，它们共同贡献到这个数，加起来的 \"感知利用率\" 可能超 100%（如 Pod A 自认跑满 + Pod B 自认跑满 = 总和 200%），但物理卡只会报一个 ≤100%。正确的口径是看 `DCGM_FI_PROF_SM_ACTIVE`（profiling metric，更准的 SM 占用）和 `DCGM_FI_PROF_SM_OCCUPANCY`。要做 per-Pod 计费得靠 `DCGM_FI_PROCESS_*` 按 PID 拆，但 time-slicing 下 PID 切换频繁，拆分精度有限。MIG 下每个 GI 有独立 DCGM entity，才能真正按 profile 计费。"
+      }
+    ],
+    "mig-manager": [
+      {
+        "text": "MIG Manager 执行动态 reshape（`nvidia.com/mig.config` label 变更）时，需要 drain 哪些 Pod？为什么？",
+        "answer": "必须 drain 所有使用该 GPU 的 Pod（resource request 含 `nvidia.com/gpu` 或任意 `nvidia.com/mig-*`）。原因：reshape 要先 destroy 现有 GI/CI（GPU Instance/Compute Instance），而 `nvidia-smi mig -dci -gi <id>` 在有进程持有 CUDA context 时会失败返回 `MIG device is currently being used`。MIG Manager 的流程：(1) cordon 节点；(2) `kubectl drain --ignore-daemonsets --delete-emptydir-data`，但 nvidia-device-plugin 和 dcgm-exporter 这些 DaemonSet 不动；(3) 停 device-plugin Pod（让它重注册）；(4) 执行 `nvidia-mig-parted apply -f /host/mig-parted-config.yaml`；(5) 重启 device-plugin；(6) uncordon。关键 ClusterPolicy 字段：`migManager.config.name` 指向 ConfigMap，`migManager.gpuClientsConfig` 声明哪些工作负载算 GPU client。"
+      },
+      {
+        "text": "Xid 74（NVLink error）触发后 MIG reshape 被阻塞，怎么处理？",
+        "answer": "Xid 74 表示 NVLink 硬件通信错误，GPU 进入降级状态，`nvidia-smi mig` 相关操作通常返回 `ERROR: Unable to destroy GPU instance`。处理：(1) `nvidia-smi -q | grep -A5 Xid` 确认错误码和 remapped rows 状态；(2) `nvidia-smi nvlink -s` 看 link state，若 inactive 先尝试 `nvidia-smi -r` GPU reset（仅对单卡 reset 支持的机型有效，DGX NVSwitch 场景需要 fabric-manager 协作）；(3) reset 失败节点 reboot；(4) 重启后 `dmesg | grep -i xid` 确认无复现；(5) 连续出现 Xid 74 认为是硬件故障，走 RMA 流程。MIG Manager 遇到 reshape 失败会把节点 annotation 标 `nvidia.com/mig.config.state=failed`，运维监控报警后人工介入；reshape 失败不会自动重试避免加重硬件故障。"
+      },
+      {
+        "text": "MIG single vs mixed strategy，Pod spec 写法有什么本质差异？已有 single Pod 迁移到 mixed 怎么平滑？",
+        "answer": "Single：`resources.limits.nvidia.com/gpu: 1`——scheduler 不知道是整卡还是 MIG 实例，靠 nodeSelector `nvidia.com/gpu.product=A100-SXM4-40GB-MIG-3g.20gb` 区分。好处是向前兼容（非 MIG Pod 直接能跑），缺点是调度器看不到 profile 维度无法 bin-pack。Mixed：`resources.limits.nvidia.com/mig-3g.20gb: 1`——资源名直接带 profile。迁移方案：(1) 过渡期保持 strategy=single，用 nodeSelector 区分 profile；(2) 切到 mixed 后旧 spec 的 `nvidia.com/gpu` 仍可用于整卡节点，但 MIG 节点上旧 spec 无法调度（因为 MIG 节点不暴露 `nvidia.com/gpu`）——必须改 spec；(3) 用 admission webhook 自动把 `nvidia.com/gpu` 基于 label 改写成对应 `nvidia.com/mig-*`，避免全量改 YAML。"
+      }
+    ],
+    "vgpu-vcs": [
+      {
+        "text": "NVIDIA vCS（Virtual Compute Server）和 vGPU 图形版本（vPC/vApps/vWS）本质差异？",
+        "answer": "vCS 是 compute-only license——只开 CUDA/cuDNN/TensorRT 等计算栈，没有 OpenGL/DirectX/Vulkan 图形 API，不支持 display output，只能用于 AI 训练/推理/HPC。图形版（vPC virtual PC、vApps virtual Apps、vWS virtual Workstation）反之专注图形，vWS 开全栈 OpenGL + 部分 CUDA，用于 CAD/渲染 VDI。一个 GPU 同一时刻只能选一个 license 模式。K8s 场景通常只用 vCS——ClusterPolicy 的 `sandboxWorkloads.enabled=true` + `vgpuManager.enabled=true` 配合 kubevirt 给 VM 分配 vGPU 做强隔离 GPU 租户。硬件要求：Ampere+ 的 A10/A16/A40/L40 或 Hopper 的 H100-PCIe（SXM 版不支持 vGPU）。"
+      },
+      {
+        "text": "DLS（Delegated License Service，本地）vs CLS（Cloud License Service）怎么选？",
+        "answer": "CLS：license server 由 NVIDIA 托管在 nvidia.com，节点的 vGPU guest driver 通过 internet 每小时心跳续租，license 文件是短期 token。适合：有稳定外网、想零运维、license 量少（<100 seats）。DLS：NVIDIA 提供的 Delegated License Service VM 镜像（基于 Ubuntu + Java app），部署在客户 IDC，作为 NVIDIA portal 的本地代理。适合：离线/air-gap 环境、合规要求 license 数据不出域、大规模 seats（几百上千）。架构：DLS VM 从 NLP（NVIDIA Licensing Portal）定期批量拉 token（每 24h），vGPU client 到 DLS checkout。HA 需部署 DLS HA 对（primary + secondary）。两者切换配置在 `/etc/nvidia/ClientConfigToken/client_configuration_token.tok`。"
+      },
+      {
+        "text": "vGPU license checkout 失败时 guest driver 的降级行为是什么？产线怎么监控？",
+        "answer": "启动时 checkout 失败：guest driver 进入 unlicensed 模式，性能被限制（通常降到 30-50% frame rate cap，CUDA 部分 feature 禁用，`nvidia-smi -q | grep License` 显示 `Licensed Product: N/A`），20 分钟宽限期后如果还没 checkout 成功则进入严格限制。运行中掉线：先进入 grace period（默认 7 天持续尝试续租），期间功能正常；超过宽限期强制降级。监控：(1) DCGM 抓 `DCGM_FI_DEV_VGPU_LICENSE_STATE`（0=unlicensed, 1=licensed, 2=grace period）；(2) guest 内 `/var/log/nvidia-gridd.log` 看 `License acquired successfully` 或 `License server connection failed`；(3) DLS 侧 web UI 看 checkout 统计和 denied 计数；(4) 产线报警阈值：unlicensed 状态 > 5min 即 P1。避坑：DLS 证书 1 年过期，提前告警续期。"
+      }
+    ],
+    "nfd-gfd": [
+      {
+        "text": "GFD（GPU Feature Discovery）在节点上暴露的 5 个关键 label 及作用？",
+        "answer": "(1) `nvidia.com/gpu.product=NVIDIA-A100-SXM4-80GB`——GPU 具体型号，用于 nodeSelector 区分卡型；(2) `nvidia.com/gpu.memory=81920`——显存 MB，用于 HPA 或 scheduler 根据显存需求挑节点；(3) `nvidia.com/gpu.count=8`——节点 GPU 数量，多租户配额和反亲和用；(4) `nvidia.com/cuda.driver.major=535` + `nvidia.com/cuda.runtime.version=12.2`——CUDA 驱动/runtime 版本，框架要求特定 CUDA 版本时筛选节点；(5) `nvidia.com/mig.capable=true` 和 `nvidia.com/mig.strategy=mixed`、`nvidia.com/mig.config.state=success`——MIG 能力与当前配置状态。额外还有 `nvidia.com/gpu.machine=DGXH100`、`nvidia.com/gpu.family=ampere`、`nvidia.com/gfd.timestamp` 等。这些 label 让 scheduler/Karpenter/Kueue 做拓扑与能力感知调度。"
+      },
+      {
+        "text": "运行时 GFD label 变化（如 MIG reshape 后）和已 pending 的 Pod 之间有什么 race？",
+        "answer": "Race：(1) scheduler 可能在 label 更新和 device-plugin 资源注册之间的窗口把 Pod 调度到节点，此时 `nvidia.com/mig-3g.40gb` 资源名还没注册，kubelet admission 失败 Pod CreateContainerError；(2) 反过来，label 已经是新 profile 但旧 Pod 的 nodeSelector 还是旧 label（如 `nvidia.com/mig.config=all-1g.10gb`），永远 pending。防护：(1) GFD 更新 label 前先删除 device-plugin 注册的资源（plugin 先 stop），label 更新完再重启 plugin 注册新资源，保证顺序；(2) MIG Manager reshape 时给节点打 taint `nvidia.com/gpu.deploy.mig-manager=reconfiguring:NoSchedule`，reshape 完成才移除——scheduler 不会在中间状态调度；(3) Pod 侧用 tolerations 和 `nvidia.com/mig.config.state=success` 双重约束避免落到未就绪节点。"
+      },
+      {
+        "text": "Karpenter 启动新 GPU 节点时，GFD label 还未就绪就有 Pod 调度过来导致失败，怎么办？",
+        "answer": "Karpenter provisioning 阶段节点 Ready 但 driver/plugin/GFD 还在 install，此时节点已可接收 Pod 但 `nvidia.com/gpu` 资源没注册——Pod 进来 admission 失败。解法：(1) Karpenter NodePool 的 startupTaints 加 `nvidia.com/gpu=present:NoSchedule`，让新节点默认拒 Pod；(2) GPU Operator 的 validator Pod（nvidia-operator-validator）通过 toleration 能上去跑验证，全链路 ready 后主动移除 taint——这是官方推荐模式，`--set daemonsets.tolerations[0].key=nvidia.com/gpu ...`；(3) validator 里的 plugin-validator 容器最后会执行 `kubectl taint node <node> nvidia.com/gpu- --overwrite`；(4) Pod 侧加 `tolerations` 明确容忍该 taint 才被调度。另外 Karpenter v1 支持 `spec.template.spec.startupTaints`，比 v0 更规范。"
+      }
+    ],
+    "dcgm-exporter": [
+      {
+        "text": "面试题：DCGM_FI_DEV_GPU_UTIL 和 DCGM_FI_PROF_SM_ACTIVE 有什么本质区别？线上做容量规划该用哪个？",
+        "answer": "DCGM_FI_DEV_GPU_UTIL 来自 NVML，语义是「过去采样窗口内至少有一个 kernel 在 GPU 上执行的时间占比」，即使只用了 1 个 SM 也会显示 100%，严重高估真实算力占用。DCGM_FI_PROF_SM_ACTIVE 来自 DCGM profiling group，通过 PerfWorks 采样 SM 活跃 warp 比例，能反映实际 SM 占用率。容量规划和成本归因应该用 SM_ACTIVE、SM_OCCUPANCY、PIPE_TENSOR_ACTIVE 这组 profiling 指标；GPU_UTIL 只适合用作「是否有 workload 在跑」的二值信号。"
+      },
+      {
+        "text": "产线：Prometheus 里 DCGM 指标有 GPU ID 但没有 pod/namespace label，dashboard 无法做 pod 归因，缺了哪些前提？",
+        "answer": "DCGM-exporter 做 pod attribution 依赖三件事：(1) 启用 kubelet pod-resources socket，挂载 /var/lib/kubelet/pod-resources 到 exporter pod；(2) exporter 启动参数带 -k 或 env DCGM_EXPORTER_KUBERNETES=true，周期调用 ListPodResources gRPC 把 GPU UUID 映射到 pod/container/namespace；(3) metrics config（dcgm-metrics.csv）里的指标行保留 {pod,namespace,container} label。Operator 默认 ClusterPolicy 里 dcgmExporter.serviceMonitor 和 hostPID 也要开。排查可以 kubectl exec 进 exporter curl localhost:9400/metrics 看 label 是否带出来，再 check -resources-socket 路径。"
+      },
+      {
+        "text": "陷阱：开了 DCGM profiling metrics 后训练任务 throughput 掉了 3-5%，原因和缓解？",
+        "answer": "DCGM profiling group（SM_ACTIVE、PIPE_TENSOR_ACTIVE 等）走 CUPTI/PerfWorks，需要独占 profiling counter，和训练 kernel 共享 SM 采样槽位，默认 30s 周期对大 batch GEMM 会挤占。缓解方式：(1) 拉长 collect-interval 到 60-120s（--collect-interval 120000）；(2) 分离 metrics，profiling group 只在 eval 节点开，训练节点只留 NVML 基础组；(3) A100/H100 上用 MIG 隔离 profiling instance；(4) DCGM 5.x 支持 MPS-aware sampling，可以降低干扰。定位可以看 dcgmi profile --pause/--resume 前后吞吐差。"
+      }
+    ],
+    "validator-pods": [
+      {
+        "text": "面试题：GPU Operator 的 6 个 validator pod 分别验证什么？哪个失败会 block 整个 node ready？",
+        "answer": "6 个 validator：(1) driver-validator 检查 nvidia.ko 加载 + nvidia-smi 可跑；(2) toolkit-validator 检查 nvidia-container-runtime hook 注册到 containerd/crio；(3) cuda-validator 跑一个 vectorAdd sample 验证 CUDA runtime；(4) plugin-validator 验证 device plugin 已把 nvidia.com/gpu 注册到 kubelet；(5) mofed-validator（可选）验证 MOFED 驱动；(6) nvidia-fs-validator（可选）验证 GPUDirect Storage。失败都会通过 nvidia.com/gpu.deploy.* annotation 阻止后续 component 调度，但只有 driver 和 toolkit 失败会让节点没有可用 GPU 资源，plugin 失败直接让 Allocatable.nvidia.com/gpu=0。"
+      },
+      {
+        "text": "产线：节点卡在 driver-validator Init 状态 20 分钟，nvidia.com/gpu.deploy.driver=true 但 toolkit 没起来，怎么排查？",
+        "answer": "Operator 用 nvidia.com/gpu.deploy.<component> annotation 做 dependency gating：driver ok 才会给 toolkit 打 true，toolkit ok 才给 device-plugin 等。Init 卡住常见原因：(1) driver container 还在编译 kmod（open-gpu-kernel-modules 首次 ~5-10 min）；(2) Secure Boot 未签名 MOK；(3) kernel header 包不全。排查：kubectl logs -n gpu-operator <driver-daemonset-pod> -c nvidia-driver-ctr 看 dkms/precompiled 日志；kubectl describe node 看 taint nvidia.com/gpu.deploy.driver=pending；nvidia-smi on host 确认 module 加载。确认后 kubectl annotate node <n> nvidia.com/gpu.deploy.driver- 让 operator 重新 reconcile。"
+      },
+      {
+        "text": "陷阱：plugin-validator 一直 CrashLoopBackOff，日志说 'failed to get gpu count'，怎么手动解锁？",
+        "answer": "plugin-validator 依赖 driver 已装且 device plugin 已 publish resource，common 陷阱是 device-plugin pod 启动早于 driver 完成加载，导致 kubelet cache 里 Allocatable 还是 0。手动解锁命令序列：(1) kubectl delete pod -n gpu-operator -l app=nvidia-device-plugin-daemonset --field-selector spec.nodeName=<node>；(2) 强制重跑 validator：kubectl annotate node <node> nvidia.com/gpu.deploy.device-plugin- nvidia.com/gpu.deploy.operator-validator- ；(3) 若还是不行 kubectl delete ds -n gpu-operator nvidia-operator-validator 让 Operator 重建。根因定位看 /run/nvidia/validations/plugin-ready 这个 host 路径文件是否存在。"
+      }
+    ],
+    "fault-diagnosis": [
+      {
+        "text": "面试题：训练集群常见 Xid 48 / 64 / 79，各自原因和运维处理策略是什么？",
+        "answer": "Xid 48=DBE（Double Bit ECC error），HBM 出现不可恢复 ECC，GPU 进入 fallen off the bus 前兆，策略是立即 cordon + drain 节点、RMA 更换。Xid 64=显存 row remapping 触发，GPU 仍可用但累计到上限需要重启；策略是观察 dcgmi diag -r 3 的 remapped row count，超过阈值走维修流程。Xid 79=GPU has fallen off the bus（PCIe 链路丢失），通常伴随硬件故障或 PSU 问题，节点必须重启，多次重启无法恢复即 RMA。DCGM 里对应 DCGM_FI_DEV_XID_ERRORS，Operator 场景下通常通过 NPD + GPU healthcheck 自动打 condition 并 taint。"
+      },
+      {
+        "text": "产线：怎么让 Node Problem Detector 把 Xid 翻译成 NodeCondition？",
+        "answer": "NPD 本身不懂 Xid，需要配一个 custom plugin 或 system-log-monitor rule：(1) 用 KernelMonitor 监听 /dev/kmsg 中 'NVRM: Xid' pattern；(2) 在 ConfigMap 里定义 rule，match regex 'NVRM: Xid \\(PCI:[0-9a-f:]+\\): (\\d+)'，把 Xid 号提取出来；(3) 给 permanent error（如 48、63、74、79）设 condition type=GpuHealthy status=False；(4) 配合 descheduler 或 custom controller 根据 condition taint 节点 nvidia.com/gpu=unhealthy:NoSchedule。更完整方案是用 NVIDIA 的 DCGM + k8s-device-plugin health check，开启 DP_DISABLE_HEALTHCHECKS=\"\" 让 plugin 自己上报 unhealthy GPU。"
+      },
+      {
+        "text": "陷阱：多机训练 NCCL all-reduce timeout，一个节点日志 Xid 74，如何联合定位根因？",
+        "answer": "Xid 74=NVLINK error，通常是 NVLink/NVSwitch 链路 CRC 或 lane down。联合诊断步骤：(1) 在报 Xid 74 的节点跑 nvidia-smi nvlink -e 查 link error counter，nvidia-smi nvlink -s 看 link active 数；(2) dcgmi diag -r 3 跑 NVLink stress；(3) NCCL 侧把 NCCL_DEBUG=INFO NCCL_DEBUG_SUBSYS=GRAPH,NET 重跑，看 ring 在哪个 rank 卡住；(4) 确认是 intra-node NVLink 还是 inter-node IB/RoCE，Xid 74 只管前者；(5) 若是 NVSwitch 系统（HGX），check fabric-manager 日志 /var/log/fabricmanager.log。处理：cordon 节点、重启尝试，若 nvlink -e 计数持续涨，RMA。"
+      }
+    ],
+    "gpu-slo": [
+      {
+        "text": "面试题：设计 GPU 集群 availability SLO，driver 升级窗口（节点 drain + reboot）算不算 downtime？",
+        "answer": "取决于 SLO 对象。站在 platform 角度看 node-level SLO，计划维护窗口应排除在 error budget 外，用 maintenance window label 标记不计入；但站在 workload 角度（训练 job 完成率、推理 QPS 可用率）任何让 pod 重启的事件都算 downtime，因为用户感知不到你是计划还是故障。务实做法：定义两层 SLO——(1) GPU-node availability（含维护窗 exclusion）给 infra team 用；(2) workload-visible availability（不含 exclusion）作为对业务承诺。Operator 升级用 maxUnavailable=10% + PDB 控制并发，把 driver 升级错峰到低峰窗，争取业务 SLO 不受影响。"
+      },
+      {
+        "text": "产线：老板问「GPU 利用率 SLI」该用哪个指标？utilization 50% 算高还是低？",
+        "answer": "GPU_UTIL 会严重高估，真实利用率 SLI 要分层：(1) 算力利用率：SM_ACTIVE 反映 SM 占用，TENSOR_ACTIVE 反映 Tensor Core 占用，LLM 训练期望 SM_ACTIVE>60%、TENSOR_ACTIVE>40%；(2) 显存利用率：FB_USED/FB_TOTAL；(3) 通信占比：NVLINK_TX/RX_BYTES、NCCL 时间占比。50% GPU_UTIL 可能实际 SM_ACTIVE 只有 15%，属于低效利用。做 SLI 建议：训练用 TENSOR_ACTIVE p50 > 40%、推理用 SM_ACTIVE 或 request QPS/capacity。单一 GPU_UTIL 指标不适合做利用率 SLO，只适合做「是否空闲」。"
+      },
+      {
+        "text": "MIG 场景下，两个 pod 共享一张 A100 切成 3g.40gb + 3g.40gb，某一方 OOM，成本归因怎么算？",
+        "answer": "MIG 下 pod resource 是 nvidia.com/mig-3g.40gb 而不是整卡，成本归因不能按整卡除以 2。标准算法：(1) 物理卡时薪 C_gpu；(2) 按 MIG profile 的 compute slice 比例 w_i 拆（3g/7g=3/7），显存维度类似 m_i = 40/80；(3) 单 pod 成本 = C_gpu × max(w_i, m_i) × 时长。OOM 只影响 availability 不改成本分配，因为你占着 slice 就付钱。实际落地用 DCGM + kube-state-metrics + OpenCost 自动做：把 mig-3g.40gb request 乘以 0.5（3/7 round up + 显存占半）系数映射到整卡成本池。"
+      }
+    ],
+    "network-operator": [
+      {
+        "text": "面试题：nv_peer_mem（GPUDirect RDMA）模块归 GPU Operator 还是 Network Operator 管？",
+        "answer": "历史上 nv_peer_mem 属于 Mellanox OFED 生态由 Network Operator 管，但自 CUDA 11.4+ / driver 510+ NVIDIA 改推荐内核原生 nvidia-peermem（替代 nv_peer_mem），由 GPU Operator 的 driver container 一起加载，Operator 有 gds / peermem 开关。实际分工：GPU Operator 负责 nvidia-peermem 模块加载（driver.gdrcopy.enabled / peermemory.enabled），Network Operator 负责 MOFED 驱动、SR-IOV/RDMA shared device plugin、NicClusterPolicy。两者通过 node label 协同，缺一不可。面试加分点：H100+ GPUDirect Async 还需要 DOCA + BlueField，归 Network Operator。"
+      },
+      {
+        "text": "产线：RDMA 网络要给训练 pod，选 rdma-shared-device-plugin 还是 sriov-device-plugin？",
+        "answer": "rdma-shared-device-plugin：多 pod 共享同一 HCA 的 verbs 接口，资源名 rdma/hca_shared_devices_a，无网络隔离，适合单租户大训练（所有 pod 都是一个 job）。sriov-device-plugin：给每个 pod 分配独立 VF，有 MAC/VLAN/GUID 隔离，资源名 nvidia.com/mlx_vf，适合多租户或者多 pod 共节点场景。训练场景一般 shared plugin 够用且性能最好（避免 VF 切分损失），推理/多租户用 SR-IOV。Network Operator 里通过 NicClusterPolicy.rdmaSharedDevicePlugin / sriovDevicePlugin 字段选，两者可共存但一块 HCA 只能选一种。"
+      },
+      {
+        "text": "陷阱：NCCL_IB_HCA 要自动从 GFD/Network Operator label 填，怎么做？",
+        "answer": "GFD 会给节点打 feature.node.kubernetes.io/pci-15b3.present=true 之类 PCI 标签，Network Operator 的 host-device-network CR 会暴露 HCA 名字但不会直接 label 到节点。实战做法：(1) 用 MPI Operator / Kubeflow PytorchJob 的 podTemplate，把 NCCL_IB_HCA 设成 mlx5_0,mlx5_1 这种固定值，前提是机型同构；(2) 异构集群用 downwardAPI + initContainer，在 pod 启动时读 /sys/class/infiniband/ 目录动态生成 env 写到 shared volume；(3) 最工程化：写一个 mutating webhook，根据节点 label nvidia.com/gpu.machine=dgx-h100 查表注入 NCCL_IB_HCA、NCCL_SOCKET_IFNAME。官方 HPC Operator 或 nccl-tests 镜像里 /opt/nccl-tests/scripts/ 有 auto-discovery 脚本可参考。"
+      }
+    ],
+    "confidential-compute": [
+      {
+        "text": "面试题：H100 Confidential Compute 模式下 PCIe 和 HBM 被做了什么？",
+        "answer": "H100 CC 模式（由 nvidia-smi conf-compute -srs 1 开启，需要 SKU 支持 + CPU TEE 如 Intel TDX/AMD SEV-SNP）下：(1) PCIe 总线上 CPU↔GPU 所有流量通过 SPDM + AES-GCM 加密，MMIO BAR 访问被 TEE 路由；(2) HBM 上的 workload 数据由 GPU 内部 encryption engine 加密，host DMA 只能拿密文；(3) GPU 提供 attestation report（SPDM measurement + NVIDIA Root CA 签名），让 workload 证明自己跑在真 H100 CC 模式下；(4) 性能损失主要来自加密 bounce buffer，BW 下降 5-15%，latency 增加。Operator 侧通过 ClusterPolicy.sandboxWorkloads + driver.confidentialCompute.enabled 启用，且必须配合 KataContainers + QEMU TEE VM。"
+      },
+      {
+        "text": "CC attestation 失败时，fail-closed 具体怎么体现？",
+        "answer": "Fail-closed 的核心是「验证没过就不给数据」。典型链路：(1) workload 启动时调用 nvtrust 的 verifier SDK 或 local-gpu-verifier，拿 GPU attestation report；(2) report 上送到 relying party（自建 KMS / Azure Attestation / 自建 verifier），验证 NVIDIA Root CA 签名、measurement 与期望 golden value 比对、CC 模式 bit 置位；(3) 验证通过才 release 数据加密密钥（KEK→DEK），workload 才能解密模型/数据集。失败时 verifier 不下发密钥，workload 启动容器里拿不到 key，自然无法解密任何 input，相当于「跑起来但没数据可算」。Operator 层面通过 initContainer 做 attestation gate，失败 exit 1 pod 不进入 running。"
+      },
+      {
+        "text": "为什么 CC 必须用 open-gpu-kernel-modules 而不能用闭源 driver？",
+        "answer": "CC 模式要求 host 侧内核模块可审计、可度量（measured boot 要把 kmod hash 放进 attestation report）。闭源 nvidia.ko 不提供源码无法做第三方 code review 也不在 NVIDIA 的 measured launch chain 里，因此 H100 CC 只支持 open-gpu-kernel-modules（从 R515 开始开源，Turing+ 可用）。Operator 配置 driver.useOpenKernelModules=true 或 driver.version 带 -open 后缀（如 550.54.15-open）。另外 CC 还需要：(1) 支持 TEE 的 CPU + BIOS 开启；(2) 支持 CC 的 vBIOS（H100 特定 firmware）；(3) kernel 5.19+ 和 IOMMU/VT-d；(4) Kata Containers runtime class。"
+      }
+    ],
+    "airgap-deploy": [
+      {
+        "text": "面试题：离线环境里 driver 镜像仓库要按哪几个维度组合准备？",
+        "answer": "driver 镜像 tag 组合形如 <driver-version>-<kernel-flavor>-<os>-<arch>-<cuda-compat>，4-5 个维度：(1) driver version（如 550.54.15、550.54.15-open）；(2) OS base（ubuntu22.04、rhel9.2、rocky8）；(3) kernel version（决定 precompiled kmod 是否匹配，signed image 还要对齐 kernel 的 signing key）；(4) 架构（x86_64/arm64，Grace-Hopper 要 arm64）；(5) 是否 open module。离线镜像同步要用 skopeo copy --all 把 multi-arch manifest 一起拉下来，存到本地 harbor/quay。ClusterPolicy 里 driver.repository、driver.image、driver.version 要换成内网 registry 路径，driver.manager.repository 同步替换。"
+      },
+      {
+        "text": "产线：离线环境 helm install 要 override 哪些 repository 字段？遗漏一个会怎样？",
+        "answer": "GPU Operator chart 有 ~12 个 component 各带自己 repository 字段，批量替换清单：driver.repository、driver.manager.repository、toolkit.repository、devicePlugin.repository、dcgmExporter.repository、dcgm.repository、gfd.repository、nodeStatusExporter.repository、migManager.repository、validator.repository、operator.repository、vgpuManager.repository（若用 vGPU）、sandboxDevicePlugin.repository、vfioManager.repository。漏一个会导致对应 pod ImagePullBackOff，validator 级联失败，节点一直不 Ready。实战用 helm template --set 生成 yaml 再 grep nvcr.io 检查残留，或 kubectl get po -n gpu-operator -o yaml | grep image: 对。推荐一次写全在 values-airgap.yaml，配 imagePullSecrets 指向内网 credential。"
+      },
+      {
+        "text": "CVE patch 流程要多久？离线环境关键节点是哪些？",
+        "answer": "NVIDIA CVE（如 CVE-2024-0099 driver kernel module）标准流程：(1) NVIDIA PSIRT 发 advisory + 修复版本（如 550.90.07）；(2) 内部拉取对应 driver container image 到离线 registry（skopeo sync ~20 min/架构）；(3) 在测试环境升级 ClusterPolicy.driver.version 跑 validator + 业务回归（~1 天）；(4) 生产 rolling upgrade，用 Operator 的 driver.upgradePolicy（maxParallelUpgrades、drainPolicy、podDeletion）控制并发，配合 PDB 保训练 checkpoint（~1-3 天取决规模）；(5) 审计上报。关键节点：测试环境能同构复现、driver container precompiled kmod 匹配 kernel、回滚镜像保留上一版。急迫 CVE 走 emergency drain 单节点临时替换 DaemonSet image。"
+      }
+    ],
+    "multi-cloud": [
+      {
+        "text": "面试题：GKE 自带 DriverInstaller DaemonSet，要不要装 GPU Operator？怎么共存？",
+        "answer": "默认 GKE GPU 节点池由 gke-node 系统组件装 driver（nvidia-driver-installer DaemonSet），如果 ClusterPolicy 也开 driver.enabled=true 会两个组件打架（都要加载/卸载 nvidia.ko）。两种选型：(1) 用 GKE 原生栈，关闭 Operator driver：driver.enabled=false，toolkit.enabled=false，只装 device plugin/DCGM/GFD；(2) 用 Operator 全家桶，创建节点池时加 --metadata=cos-gpu-installer-version=disabled 或用 Ubuntu 节点 + disable GKE driver installer（KubeConfig 打 label cloud.google.com/gke-gpu-driver-version=disabled）。生产推荐方案 1，因为 GKE 的 COS driver 和 GKE control plane 紧耦合，自己装容易踩 image streaming / cos kernel upgrade 兼容问题。AKS 的 GPU extension、EKS GPU AMI 也是同类选择。"
+      },
+      {
+        "text": "EKS 上 GPU node 选 EKS Optimized GPU AMI 还是 bare Amazon Linux + Operator 自己装 driver？",
+        "answer": "EKS GPU AMI（amazon-eks-gpu-node-*）预装 NVIDIA driver + nvidia-container-runtime + device plugin，上来即用，缺点是 driver 版本跟 AMI 发布挂钩，升级不灵活，且和 Operator 重复会冲突。bare AMI + Operator：完全由 Operator 管 driver/toolkit，版本自由、CVE 响应快，但需要 Operator 支持目标 kernel 的 precompiled image，冷启动慢 5-10 min。选型建议：(1) 小集群、driver 不敏感用 EKS GPU AMI；(2) 大规模 + 有 CVE SLA 要求 + 需要 CC/MIG 等新特性 → bare AMI + Operator；(3) Karpenter 场景几乎都用 bare AMI 配合 Operator，因为节点生命周期短要一致性。Trainium/Inferentia 节点不走这套，是 neuron-device-plugin。"
+      },
+      {
+        "text": "AKS 有 nvidia-device-plugin managed extension，和自部署 Operator 怎么共存？",
+        "answer": "AKS 的 GPU 支持有三档：(1) skipGPUDriverInstall=false + 装内置 nvidia-device-plugin DaemonSet（AKS 默认）；(2) AKS GPU Operator extension（az aks extension，preview）；(3) 关掉 AKS 托管部分，自部署 Operator。三种不能同时开启 driver，否则 kmod 冲突。正式生产推荐 (3)：创建 node pool 时用 --skip-gpu-driver-install，并给节点打 taint sku=gpu:NoSchedule；helm install gpu-operator 时配 driver.enabled=true + toolkit.enabled=true。共存检查命令：kubectl get ds -n kube-system | grep -i nvidia 看是否还有 AKS 自己的 plugin。AKS GPU Operator extension 本质是 Microsoft 托管的 Operator，适合不想维护 helm 的团队，但牺牲版本灵活性。"
+      }
+    ],
+    "operator-upgrade-dr": [
+      {
+        "text": "面试题：helm upgrade gpu-operator 用 --reset-values 有什么陷阱？",
+        "answer": "--reset-values 会把之前 values override 全部丢弃、回退到新 chart 默认值。GPU Operator 场景的大坑：(1) 离线 registry 地址被重置成 nvcr.io，节点立即 ImagePullBackOff；(2) driver.version pin 丢失，变成新 chart 默认 driver，和当前节点 kernel 不兼容；(3) ClusterPolicy spec 被重写，migManager strategy、toolkit env、custom toleration 全消失；(4) driver.upgradePolicy 回默认立即并发升级，可能同时 drain 半集群训练 pod。正确做法 --reuse-values + 显式 --set 覆盖需要改的字段；或者把 values 完整存成 values-prod.yaml 走 -f 参数，永远不用 --reset-values。升级前 helm get values gpu-operator -n gpu-operator -o yaml > backup.yaml 留底。"
+      },
+      {
+        "text": "事故：ClusterPolicy CRD 被误删，已有 DaemonSet 会发生什么？",
+        "answer": "ClusterPolicy 是 CR，删除 CR 不删 CRD 的话 Operator controller 会走 finalizer 清理所有 component DaemonSet（driver/toolkit/device-plugin/dcgm 等），节点上的 nvidia.ko 会在 driver ds 删除时卸载（除非有 workload 占用 GPU），运行中的训练 pod 一旦退出新 pod 拿不到 GPU。如果删的是 CRD 本身，K8s 会级联删除所有 ClusterPolicy CR，同样触发 finalizer。恢复步骤：(1) kubectl annotate clusterpolicy cluster-policy kubernetes.io/finalizer- 阻止继续清理（如果还来得及）；(2) 从 helm release 或 values 备份重新 helm upgrade 一次，Operator 会重建 ClusterPolicy；(3) 节点 annotation nvidia.com/gpu.deploy.* 清理让 validator 重跑。预防：给 CRD 加 kubectl protect / OPA policy 禁删，helm release 加 --keep-history。"
+      },
+      {
+        "text": "23.x 升 24.x 有哪些典型破坏性变更？",
+        "answer": "GPU Operator 23→24 破坏性变更重点：(1) 废弃 driver.rdma.enabled 字段，改走 Network Operator 的 NicClusterPolicy；(2) ClusterPolicy API 从 v1 稳定化，部分旧字段 schema 收紧，之前能塞 unknown field 的地方会被拒；(3) driver.upgradePolicy.autoUpgrade 默认行为变化（从 opt-in 变 opt-out 或反之，视版本），不显式配置会自动滚驱动；(4) 默认 CUDA/driver 版本跳一大版本（如 535→550），和老 workload 的 CUDA compat 可能不兼容；(5) MIG strategy single 的 label 结构可能增加 nvidia.com/gpu.clique 等新 label；(6) 镜像 tag 格式带 -ubi9 / -ubuntu22.04 后缀要求。升级前必须读 release notes + changelog，预生产 30 天以上灰度。"
+      }
+    ],
+    "gfd-label-scheduling": [
+      {
+        "text": "面试题：nvidia.com/gpu.clique label 的语义是什么？什么场景用？",
+        "answer": "nvidia.com/gpu.clique 是 GFD 基于 nvml fabric clique ID 打的 label（H100/H200 NVSwitch 拓扑下），语义是「这批 GPU 属于同一 NVLink fabric 域，能互相做 NVLink P2P」。一个 DGX H100 8 卡是一个 clique；GB200 NVL72 是 72 卡一个 clique；没 NVSwitch 的 PCIe 服务器每卡独自 clique 或只 NUMA 本地互通。用途：(1) 大模型张量并行调度要求 TP group 内所有 rank 在同一 clique，否则走 IB/PCIe 性能掉一个数量级；(2) gang scheduling（Volcano/Kueue）用 clique 做 affinity rule，nodeAffinity 匹配同一 clique value；(3) DRA ResourceSlice 也会把 clique 作为 attribute 暴露给调度器。"
+      },
+      {
+        "text": "产线：nvidia.com/cuda.driver.major 和 nvidia.com/gpu.product label 怎么组合使用？",
+        "answer": "典型组合用法：(1) CUDA 版本选型——workload 需要 CUDA 12.4 runtime，用 nodeSelector nvidia.com/cuda.driver.major=\"550\" 确保 driver 支持（550 driver 附带 CUDA 12.4）；(2) 硬件架构选型——推理 pod 要 H100 不要 A100，用 nvidia.com/gpu.product=NVIDIA-H100-80GB-HBM3 或 compute.major=\"9\"（Hopper）；(3) 组合使用——训练 pod 同时要 H100 + 新 driver：matchExpressions 加两条 (compute.major In [9], cuda.driver.major In [550,555])；(4) anti-affinity 把推理和训练分开用 gpu.product 区分机型。踩坑：product label 值字符串太长、机型重命名（例如 H100 SXM5 vs H100 PCIe）导致 selector 失配，优先用 compute.major + memory 组合更稳。"
+      },
+      {
+        "text": "陷阱：migManager 在节点上 reshape MIG 期间，GFD label 变化的 race 怎么处理？",
+        "answer": "MIG reshape 流程：migManager 先 drain GPU、destroy 旧 instance、create 新 instance、再 reconcile。期间 GFD 会按节点 label 变化：nvidia.com/gpu.count、nvidia.com/mig-<profile> 的 product/memory label 会瞬时归零再回填，device plugin 也要重 register resource。Race 表现：(1) 此时有新 pod 调度进来，nodeSelector 匹配到「旧」label 但 device plugin 已切换 profile，pod Pending 或 FailedScheduling；(2) Autoscaler 看到 Allocatable 归零以为节点挂了发 scale-out。缓解：(1) migManager 在 reshape 前给节点打 taint nvidia.com/gpu.present=false:NoSchedule，结束后移除；(2) nvidia.com/gpu.deploy.mig-manager=paused 暂停调度；(3) 单独 dedicated MIG node pool，不和非 MIG workload 混；(4) Operator 24.x 的 mig-manager 已加 in-flight 保护 annotation，升级到最新版本。"
+      }
+    ],
+    "dra-operator": [
+      {
+        "text": "面试题：DRA 相对 Device Plugin 的三大核心优势？",
+        "answer": "(1) 细粒度资源描述：DP 只能暴露 countable resource（nvidia.com/gpu=8），DRA 用 ResourceSlice + DeviceClass 表达 attribute（memory、clique、mig-profile、bandwidth），workload 可以通过 ResourceClaim 申请「80GB HBM + NVLink 同 clique + compute.major>=9」这种约束。(2) 动态分配：DP 资源静态，节点级 capacity 固定；DRA 支持在 scheduling 时动态配置（如现场 MIG reshape、vGPU 配 profile、SR-IOV VF 分配），由 DRA driver（如 nvidia-dra-driver）响应。(3) 多 claim 共享与拓扑感知：多个 pod 可共享一个 ResourceClaim（类似 PVC），DRA scheduler plugin 结合 partitionable devices 做 NVLink/NUMA aware 分配，DP 只能靠 topology manager 简单 best-effort。"
+      },
+      {
+        "text": "K8s 1.32 structured parameters GA 对 DRA 有什么意义？",
+        "answer": "K8s 1.26 alpha DRA 用 CRD-based parameters（ResourceClaimParameters），调度器要 call out 到 DRA driver 做 allocate，rpc chatty 且 scheduler 不可重放。1.32 structured parameters GA 改为：DRA driver 提前把所有 device 能力写到 ResourceSlice（schema 化 attributes + capacity），scheduler 直接在本地用 CEL 表达式匹配（deviceClassName + selectors），不用每次调 driver，调度速度提升 10x+ 且支持 scheduler simulator、preemption 预估、Karpenter 容量预测。NVIDIA DRA driver 0.1+ 已切到 structured model，暴露 gpu-shared、compute-domain（NVLink clique）等 DeviceClass。这也是 DRA 在 1.34 beta-by-default、1.36+ GA 路线的前置条件。"
+      },
+      {
+        "text": "DRA 和现有 Karpenter、Kueue 的兼容性如何？",
+        "answer": "Karpenter：v1.0 之前不认 ResourceClaim，只看 requests.nvidia.com/gpu，DRA workload 无法触发 scale-out。Karpenter v1.1+（2024 年末）开始加 DRA support，provisioner 能读 ResourceClaim 做容量预测，但早期需要在 NodePool 明确映射 DeviceClass→instanceType。Kueue：0.6+ 已支持 ResourceClaim-based 资源预留，ClusterQueue 可以写 covered resource 为 deviceclass.resource.k8s.io/gpu.nvidia.com；flavor 机制可按 DRA attribute 匹配。Volcano/KAI：要 scheduler 层面实现 DRA plugin，目前还在追赶。务实建议：2025 年大多数生产仍以 Device Plugin 为主，DRA 在 dev cluster / MIG 动态 reshape / confidential compute 场景试点；Karpenter+DRA 组合至少等 v1.2。"
+      }
+    ],
+    "karpenter-gpu": [
+      {
+        "text": "面试题：Karpenter NodePool 里 startupTaints 在 GPU 场景为什么必须配？",
+        "answer": "GPU 节点从启动到 ready 要经历：cloud-init → containerd → kubelet ready → GPU Operator DaemonSet 调度 → driver 编译/加载（open-kmod 冷启动 5-10 min）→ toolkit → device plugin register → Allocatable.nvidia.com/gpu 从 0 变成 8。中间有个窗口节点 Ready=True 但 GPU 资源还没 register，Karpenter 会把 workload pod 调度上去，pod 启动失败 CrashLoop 或被调度器判成 0/0 GPU 节点。配 startupTaints: [{key: nvidia.com/gpu, effect: NoSchedule}] 让节点启动初期所有 GPU workload 挡住，等 Operator validator 完成后 nvidia-operator-validator pod 会移除该 taint（或用 node label gate）。没配这个 taint 几乎必 100% 出现冷启动调度失败。"
+      },
+      {
+        "text": "产线：Karpenter consolidation 误杀正在跑训练的 Pod，怎么防？",
+        "answer": "Karpenter consolidation 会评估「empty/underutilized 节点能否合并」，训练 pod 若没配好可能被判可驱逐。防线：(1) PodDisruptionBudget：minAvailable=100% 或 maxUnavailable=0，禁止 voluntary eviction；(2) karpenter.sh/do-not-disrupt=true annotation 或 pod label，Karpenter v1 直接跳过；(3) NodePool spec.disruption.consolidationPolicy=WhenEmpty（只 consolidate 完全空节点）而非 WhenEmptyOrUnderutilized；(4) consolidateAfter 设长（如 1h）给训练留缓冲；(5) 训练用 StatefulSet + checkpoint，即使被驱逐也能恢复。对长训建议专用 NodePool 完全禁 consolidation，推理节点走 aggressive consolidation 省钱。"
+      },
+      {
+        "text": "陷阱：NodePool requirements 里怎么写 instance-gpu-name 过滤 H100？",
+        "answer": "Karpenter 从 aws/azure/gcp 的 instance metadata 暴露 well-known label，关键三个：karpenter.k8s.aws/instance-gpu-name（值如 h100、a100、l4）、instance-gpu-count、instance-gpu-memory。过滤 H100 SXM 8 卡实例：requirements: [{key: karpenter.k8s.aws/instance-gpu-name, operator: In, values: [\"h100\"]}, {key: karpenter.k8s.aws/instance-gpu-count, operator: In, values: [\"8\"]}, {key: karpenter.k8s.aws/instance-family, operator: In, values: [\"p5\"]}]。陷阱：(1) H100 PCIe 和 SXM 都叫 h100，要用 instance-family 区分（p5 是 SXM，p5en 也是）；(2) 有些旧版本 Karpenter label 前缀是 karpenter.k8s.aws/instance-accelerator-name；(3) 异构 GPU（L4 + H100）混 NodePool 要多条 requirement，不然 Karpenter 挑便宜 L4 导致训练任务失败。"
+      }
+    ],
+    "kai-volcano-kueue": [
+      {
+        "text": "面试题：GPU Operator 给调度器（KAI/Volcano/Kueue）提供哪三类数据？",
+        "answer": "(1) Capacity：device plugin register 的 nvidia.com/gpu、nvidia.com/mig-* 作为 kubelet Allocatable，scheduler 按 request 匹配；(2) Topology & attribute：GFD 打的 node label（gpu.product、gpu.memory、gpu.clique、compute.major、mig.strategy），调度器做 nodeAffinity、gang scheduling 的拓扑约束；(3) Health：DCGM + NPD 产生的 NodeCondition（GpuHealthy=False）、Pod 级 GPU fault event，高级调度器（KAI/Volcano）据此避开坏节点或触发迁移。额外还通过 DRA ResourceSlice 暴露结构化属性（1.32+），但目前主流还是 label/resource 两条路。"
+      },
+      {
+        "text": "Kueue ResourceFlavor 怎么和 GFD label 映射？",
+        "answer": "ResourceFlavor 本质是一个 label selector bundle，匹配节点组成 flavor。典型配置：apiVersion: kueue.x-k8s.io/v1beta1 kind: ResourceFlavor metadata.name: h100-sxm，spec.nodeLabels: {nvidia.com/gpu.product: NVIDIA-H100-80GB-HBM3}；a100-mig-3g: spec.nodeLabels: {nvidia.com/gpu.product: NVIDIA-A100-SXM4-40GB, nvidia.com/mig.strategy: single, nvidia.com/mig.config: all-3g.20gb}。ClusterQueue 引用 flavor + 声明 quota：resourceGroups[].flavors[].resources[{name: nvidia.com/gpu, nominalQuota: 64}]。Job 通过 queueName + podTemplate.spec.nodeSelector/tolerations 绑定。复杂场景还可以用 spec.tolerations 匹配 startupTaint 或专用 taint。"
+      },
+      {
+        "text": "陷阱：KAI 要做动态 MIG reshape，和 migManager 怎么协作？",
+        "answer": "原生 migManager 基于 ClusterPolicy.mig.strategy + node label nvidia.com/mig.config=all-3g.20gb 做静态 profile，reshape 要手动改 label。KAI scheduler 的动态模式：(1) 需要 Run:ai/NVIDIA 的 fractional GPU operator 或 dynamic MIG controller（非 stock migManager）；(2) KAI 根据 workload 申请（例如 jobspec 要求 20GB + 3 SM slice）动态计算最优 MIG profile；(3) 向 controller 发 ReshapeRequest CR，controller cordon GPU、destroy 旧 instance、create 新 instance、uncordon；(4) 同时更新 node label 和 device plugin。协作关键：(a) 必须关 stock migManager 或把它放 dedicated node pool 不 overlap；(b) reshape 期间给 GPU 打 taint 防 race（同 gfd-label-scheduling 那题）；(c) checkpoint 机制保证被迁移 job 可恢复；(d) 2024 Q4 起有 DRA-based 方案逐步替代。"
+      }
+    ],
+    "mig-spot-scheduling": [
+      {
+        "text": "面试题：动态 MIG reshape 完整流程节点是什么？",
+        "answer": "假设把 A100 从 7x1g.5gb 变成 3x2g.10gb+1x1g.5gb：(1) migManager watch 到 node label nvidia.com/mig.config 变化；(2) 给节点打 taint/标记 pause，等现有 pod drain（nvidia.com/gpu.deploy.mig-manager=paused）；(3) stop device-plugin pod 释放 GPU 资源；(4) nvidia-smi mig -dci -i 0 destroy 所有 compute instance，mig -dgi -i 0 destroy 所有 GPU instance；(5) 按新 profile mig -cgi 9,9,9,19 -C create（9 是 2g.10gb profile id）；(6) 重启 device-plugin，plugin 重新 ListAndWatch 把新 resource（nvidia.com/mig-2g.10gb=3、mig-1g.5gb=1）register 给 kubelet；(7) GFD 更新 nvidia.com/mig-2g.10gb.memory 等 label；(8) 移除 taint 允许调度。整个过程 30s-2min，期间 GPU 不可用。DGX A100 开 MIG 需要 GPU reset 可能更久。"
+      },
+      {
+        "text": "产线：Spot instance 收到 2 分钟 interruption notice，Operator 该做什么？",
+        "answer": "2 分钟窗口非常紧，Operator 本身不监听 spot notice，需要额外组件（AWS Node Termination Handler / Azure Scheduled Events handler / GCP preemption webhook）。推荐动作序列：(1) handler 收到 notice 立即 kubectl cordon + kubectl drain --force --ignore-daemonsets --delete-emptydir-data --grace-period=100；(2) 训练 pod 配 terminationGracePeriodSeconds=110 + preStop hook 触发 checkpoint save（如 torch.save 到 S3/FSx）；(3) GPU Operator 的 DaemonSet（driver/toolkit/plugin）走 tolerations: [{effect: NoExecute, operator: Exists}] 直到最后才被踢，保证 checkpoint 过程还有 GPU 可用；(4) 通过 PodDisruptionBudget + PriorityClass 保证 checkpoint sidecar 优先级；(5) 若用 Kueue/Volcano，配 requeue policy 让 job 在新节点自动重启。补充：H100 的 suspend/resume API + CRIU 是更理想方案，但生态不成熟。"
+      },
+      {
+        "text": "陷阱：训练 pod 要 checkpoint + terminationGracePeriod 怎么配才能配合 spot？",
+        "answer": "关键参数四件套：(1) terminationGracePeriodSeconds=110（spot 给 120s，留 10s buffer）；(2) lifecycle.preStop.exec.command 触发 SIGUSR1 或 checkpoint API，让训练框架 flush 到 remote storage；(3) 训练代码里监听 signal，收到后完成当前 step、save optimizer state + dataloader position，不要只 save model；(4) 配 PodDisruptionBudget(maxUnavailable=0) 防止 voluntary eviction 打断。额外最佳实践：(a) 用 async checkpoint（如 torch.distributed.checkpoint + NCCL async）把 save 和 compute 重叠，正常情况下每 N 步就有 recent checkpoint；(b) spot 场景推荐 checkpoint interval 缩到 5-10 min；(c) 恢复策略：新 pod 启动 init container 从 storage 拉最新 checkpoint；(d) Karpenter/cluster autoscaler 配合 spot fallback on-demand NodePool，重要 job 自动切 on-demand。"
+      }
+    ]
+  }
+}

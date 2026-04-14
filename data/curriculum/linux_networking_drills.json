@@ -1,0 +1,369 @@
+{
+  "comment": "Drill questions for Linux 网络 track. 3 per lesson, model answer 2-4 sentences.",
+  "drills": {
+    "tcp-kernel-path": [
+      {
+        "text": "网络包从 NIC 到用户态 socket 的关键路径中，softirq 处理函数叫什么？它的性能瓶颈如何观测？",
+        "answer": "softirq 的入口函数是 `net_rx_action`，它调用驱动注册的 NAPI poll 函数从 ring buffer 批量收包。性能瓶颈通过 `/proc/net/softnet_stat` 观测——第二列 `time_squeeze` 非零说明 softirq 时间片用完但还有包没处理完，第一列 `processed` 和第三列 `dropped` 分别是处理计数和丢包计数。"
+      },
+      {
+        "text": "sk_buff（skb）在 Linux 网络栈中的作用是什么？它在收包路径中在哪个阶段被分配？",
+        "answer": "sk_buff 是 Linux 内核中描述网络包的核心数据结构，包含包数据指针、协议头偏移、元数据（如来源接口、路由信息）等。在收包路径中，驱动在 NAPI poll 阶段从 DMA ring buffer 取出数据后分配 skb（`napi_alloc_skb` 或 `build_skb`），随后 skb 贯穿整个协议栈直到数据拷贝到 socket buffer。"
+      },
+      {
+        "text": "为什么默认情况下所有网卡中断可能都在 CPU0 上处理？这对 AI 推理服务有什么影响？",
+        "answer": "网卡的 MSI-X 中断在没有手动绑定或 irqbalance 未运行时，默认由 CPU0 处理。所有 softirq 收包都在 CPU0 上，单核 softirq 处理速率成为瓶颈——高并发推理服务会出现 P99 延迟飙升和 `/proc/net/softnet_stat` 的 time_squeeze 增长。解决方案是配置 RSS 或 RPS 把中断和包处理分散到多核。"
+      }
+    ],
+    "socket-buffer-tuning": [
+      {
+        "text": "tcp_rmem 的三元组 min-default-max 分别代表什么？TCP autotuning 用哪个值作为上限？",
+        "answer": "`net.ipv4.tcp_rmem` 的三个值：min 是每个 TCP socket 接收 buffer 的最小保证值（即使内存压力也不低于此）；default 是新建 socket 的初始值；max 是 autotuning 允许的最大值。TCP autotuning 根据 RTT 和吞吐动态扩展 buffer，以 max 值为上限。"
+      },
+      {
+        "text": "如何用 ss 命令查看单条 TCP 连接的 socket buffer 使用情况？关键字段是什么？",
+        "answer": "用 `ss -tim` 查看，输出中 `skmem:(r<接收已用>,rb<接收上限>,t<发送已用>,tb<发送上限>,...)` 显示 socket 内存使用。`r` 和 `rb` 分别是接收 buffer 已用和上限；`cwnd` × MSS 是当前拥塞窗口（发送窗口）大小。如果 `r` 接近 `rb` 说明接收端 buffer 满了。"
+      },
+      {
+        "text": "BDP（Bandwidth-Delay Product）是什么？100Gbps / 0.5ms RTT 的数据中心，BDP 大约多少？",
+        "answer": "BDP = 带宽 × RTT，是网络管道中「在途」数据的理论量，TCP buffer 至少要等于 BDP 才能跑满带宽。100Gbps = 12.5GB/s，RTT = 0.5ms = 0.0005s，BDP = 12.5GB/s × 0.0005s ≈ 6.25MB。因此 `tcp_rmem` 和 `tcp_wmem` 的 max 值至少要 8MB 以上。"
+      }
+    ],
+    "routing-policy": [
+      {
+        "text": "Linux 的策略路由中，`ip rule` 和 `ip route` 的关系是什么？数据包的路由查找顺序是怎样的？",
+        "answer": "`ip rule` 定义策略规则（按 priority 从小到大匹配），每条规则指定匹配条件（源 IP/fwmark/接口等）和对应的路由表。匹配到某条 rule 后，在该 rule 指定的路由表中查找路由。如果未匹配到路由则继续下一条 rule。默认有三条 rule：local 表（priority 0）→ main 表（32766）→ default 表（32767）。"
+      },
+      {
+        "text": "GPU 节点有 eth0（管理网）和 bond0（数据网），如何用策略路由确保 NCCL 流量走 bond0？",
+        "answer": "两种方式：(1) 按源 IP 匹配——`ip rule add from <bond0-subnet> table 100`，table 100 中默认路由指向 bond0 网关，NCCL 绑定 bond0 IP 后流量自动走 table 100；(2) 按 fwmark——用 iptables mangle 给 NCCL 端口流量打 mark，`ip rule add fwmark 0x1 table 100`。方式 (1) 更简单且不依赖 iptables。"
+      },
+      {
+        "text": "`ip route get <dst>` 命令的输出包含什么信息？为什么它是路由排障的最终武器？",
+        "answer": "`ip route get` 模拟内核对指定目的地的路由查找过程，输出实际选中的路由条目、出接口（dev）、源 IP（src）、使用的路由表。它比 `ip route show` 更准确，因为后者只是列出某张表的所有条目，而 `ip route get` 反映了 ip rule 策略路由匹配后的真实决策路径。"
+      }
+    ],
+    "tcp-congestion": [
+      {
+        "text": "BBR 和 CUBIC 的核心区别是什么？为什么 BBR 在数据中心长肥管道上比 CUBIC 更快达到满速？",
+        "answer": "CUBIC 是 loss-based 算法——只在丢包发生后才降速，在丢包前会持续增大 cwnd 填满 buffer（buffer bloat）。BBR 是 model-based 算法——通过测量 RTT 和 delivery rate 估算瓶颈带宽，主动控制发送速率不超过带宽估计值。在数据中心浅 buffer 交换机 + 高带宽场景下，CUBIC 需要经历多次丢包-恢复周期才能爬升到满速，BBR 通过 startup 阶段指数探测几个 RTT 就能找到带宽上限。"
+      },
+      {
+        "text": "DCTCP 利用什么机制来替代传统的丢包反馈？它对交换机有什么要求？",
+        "answer": "DCTCP 利用 ECN（Explicit Congestion Notification）——交换机在队列深度超过阈值时对包标记 CE（Congestion Experienced），接收方回传 ECE 标志给发送方。发送方根据被标记包的比例（而非丢包）细粒度调整 cwnd。要求端到端 ECN 启用（`sysctl net.ipv4.tcp_ecn=1`）且路径上交换机支持 RED/WRED 或显式 ECN 标记。"
+      },
+      {
+        "text": "如何在不影响全局拥塞算法的情况下，只对 NCCL 通信使用 BBR？",
+        "answer": "两种方式：(1) 应用层用 `setsockopt(sock, IPPROTO_TCP, TCP_CONGESTION, \"bbr\")` per-socket 指定——需要修改应用代码或使用 LD_PRELOAD hook；(2) 用 iptables + ip route 给 NCCL 端口流量打 mark，然后用 `ip route add ... congctl bbr` 为特定路由指定拥塞算法（需要 kernel 4.20+）。不修改全局 `sysctl net.ipv4.tcp_congestion_control`。"
+      }
+    ],
+    "interrupt-affinity-multiqueue": [
+      {
+        "text": "RSS（Receive Side Scaling）和 RPS（Receive Packet Steering）的区别是什么？什么场景用 RPS？",
+        "answer": "RSS 在网卡硬件层面按包头 hash 将包分配到不同 RX queue，每个 queue 对应不同 CPU 的硬中断——不消耗 CPU 做分发。RPS 是内核软件实现的等价机制——在 `net_rx_action` 中按 hash 把 skb 分发到目标 CPU 的 backlog 队列。RPS 适合：网卡 queue 数少于 CPU 核数，或虚拟网卡（veth/virtio）不支持硬件多队列的场景。"
+      },
+      {
+        "text": "如何查看网卡 eth0 的每个 RX queue 的中断绑定在哪个 CPU 上？",
+        "answer": "先 `ethtool -l eth0` 看队列数，再 `grep eth0 /proc/interrupts` 找到每个 queue 的 IRQ 号（如 `eth0-TxRx-0`），然后 `cat /proc/irq/<IRQ号>/smp_affinity_list` 看绑定的 CPU 列表。也可以用 `cat /proc/irq/<IRQ号>/effective_affinity_list` 看实际生效的 CPU。"
+      },
+      {
+        "text": "为什么生产 GPU 节点通常禁用 irqbalance？手动绑定中断的原则是什么？",
+        "answer": "irqbalance 会根据负载动态迁移中断到不同 CPU，导致中断亲和不稳定——NCCL 通信线程 pin 在 NUMA0 的 CPU 上，但中断可能被迁移到 NUMA1 的 CPU，跨 NUMA 处理增加数微秒延迟。手动绑定原则：网卡中断绑定到该网卡所在 NUMA 节点的 CPU 上，且和 NCCL 线程在同一 NUMA 域，避免跨 NUMA 的 cache 一致性开销。"
+      }
+    ],
+    "netns-veth-pair": [
+      {
+        "text": "veth pair 的两端在内核中是如何关联的？往一端写数据时内核做了什么？",
+        "answer": "veth pair 的两个 `net_device` 结构体通过 `peer` 指针互相引用。往一端调用 `dev_queue_xmit` 时，veth 的 xmit 函数直接调用对端的 `netif_rx` 将 skb 放入对端的收包队列——数据不经过任何物理 NIC，但仍然经过 netfilter（iptables）和 tc qdisc 处理。"
+      },
+      {
+        "text": "Network namespace 隔离了哪些网络资源？/proc/<pid>/ns/net 的作用是什么？",
+        "answer": "每个 network namespace 隔离：网络设备列表（lo、eth0 等）、IPv4/IPv6 协议栈配置、路由表、iptables/nftables 规则、socket 列表、ARP/NDP 邻居表、/proc/net 和 /sys/class/net 的视图。`/proc/<pid>/ns/net` 是该进程网络 namespace 的文件句柄，`nsenter -n -t <pid>` 或 `ip netns exec` 通过它进入对应 namespace。"
+      },
+      {
+        "text": "veth pair 在高性能场景（100Gbps+）的局限是什么？有什么替代方案？",
+        "answer": "veth 的发送和接收都在软件层面通过 softirq 处理，单流吞吐受限于单核 CPU 能力——100Gbps 线速需要多核并行处理，但 veth 不支持硬件多队列 RSS。替代方案：macvlan/ipvlan（直接使用物理网卡的硬件队列）、SR-IOV VF 直通（绕过宿主机网络栈，接近裸金属性能）。"
+      }
+    ],
+    "linux-bridge": [
+      {
+        "text": "Linux bridge 的 FDB（Forwarding Database）是什么？它是如何学习的？",
+        "answer": "FDB 是 bridge 的 MAC 地址转发表，记录 MAC 地址 → 端口的映射关系。学习过程：帧从某端口进入时，bridge 将帧的源 MAC 与入端口记录到 FDB（MAC learning）。后续如果目的 MAC 在 FDB 中找到对应端口就单播转发，找不到则 flood 所有端口。`bridge fdb show` 查看 FDB 内容。"
+      },
+      {
+        "text": "net.bridge.bridge-nf-call-iptables=1 这个 sysctl 对 K8s 有什么意义？",
+        "answer": "这个参数使得通过 Linux bridge 转发的二层帧也会经过 iptables 的 FORWARD 链。K8s 依赖此特性让 kube-proxy 的 iptables 规则对同节点 Pod 间流量生效（这些流量走 bridge 转发而非 IP 路由），同时 NetworkPolicy 的 iptables 规则也需要此参数才能对 bridge 流量做过滤。关闭会导致同节点 Pod 间的 Service 和网络策略失效。"
+      },
+      {
+        "text": "为什么 AI 集群中 Linux bridge 模式的容器网络会成为性能瓶颈？",
+        "answer": "所有通过 bridge 的流量都在内核软件层做帧转发，经过 FDB 查找、netfilter hook、tc qdisc 等处理，每个包消耗 CPU 资源。100Gbps 级别流量下，bridge 的 softirq 处理成为 CPU 瓶颈——单核无法处理线速流量且 bridge 不支持硬件 offload。这促使生产环境转向 macvlan（减少一层 bridge 转发）或 SR-IOV（完全绕过宿主机网络栈）。"
+      }
+    ],
+    "macvlan-ipvlan-detail": [
+      {
+        "text": "macvlan 和 ipvlan 的核心区别是什么？什么场景下必须用 ipvlan？",
+        "answer": "macvlan 为每个子接口分配独立 MAC 地址，交换机看到多个 MAC；ipvlan 所有子接口共享父接口 MAC，仅用 IP 区分。必须用 ipvlan 的场景：(1) 交换机 MAC 表容量有限、节点 Pod 数量多时；(2) 802.1X 端口认证只允许单 MAC 的环境；(3) 某些公有云 VM 限制每个 vNIC 只能有一个 MAC。"
+      },
+      {
+        "text": "macvlan bridge 模式下，子接口和父接口之间为什么不能直接通信？",
+        "answer": "macvlan bridge 模式下，子接口之间可以直接在宿主机内部转发（不经物理交换机），但子接口和父接口之间的流量会被 macvlan 驱动丢弃——这是内核设计决定。原因是 macvlan 是「虚拟从设备」，父接口收到的帧只分发给匹配 MAC 的子接口，不回传给自己。解决方案：在父接口上也创建一个 macvlan 子接口专门和宿主机通信，或通过外部交换机 hairpin。"
+      },
+      {
+        "text": "GPU Pod 使用 ipvlan L2 模式接入物理网络，如果物理网络使用 RoCEv2，有什么注意事项？",
+        "answer": "ipvlan L2 模式在二层工作，支持 ARP/NDP 邻居发现，RoCEv2 的 GID 解析依赖 L2 邻居发现所以可以正常工作。注意事项：(1) ipvlan 子接口共享父接口 MAC，RoCE 的 GID 表中 MAC 相同——需要确认 RDMA CM 用 IP 而非 MAC 区分连接；(2) PFC（Priority Flow Control）配置在物理网卡上，ipvlan 子接口无法独立配置 QoS priority；(3) MTU 必须与父接口一致。"
+      }
+    ],
+    "vlan-vxlan-geneve": [
+      {
+        "text": "VXLAN 封装的包头结构是什么？相比原始以太网帧增加了多少字节开销？",
+        "answer": "VXLAN 在原始二层帧外面套了四层：外层 Ethernet（14 字节）+ 外层 IP（20 字节）+ 外层 UDP（8 字节，目标端口 4789）+ VXLAN header（8 字节，含 24-bit VNI），总计 50 字节。加上可能的外层 VLAN tag（4 字节）则为 54 字节。这意味着物理 MTU 1500 时，内层有效 MTU 只有 ~1450。"
+      },
+      {
+        "text": "GENEVE 相比 VXLAN 的主要改进是什么？Cilium 为什么优先选 GENEVE？",
+        "answer": "GENEVE 支持可变长度的 TLV（Type-Length-Value）选项头，可以在隧道头中携带自定义元数据——如安全标签（security identity）、trace ID、LB 状态等。VXLAN 头是固定格式无法扩展。Cilium 用 GENEVE 选项头传递 identity 信息实现高效的 NetworkPolicy 执行，避免在每个节点查询中心化的 identity 映射。"
+      },
+      {
+        "text": "AI 集群为什么通常避免使用 overlay 网络？什么情况下不得不用？",
+        "answer": "overlay 封装增加 50+ 字节开销、消耗 CPU 做封装解封、增加延迟且可能引入 MTU 问题。AI 训练的 NCCL 流量对带宽和延迟极度敏感，overlay 的开销不可接受。通常用 BGP（Calico）或 flat L2 网络。不得不用 overlay 的场景：多租户隔离要求不同训练任务网络完全隔离、跨数据中心 L3 不互通需要 overlay 打通。"
+      }
+    ],
+    "iptables-chains-tables": [
+      {
+        "text": "iptables 的四张表在同一个链上的优先级顺序是什么？为什么 raw 表最先执行？",
+        "answer": "优先级从高到低：raw → mangle → nat → filter。raw 表最先执行是因为它的核心功能是 `NOTRACK`——在 conntrack 之前标记某些包不需要连接追踪，从而跳过后续所有依赖 conntrack 的处理（NAT、有状态过滤）。如果不最先执行就失去了绕过 conntrack 的意义。"
+      },
+      {
+        "text": "kube-proxy iptables 模式下，一个 Pod 访问 ClusterIP 的 DNAT 发生在哪条链的哪张表？",
+        "answer": "Pod 发出的包经过 OUTPUT 链的 nat 表——kube-proxy 在此插入 KUBE-SERVICES 链做 ClusterIP 匹配，匹配后跳转到 KUBE-SVC-xxx 链随机选一个 endpoint，再跳转到 KUBE-SEP-xxx 链执行 DNAT（`-j DNAT --to-destination <pod-ip>:<port>`）。如果是外部流量进入 NodePort，则在 PREROUTING 链的 nat 表完成相同逻辑。"
+      },
+      {
+        "text": "iptables 规则数过多对 per-packet 性能有什么影响？量化级别是怎样的？",
+        "answer": "iptables 规则是线性遍历——每个包都从链的第一条规则开始逐条匹配直到命中。5000 Service × 10 endpoint = 5 万+ 规则，每个包在 nat 表遍历可增加 1-5ms 的 CPU 时间。规则更新时 kube-proxy 调用 `iptables-restore` 全量替换也消耗数百毫秒 CPU。这是 ipvs（O(1) hash 查找）和 eBPF（编译后的程序直接执行）替代方案的核心动机。"
+      }
+    ],
+    "conntrack-nat": [
+      {
+        "text": "conntrack 表满时会出现什么症状？如何快速确认是 conntrack 导致的丢包？",
+        "answer": "表满时新连接的首包被直接丢弃，表现为间歇性连接失败（已建立的连接不受影响）。`dmesg` 出现 `nf_conntrack: table full, dropping packet`，`conntrack -C` 显示当前条目数等于 `nf_conntrack_max`，`conntrack -S` 的 `drop` 计数持续增长。`netstat -s` 或 `/proc/net/stat/nf_conntrack` 也能看到 drop 统计。"
+      },
+      {
+        "text": "K8s 中 DNS 查询为什么容易触发 conntrack 的 race condition？表现是什么？",
+        "answer": "Pod 的 DNS 查询默认同时发送 A 和 AAAA 两个 UDP 包到 kube-dns ClusterIP，经过 DNAT 转换。两个包使用相同的源端口，在 conntrack 表中可能发生 insertion race——两个包同时尝试创建同一个五元组的 entry，一个成功一个被丢弃。表现为间歇性 DNS 解析超时（5 秒 timeout 后重试）。解决方案：使用 nodelocaldns 避免 DNAT，或用 `tc-bpf` 给 DNS 包随机化源端口。"
+      },
+      {
+        "text": "每条 conntrack entry 大约占多少内存？如何估算 nf_conntrack_max 的内存开销？",
+        "answer": "每条 conntrack entry 约 300-400 字节（包含 original 和 reply 方向的五元组、计时器、NAT 信息、引用计数等）。加上 hash 表 bucket 开销，每条约 400 字节。`nf_conntrack_max=262144` 时约消耗 100MB 内存。计算公式：内存 ≈ nf_conntrack_max × 400 字节。hash 表大小（`nf_conntrack_buckets`）通常是 max/4。"
+      }
+    ],
+    "nftables-migration": [
+      {
+        "text": "nftables 相比 iptables 在规则匹配效率上有什么核心改进？",
+        "answer": "nftables 引入了 set 和 map 数据结构——一条规则可以用集合匹配代替 iptables 的多条线性规则。例如匹配 5000 个 Service ClusterIP，iptables 需要 5000 条规则 O(N) 遍历，nftables 用一个 set 做 O(1) hash 查找。此外 nftables 规则编译为字节码在内核虚拟机执行，减少了 iptables 的 per-rule 函数调用开销。"
+      },
+      {
+        "text": "RHEL 9 上执行 `iptables -L` 显示空规则但 Service 正常工作，原因是什么？",
+        "answer": "RHEL 9 默认的 `iptables` 命令实际是 `iptables-nft`（nftables 后端），而 kube-proxy 可能使用 `iptables-legacy`（或反之）。两种后端的规则存储在不同的内核子系统中互不可见——`iptables-nft` 写入 nftables 的规则用 `iptables-legacy` 看不到。应该用 `nft list ruleset` 查看所有 nftables 规则，或 `iptables -V` 确认当前是 legacy 还是 nf_tables 后端。"
+      },
+      {
+        "text": "kube-proxy nftables 模式（1.29+）的前置条件有哪些？",
+        "answer": "需要：(1) 内核 5.13+（nftables set 特性完整支持）；(2) nft CLI 工具已安装；(3) kube-proxy 启动参数 `--proxy-mode=nftables`；(4) 节点上不能同时运行 iptables 模式的 kube-proxy（否则规则冲突）。此外集群中所有节点需要统一使用同一种 proxy mode，混用会导致行为不一致。"
+      }
+    ],
+    "ebpf-fundamentals": [
+      {
+        "text": "eBPF 程序的 XDP 类型和 TC 类型分别 attach 在数据包路径的什么位置？性能差异多大？",
+        "answer": "XDP attach 在网卡驱动层——包刚从 DMA 进入内核、分配 skb 之前（native XDP 模式甚至不分配 skb），是最早的处理点。TC attach 在 `__netif_receive_skb` 之后的 traffic control 层——已经有了完整的 skb。XDP 因为省去了 skb 分配和协议栈上下文可以达到 >10Mpps 的单核处理速度，比 TC 层快 2-5 倍。"
+      },
+      {
+        "text": "eBPF map 的 BPF_MAP_TYPE_HASH 和 BPF_MAP_TYPE_LPM_TRIE 分别用于什么场景？",
+        "answer": "HASH map 做精确键值查找，Cilium 用它存储 conntrack entry（五元组 → 连接状态）和 endpoint map（Pod IP → identity）。LPM_TRIE（最长前缀匹配 trie）用于 CIDR/路由查找——输入一个 IP，找到最长匹配的前缀对应的策略或路由，Cilium 用它实现 CIDR-based NetworkPolicy。"
+      },
+      {
+        "text": "Cilium 用 eBPF 替代 kube-proxy 后，为什么 conntrack 不再使用内核的 nf_conntrack？",
+        "answer": "Cilium 在 BPF hash map 中自己实现了 conntrack——eBPF 程序在 TC/XDP 层直接完成 DNAT 和连接追踪，包不需要进入 netfilter 栈。好处：(1) 绕过 nf_conntrack 的全局锁和 hash table full 问题；(2) BPF map 的 entry 结构可以定制（只存需要的字段）；(3) conntrack GC 由 BPF 程序或 agent 控制，更灵活。风险是失去了内核 conntrack 的成熟度和 `conntrack -L` 等标准工具的可见性。"
+      }
+    ],
+    "ebpf-observability": [
+      {
+        "text": "pwru 的工作原理是什么？它如何追踪一个包在内核中的完整路径？",
+        "answer": "pwru 用 kprobe/fentry 批量 attach 到内核网络栈的数百个函数（如 `__netif_receive_skb`、`ip_rcv`、`nf_hook_slow`、`tcp_v4_rcv` 等），通过跟踪 skb 指针识别同一个包。每当包经过一个被 attach 的函数，pwru 记录函数名、返回值和时间戳。用户通过五元组 filter 指定要追踪的包，pwru 在 eBPF 程序中匹配 filter 后输出路径。"
+      },
+      {
+        "text": "Hubble 和 tcpdump 的核心区别是什么？Hubble 在什么场景下更有优势？",
+        "answer": "tcpdump 在 AF_PACKET 层抓原始包，需要手动解析协议和关联连接。Hubble 在 Cilium eBPF datapath 中采集结构化流事件（L3/L4/L7），直接关联 Pod identity、Service name、DNS 查询、HTTP 状态码。Hubble 优势场景：(1) 快速画出 Pod 间 service map；(2) 按 K8s label 过滤流量（而非 IP）；(3) 查看被 NetworkPolicy drop 的流——tcpdump 看不到被 eBPF drop 的包。"
+      },
+      {
+        "text": "bpftrace 追踪 TCP 重传的单行命令是什么？输出什么信息？",
+        "answer": "`bpftrace -e 'kprobe:tcp_retransmit_skb { @[comm, ntop(((struct sock *)arg0)->__sk_common.skc_daddr)] = count(); }'`——追踪 `tcp_retransmit_skb` 内核函数，按进程名和目标 IP 聚合重传次数。也可以用 tracepoint：`tracepoint:tcp:tcp_retransmit_skb` 获取更丰富的信息（sport、dport、state）。输出可以快速定位哪些进程到哪些目标重传最多。"
+      }
+    ],
+    "rdma-verbs": [
+      {
+        "text": "RDMA 的三种操作类型 SEND/RECV、RDMA Write、RDMA Read 有什么区别？哪个用于 NCCL allreduce？",
+        "answer": "SEND/RECV 需要双方参与——发送方 post Send WR，接收方必须预先 post Receive WR，类似 TCP 的双向通信。RDMA Write 单方操作——发送方直接写远端 memory 指定地址，远端 CPU 无感知（不需要 post Receive）。RDMA Read 单方读远端内存。NCCL 的 IB transport 主要用 RDMA Write，因为它无需远端 CPU 参与，延迟最低、适合流水线化的 allreduce。"
+      },
+      {
+        "text": "Memory Region（MR）注册为什么要求物理页 pin 住？如果不 pin 会怎样？",
+        "answer": "RDMA NIC 通过 DMA 直接读写物理地址——MR 注册时 libibverbs 调用 `ibv_reg_mr` 将虚拟地址范围翻译为物理页地址写入 NIC 的硬件页表。如果物理页被 OS swap out 到磁盘，NIC DMA 访问的物理地址已被其他进程使用，会导致数据损坏或 NIC 硬件错误。因此 MR 注册必须 `mlock` pin 住物理页，ulimit -l 需设为 unlimited。"
+      },
+      {
+        "text": "RDMA 相比 TCP 的延迟优势从何而来？量化差距大约是多少？",
+        "answer": "RDMA 的延迟优势来自两个 bypass：(1) kernel bypass——用户态程序直接操作网卡硬件队列（QP），不需要系统调用和内核协议栈处理；(2) zero-copy——数据直接从应用 buffer DMA 到网卡，不经过 socket buffer 拷贝。TCP 单向延迟约 30-50μs（包含系统调用、协议栈、缓冲区拷贝），RDMA 单向延迟约 1-3μs——差距约 10-30 倍。"
+      }
+    ],
+    "ib-vs-roce": [
+      {
+        "text": "InfiniBand 如何实现无丢包网络？和以太网的 PFC 有什么本质区别？",
+        "answer": "IB 使用 credit-based flow control（基于信用的流控）——发送方只有持有接收方授予的 credit 才能发送，credit 精确对应接收方的 buffer 空间，从链路层就保证不会因 buffer 溢出丢包。以太网 PFC 是反压式——接收方 buffer 快满时发 PAUSE 帧暂停发送方，是事后补救。IB 的 credit 机制从根本上避免了丢包，而 PFC 存在 PAUSE 传播导致 deadlock（PFC storm）的风险。"
+      },
+      {
+        "text": "RoCEv2 的 DCQCN 拥塞控制是什么？它和 TCP 的 DCTCP 有什么关系？",
+        "answer": "DCQCN（Data Center Quantized Congestion Notification）是 RoCEv2 专用的端到端拥塞控制算法。交换机用 ECN 标记拥塞包，接收方生成 CNP（Congestion Notification Packet）通知发送方降速。DCQCN 借鉴了 DCTCP 的 ECN 多级反馈思想，但工作在 RDMA transport 层（而非 TCP 层），调速粒度是 QP 级别的注入速率而非 TCP 的 cwnd。"
+      },
+      {
+        "text": "512 GPU 集群选型 IB NDR 和 RoCEv2 400GbE，除了性能还需考虑哪些运维因素？",
+        "answer": "IB 需要：(1) 专用 IB 交换机（成本高于以太网交换机 2-3 倍）；(2) 子网管理器（UFM/OpenSM）部署和维护——SM 故障全网瘫痪；(3) IB 专业运维人员（ibdiagnet、SM 管理不是传统网工技能）。RoCEv2 需要：(1) 支持 DCB 的交换机（PFC/ECN/ETS）；(2) 精确的 PFC 配置避免 deadlock；(3) 和现有以太网团队共享运维。RoCEv2 运维门槛低但调优复杂度高。"
+      }
+    ],
+    "gpudirect-rdma": [
+      {
+        "text": "GPUDirect RDMA 的数据路径和标准 RDMA 有什么区别？需要什么内核模块支持？",
+        "answer": "标准 RDMA：GPU 显存 → cudaMemcpy → host memory → NIC DMA 发出（两次数据搬移）。GPUDirect RDMA：GPU 显存 → PCIe P2P → NIC 直接 DMA 发出（一次数据搬移，绕过 CPU 和 host memory）。需要 `nvidia-peermem` 内核模块（旧版是 `nv_peer_mem`），它在 PCIe 层注册 GPU BAR 空间为 RDMA 可访问的内存区域。"
+      },
+      {
+        "text": "GPU 和 RDMA NIC 不在同一个 PCIe root complex 下时，GPUDirect RDMA 性能会怎样？",
+        "answer": "跨 PCIe root complex（通常意味着跨 NUMA）的 P2P DMA 需要经过 CPU 的 QPI/UPI 总线中转——数据路径变为 GPU → PCIe → QPI → PCIe → NIC，增加约 2-5μs 延迟且带宽受 QPI 带宽限制。`nvidia-smi topo -m` 显示 SYS（而非 PIX）关系。此时 NCCL 可能判断 host bounce buffer 更快而不启用 GDR——用 `NCCL_NET_GDR_LEVEL` 可以强制启用但不推荐。"
+      },
+      {
+        "text": "GDR Copy 解决了 GPUDirect RDMA 的什么问题？阈值大约是多少？",
+        "answer": "GPUDirect RDMA 对小消息（<64KB）反而慢于 host bounce buffer——因为 GPU BAR 空间是 uncacheable 的 MMIO 映射，小量数据的 DMA 启动开销占比大。GDR Copy 用 CPU 显式读写 GPU BAR 空间（通过 `gdrcopy` 内核模块映射的用户态地址），对小消息比 DMA 方式更快。NCCL 通过 `NCCL_GDRCOPY` 控制，典型阈值 ~64KB 以下用 GDR Copy，以上用 GPUDirect RDMA DMA。"
+      }
+    ],
+    "nccl-transport": [
+      {
+        "text": "NCCL 的三种 transport（P2P、SHM、NET）分别用于什么场景？如何判断 NCCL 实际选了哪种？",
+        "answer": "P2P：同节点 GPU 间有 NVLink 或 PCIe P2P 能力时直接 DMA。SHM：同节点但 P2P 不可用时通过 host shared memory 中转。NET：跨节点通信，下分 Socket（TCP）和 IB（RDMA verbs）两种 plugin。设 `NCCL_DEBUG=INFO` 启动，日志中 `Channel` 行会显示每个 channel 使用的 transport（如 `NET/IB/0` 或 `NET/Socket/0`、`P2P/NVLink`）。"
+      },
+      {
+        "text": "NCCL_SOCKET_IFNAME 和 NCCL_IB_HCA 这两个环境变量分别控制什么？",
+        "answer": "`NCCL_SOCKET_IFNAME` 指定 Socket transport 使用的网络接口名（如 `eth1`、`bond0`），防止 NCCL 走管理网。支持前缀匹配和排除（`^eth0` 排除 eth0）。`NCCL_IB_HCA` 指定 IB transport 使用的 HCA 设备和端口（如 `mlx5_0:1` 表示设备 mlx5_0 的端口 1），用于多网卡节点选择正确的 RDMA NIC。两者可同时设置——IB transport 用 HCA，fallback 到 Socket 时用 IFNAME。"
+      },
+      {
+        "text": "NCCL_DEBUG=INFO 日志中看到 NET/Socket 而不是 NET/IB，最常见的原因有哪些？",
+        "answer": "常见原因：(1) RDMA 设备在容器内不可见——缺少 SR-IOV VF 直通或 rdma-shared-device-plugin；(2) `libibverbs` 或 RDMA user-space 驱动未安装在容器镜像中；(3) `NCCL_IB_HCA` 指定了不存在的设备名；(4) IB 端口状态不是 Active（`ibstat` 检查）；(5) NCCL 编译时未包含 IB 支持（`--with-verbs`）。逐项检查 `ibv_devinfo` 在容器内是否正常返回。"
+      }
+    ],
+    "multus-sriov-k8s": [
+      {
+        "text": "Multus CNI 的作用是什么？它和主 CNI 的关系是怎样的？",
+        "answer": "Multus 是 meta-CNI plugin——它不直接创建网络接口，而是作为 CNI 链的入口调用其他 CNI 插件。主 CNI（如 Calico/Cilium）负责创建 Pod 的 eth0（集群网络），Multus 在此基础上调用额外的 CNI 插件（如 sriov-cni、macvlan-cni）创建 net1、net2 等附加接口。Pod 通过 `k8s.v1.cni.cncf.io/networks` annotation 指定要附加的网络。"
+      },
+      {
+        "text": "SR-IOV VF 直通给 Pod 后，宿主机的 NetworkPolicy 对 VF 流量生效吗？为什么？",
+        "answer": "不生效。SR-IOV VF 直通后，VF 的数据面完全绕过宿主机网络栈——帧直接在 VF 硬件和 Pod 用户态之间 DMA，不经过 veth、bridge 或 eBPF datapath。因此无论是 iptables 还是 Cilium eBPF 的 NetworkPolicy 都无法拦截 VF 流量。安全隔离需要在物理交换机 ACL、VF 硬件 QoS 或 SmartNIC 上实施。"
+      },
+      {
+        "text": "如何保证每张 GPU 分配到拓扑最近的 RDMA VF？需要哪些 K8s 组件配合？",
+        "answer": "需要：(1) Topology Manager（`--topology-manager-policy=single-numa-node` 或 restricted）确保 GPU 和 VF 在同一 NUMA 节点；(2) sriov-device-plugin 上报 VF 的 NUMA 信息（通过读取 `/sys/bus/pci/devices/<VF-BDF>/numa_node`）；(3) GPU device-plugin 上报 GPU 的拓扑提示。Topology Manager 在 Admit Pod 时取各 device plugin 的拓扑 hint 交集，保证所有设备在同一 NUMA 域。"
+      }
+    ],
+    "prefill-decode-network": [
+      {
+        "text": "Prefill-Decode 分离架构中，KV cache 传输的带宽需求如何估算？",
+        "answer": "每个 token 的 KV cache 大小 = 层数 × KV 头数 × 头维度 × 2(K+V) × 数据类型字节数。以 Llama 3 70B FP16 为例：80 层 × 8 头 × 128 维 × 2 × 2 字节 ≈ 327,680 字节/token ≈ 320KB。4K context ≈ 1.3GB。要在 10ms 内传完需要 >1Tbps 带宽——通常需要多条 RDMA 链路并行传输。"
+      },
+      {
+        "text": "KV cache 传输用 RDMA Write 相比 TCP sendfile 的优势是什么？",
+        "answer": "RDMA Write 优势：(1) kernel bypass + zero-copy，KV cache 数据从 Prefill 端 GPU 显存直接 DMA 到 Decode 端 GPU 显存（配合 GPUDirect RDMA），全程不经过 CPU 和 host memory；(2) 延迟 1-3μs vs TCP 的 30-50μs；(3) 不消耗 CPU 资源，CPU 可以做下一个请求的 prefill。TCP sendfile 仍需要内核协议栈处理，且无法直传 GPU 显存。"
+      },
+      {
+        "text": "Prefill-Decode 分离架构对网络拓扑有什么特殊要求？",
+        "answer": "Prefill 和 Decode 节点之间需要高带宽低延迟的专用网络平面——通常要求在同一 leaf 交换机下或相邻 ToR 之间有充足的 bisection bandwidth。如果 Prefill 和 Decode 跨 spine 交换机，oversubscription 会导致 KV cache 传输排队延迟。理想拓扑：Prefill 和 Decode 节点在同一 pod/rack 内，leaf 交换机之间全线速互联（non-blocking），网络平面和推理请求流量、监控流量隔离。"
+      }
+    ],
+    "ss-ip-ethtool": [
+      {
+        "text": "ss -ti 输出中哪些字段能帮助判断网络问题？分别代表什么？",
+        "answer": "关键字段：`rtt` 是平滑 RTT 和 RTT 方差（rttvar）——方差突增说明网络抖动；`retrans` 是未确认的重传段数/总重传次数——非零说明有丢包；`cwnd` 是拥塞窗口大小——过小说明受限于拥塞或接收窗口；`skmem:(r,rb,t,tb)` 是 socket buffer 使用情况——r 接近 rb 说明接收 buffer 满。"
+      },
+      {
+        "text": "ethtool -S 输出中哪些计数器指向网卡层面的丢包？",
+        "answer": "关键计数器（Mellanox 网卡为例）：`rx_out_of_buffer`——ring buffer 满导致丢包，需要 `ethtool -G` 扩大 ring buffer；`rx_discards_phy`——物理层丢包（CRC 错误等）；`tx_pause`——发送方收到 PFC PAUSE 帧次数；`rx_pci_signal_integrity`——PCIe 信号完整性错误。不同网卡驱动计数器名称不同，需参考驱动文档。"
+      },
+      {
+        "text": "`ip neigh` 表中条目状态 REACHABLE、STALE、FAILED 分别代表什么？FAILED 状态对网络有什么影响？",
+        "answer": "REACHABLE：最近确认过可达（收到对端回复）。STALE：超过 reachable time 未确认但仍可用——下次使用时触发探测。FAILED：ARP/NDP 解析失败——发了多次 ARP 请求无响应。FAILED 状态意味着到该 IP 的包无法发送（没有 MAC 地址可填），表现为连接超时。常见原因：目标主机 down、VLAN 不通、ARP 被防火墙拦截。"
+      }
+    ],
+    "tcpdump-wireshark": [
+      {
+        "text": "在 K8s Pod 中抓包，为什么不能直接在宿主机 eth0 上用 tcpdump？应该怎么做？",
+        "answer": "宿主机 eth0 上看到的是封装后的流量（如 VXLAN header），无法直接分析 Pod 间的原始通信。应该进入 Pod 的 network namespace 抓包：先 `crictl inspect <container-id> | grep pid` 获取 Pod 进程 PID，然后 `nsenter -n -t <pid> tcpdump -i eth0` 在 Pod 视角抓包。或者在宿主机的 veth 端抓包（`tcpdump -i veth<xxx>`）——此时看到的是 Pod 出来、bridge 处理前的包。"
+      },
+      {
+        "text": "Wireshark 中 tcp.analysis.retransmission 和 tcp.analysis.fast_retransmission 的区别是什么？",
+        "answer": "`tcp.analysis.retransmission` 标记 RTO 超时重传——发送方在 RTO 时间（通常 200ms-数秒）内未收到 ACK 触发。`tcp.analysis.fast_retransmission` 标记快速重传——发送方收到 3 个重复 ACK 后立即重传，不等 RTO 超时。Fast retransmit 延迟更短（~1 RTT），通常伴随 `tcp.analysis.duplicate_ack_num >= 3`。如果看到大量 RTO 重传而非 fast retransmit，说明丢包可能是双向的（ACK 也丢了）。"
+      },
+      {
+        "text": "高流量接口上不加 BPF filter 的 tcpdump 有什么风险？如何避免？",
+        "answer": "tcpdump 在用户态处理每个经过接口的包——100Gbps 接口上可能每秒数百万个包，不加 filter 会导致：(1) tcpdump 进程 CPU 100% 且自身丢包（`tcpdump: dropped N packets by kernel`）；(2) 干扰正常业务流量处理（AF_PACKET socket 消耗 CPU 和内存）。必须用 BPF filter 缩小范围（如 `host x and port y`），用 `-c` 限制包数，用 `-s 96` 限制每包捕获长度。"
+      }
+    ],
+    "ebpf-tracing": [
+      {
+        "text": "tcpdump 看不到被内核丢弃的包，为什么？eBPF 追踪工具如何弥补这个盲区？",
+        "answer": "tcpdump 通过 AF_PACKET socket 在 `__netif_receive_skb` 之后的 ptype 分发点捕获包。如果包在到达这个点之前被丢弃（如 XDP drop）或在之后被 netfilter drop，tcpdump 能看到进入但看不到丢弃动作。eBPF 工具（pwru/bpftrace）可以 attach 到内核任意函数——包括 `kfree_skb`（包释放/丢弃点）和 `nf_hook_slow`（netfilter hook），精确追踪包被哪个函数以什么原因丢弃。"
+      },
+      {
+        "text": "kfree_skb tracepoint 在包丢弃排障中的作用是什么？内核 5.17+ 有什么增强？",
+        "answer": "`tracepoint:skb:kfree_skb` 在内核释放被丢弃的 skb 时触发——每一个被丢弃的包都会经过这个 tracepoint。内核 5.17+ 新增 `reason` 字段，枚举了丢弃原因（如 `SKB_DROP_REASON_NETFILTER_DROP`、`SKB_DROP_REASON_TCP_OFO_QUEUE_PRUNE` 等），不再需要通过 kstack 猜测丢弃原因。`bpftrace -e 'tracepoint:skb:kfree_skb { @[args->reason] = count(); }'` 可以按原因聚合丢包统计。"
+      },
+      {
+        "text": "pwru 和 bpftrace 的适用场景有什么区别？什么时候用哪个？",
+        "answer": "pwru 专注于包路径追踪——自动 attach 到网络栈所有函数，按包的 skb 指针关联完整路径，适合「这个包去哪了/在哪被丢了」的问题。bpftrace 是通用 eBPF 脚本工具——可以 attach 到任意 kprobe/tracepoint，自定义聚合和输出，适合「统计某类事件的频率/分布」（如 TCP 重传次数、连接延迟分布）。排障流程：先用 bpftrace 的 kfree_skb 确认有丢包和大致原因，再用 pwru 追踪具体包路径定位精确的丢弃位置。"
+      }
+    ],
+    "mtu-mss-pmtud": [
+      {
+        "text": "PMTUD 的工作原理是什么？为什么它在实际网络中经常失效？",
+        "answer": "PMTUD：发送方在 IP 头设 DF（Don't Fragment）标志，路径上 MTU 不足的路由器返回 ICMP Fragmentation Needed 消息携带可接受的 MTU 值。失效原因：(1) 很多防火墙/安全组错误丢弃所有 ICMP 包——发送方收不到 Fragmentation Needed 消息，一直用大包重传超时（PMTUD 黑洞）；(2) 某些 ECMP 路径上部分路径 MTU 不同，ICMP 回包走了不同路径可能丢失。"
+      },
+      {
+        "text": "VXLAN overlay 导致 Pod 间大包传输失败的典型表现和根因是什么？",
+        "answer": "典型表现：Pod 间 `ping -s 1400` 正常但 `curl` 下载大文件卡住。根因：Pod 内 MTU 仍是 1500，发送 1500 字节的帧经 VXLAN 封装后变成 ~1550 字节超过物理网络 MTU（也是 1500），触发分片或 DF 标志下的 ICMP Fragmentation Needed。如果 ICMP 被拦截（PMTUD 黑洞），大包无法传输而小包正常——TCP 握手（SYN 包小）成功但数据传输挂起。"
+      },
+      {
+        "text": "TCP MSS clamping 是什么？它如何解决 overlay 的 MTU 问题？",
+        "answer": "MSS clamping 通过 iptables mangle 表修改经过的 TCP SYN 包中的 MSS option 值——`iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu` 自动根据出接口 MTU 计算 MSS。这样 TCP 双方协商的 MSS 从一开始就考虑了封装开销，发送的数据段不会超过路径 MTU。优点是不需要所有组件感知 overlay MTU——在转发路径上统一 clamp 即可。"
+      }
+    ],
+    "rdma-perftest": [
+      {
+        "text": "ib_write_bw 测试命令的基本用法是什么？如何测试 GPUDirect RDMA 带宽？",
+        "answer": "Server 端：`ib_write_bw -d mlx5_0 -s 65536 --report_gbits`。Client 端：`ib_write_bw -d mlx5_0 -s 65536 --report_gbits <server-ip>`。测试 GPUDirect RDMA 加参数 `--use_cuda=0`——数据直接从 GPU 0 显存发送。`-s` 指定消息大小，`-n` 指定迭代次数。输出包含每种消息大小的带宽（Gbps）、消息速率和平均延迟。"
+      },
+      {
+        "text": "ibstat 输出中哪些字段最关键？Rate 低于预期通常是什么原因？",
+        "answer": "关键字段：`State`（应为 Active）、`Physical state`（应为 LinkUp）、`Rate`（如 NDR 应为 400 Gb/sec）、`Base lid` 和 `SM lid`（IB 需要 SM 分配 LID）。Rate 低于预期的常见原因：(1) 线缆/光模块不匹配（如 HDR 线缆插 NDR 端口降速到 200G）；(2) 交换机端口未配置为最高速率；(3) 线缆质量问题触发自动降速；(4) 固件版本不支持最高速率。"
+      },
+      {
+        "text": "ibdiagnet 做什么检查？哪些输出需要特别关注？",
+        "answer": "ibdiagnet 扫描整个 IB 子网拓扑——发现所有节点和交换机、检查每条链路的速率和错误计数器、验证路由表一致性。需要关注：(1) `Links With Errors` 部分——symbol_error/link_downed 非零说明物理层问题；(2) `Port State` 非 Active 的端口；(3) `Speed/Width` 不一致的链路（如某端口协商到 HDR 而非 NDR）；(4) routing 不均衡警告。输出报告保存在 `/var/tmp/ibdiagnet2/` 目录。"
+      }
+    ],
+    "llm-streaming-tuning": [
+      {
+        "text": "Nginx 的 proxy_buffering 对 LLM SSE streaming 有什么影响？正确配置是什么？",
+        "answer": "`proxy_buffering on`（默认）时 Nginx 会缓存 upstream 完整响应（或满一个 buffer）再转发给 client——SSE 的逐 token 小消息被缓存，客户端表现为长时间无输出然后一批到达。正确配置：`proxy_buffering off`（或 upstream 返回 `X-Accel-Buffering: no` header），同时 `proxy_cache off`，确保每个 SSE event 立即透传。"
+      },
+      {
+        "text": "TCP_NODELAY 对 LLM token-by-token streaming 为什么是必须的？",
+        "answer": "不设 TCP_NODELAY 时 Nagle 算法生效——TCP 会等待凑满一个 MSS（~1460 字节）或收到前一个包的 ACK 后才发送。SSE 的每个 token 通常只有几十字节，会被 Nagle 缓存最多 200ms 才和后续 token 合并发送——用户感知到的是每 200ms 一批 token 而非实时流。设置 `TCP_NODELAY`（Nginx 用 `tcp_nodelay on`）禁用 Nagle，每个 write() 立即发送。"
+      },
+      {
+        "text": "LLM 推理服务的 proxy_read_timeout 为什么需要设很长？默认值有什么问题？",
+        "answer": "LLM 生成长文本时（如 8K+ tokens），按每 token 50ms 计算需要 400+ 秒。Nginx 的 `proxy_read_timeout` 默认 60s——如果 vLLM 在 60s 内没有发送任何数据（如生成停顿或调度延迟），Nginx 会断开 upstream 连接返回 504。SSE streaming 场景下应设为 300-600s。同时 `proxy_send_timeout` 和 `keepalive_timeout` 也需相应调大。"
+      }
+    ]
+  }
+}

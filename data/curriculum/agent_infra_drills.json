@@ -1,0 +1,383 @@
+{
+  "comment": "Drill questions for Agent 基础设施 track. 3 per lesson, model answer 2-4 sentences.",
+  "drills": {
+    "vllm-sglang-arch": [
+      {
+        "text": "vLLM 的 PagedAttention 借鉴了操作系统的什么机制？它解决了 KV cache 的什么问题？",
+        "answer": "PagedAttention 借鉴了虚拟内存的分页机制，将 KV cache 切成固定大小的 block（默认 16 tokens/block），通过 block table 间接映射。解决了 KV cache 的内部碎片问题——不需要为每个请求预分配 max_seq_len 的连续显存，使显存利用率从 20-40% 提升到 >95%。"
+      },
+      {
+        "text": "SGLang 的 RadixAttention 和 vLLM 的 prefix caching 有什么本质区别？为什么对 Agent 工作负载更有利？",
+        "answer": "RadixAttention 用 radix tree（基数树）全局管理所有活跃请求的 KV cache prefix，能自动识别任意请求间的公共前缀并复用。vLLM 的 prefix caching 基于 block hash 匹配，需要 block 边界对齐。Agent 场景大量请求共享 system prompt + few-shot examples，RadixAttention 的树形结构能精确匹配不同长度的公共前缀，TTFT 降低 3-5x。"
+      },
+      {
+        "text": "Continuous batching 相比 static batching 的核心改进是什么？解决了什么效率问题？",
+        "answer": "Continuous batching（iteration-level scheduling）在每个 decode step 后检查哪些请求已完成，空出的 slot 立即插入新请求。Static batching 必须等 batch 内最长请求完成才能释放 GPU——短请求 pad 到最长长度，GPU 利用率不到 30%。Continuous batching 消除了这种'短等长'的浪费。"
+      }
+    ],
+    "kv-cache-memory": [
+      {
+        "text": "Llama-3.1-70B（80 层，GQA 8 KV heads，head_dim 128，FP16）每个 token 的 KV cache 占多少显存？请写出计算公式。",
+        "answer": "公式：2（K+V）× num_layers × num_kv_heads × head_dim × dtype_bytes = 2 × 80 × 8 × 128 × 2 = 327,680 bytes ≈ 320 KB/token。GQA 8 heads 相比 MHA 64 heads 将 KV cache 缩小到 1/8。"
+      },
+      {
+        "text": "KV cache 量化到 FP8 的收益和风险分别是什么？什么情况下不建议用？",
+        "answer": "FP8 KV cache 显存占用减半，并发容量翻倍。风险是长上下文（>32K tokens）任务中 attention score 精度不够，在 RULER/NIAH 等 benchmark 上会掉点。不建议在对长上下文检索精度要求高的场景使用。生产建议默认 FP16，显存紧张时用 FP8 并跑 benchmark 验证。"
+      },
+      {
+        "text": "GQA（Grouped-Query Attention）为什么对推理服务的成本有巨大影响？",
+        "answer": "GQA 减少 KV heads 数量（如 Llama-3 用 8 KV heads vs 64 attention heads），KV cache 缩小到 MHA 的 1/8。同样显存能服务 8x 的 token 总量，直接决定了单卡的并发上限。选模型时同等质量下 GQA 模型的推理服务成本可低一个数量级。"
+      }
+    ],
+    "prefill-decode-disagg": [
+      {
+        "text": "Prefill 阶段和 Decode 阶段的算力特征有什么本质区别？为什么混合部署会导致 TPOT 抖动？",
+        "answer": "Prefill 是 compute-bound（大量矩阵乘，GPU 算力打满），Decode 是 memory-bandwidth-bound（每步少量计算但读取整个 KV cache）。混合部署时一个长 prompt 的 prefill 耗时数百毫秒，会阻塞同一 GPU 上所有 decode 请求，导致 TPOT 剧烈抖动。"
+      },
+      {
+        "text": "Mooncake 和 DistServe 在 KV cache 传输方面的架构差异是什么？",
+        "answer": "DistServe 的 prefill 实例完成后将 KV cache 直接通过 RDMA 传输到 decode 实例——点对点直传。Mooncake 引入分布式 KVCache pool（CPU memory + SSD），prefill 和 decode 实例都从 pool 读写。Mooncake 的好处是 KV cache 生命周期独立于 GPU 实例，支持跨请求复用和弹性扩缩容。"
+      },
+      {
+        "text": "70B 模型 4096 tokens 的 KV cache 在 100Gbps RoCE 网络上传输延迟大约多少？如何降低？",
+        "answer": "KV cache 大小约 4096 × 320KB ≈ 1.25GB，100Gbps（12.5 GB/s）传输约 100ms。降低方案：(1) 升级到 400Gbps InfiniBand 降到 25ms；(2) KV cache 量化到 FP8 减半传输量；(3) 流水线传输——prefill 每完成几层就开始传，不等全部完成。"
+      }
+    ],
+    "speculative-decoding": [
+      {
+        "text": "Speculative decoding 的加速比由哪些因素决定？典型能达到多少倍加速？",
+        "answer": "加速比 ≈ K × acceptance_rate / (draft_cost + verify_cost)。关键因素：(1) draft model 和 target model 的分布相似度；(2) temperature 设置（temperature=0 接受率最高）；(3) 生成内容的可预测性（高频 token 接受率高）。同族模型（Llama-8B draft for 70B target）典型接受率 70-85%，端到端加速 2-3x。"
+      },
+      {
+        "text": "vLLM 支持哪几种 speculative decoding 方式？各自的特点是什么？",
+        "answer": "三种：(1) 外部 draft model（`--speculative-model`）——需要额外 GPU 显存加载 draft model，灵活性高；(2) Medusa heads——在 target model 上接多个 prediction head，无需额外模型但需要专门训练；(3) Eagle——基于 feature-level draft 而非 token-level，接受率比 Medusa 更高，SGLang 支持 Eagle-2。"
+      },
+      {
+        "text": "什么场景下 speculative decoding 的收益有限？",
+        "answer": "三种场景：(1) batch size 很大时——verify 阶段的额外计算随 batch 线性增长，marginal benefit 下降；(2) streaming 输出且用户感知延迟——每个 verify step 延迟比普通 decode 高；(3) draft model 不可用的情况（多模态模型、特殊架构）。总结：低并发、高延迟敏感、target 远大于 draft 的场景收益最大。"
+      }
+    ],
+    "inference-parallelism": [
+      {
+        "text": "推理场景中 Tensor Parallelism（TP）和 Pipeline Parallelism（PP）的适用范围有什么区别？",
+        "answer": "TP 将每层权重切分到多卡并行计算同一层，延迟不增但 AllReduce 要求高带宽（NVLink），适合节点内并行。PP 按层切分到不同节点，只传 activation（数据量小），对网络带宽要求低，适合跨节点扩展。但 PP 在 decode 阶段有 pipeline bubble 效率偏低。选型原则：优先打满节点内 TP，不够再加 PP。"
+      },
+      {
+        "text": "为什么 TP degree 必须能整除 num_kv_heads？",
+        "answer": "TP 将 KV cache 沿 head 维度切分到多张卡，每卡存 num_kv_heads / TP 个 KV heads。如果不能整除，KV heads 无法均匀分配，有的卡多有的卡少，导致显存和计算不均衡。例如 GQA 8 heads 时 TP 只能选 1/2/4/8。"
+      },
+      {
+        "text": "Expert Parallelism（EP）是什么？它和 TP/PP 的关系是什么？",
+        "answer": "EP 是 MoE（Mixture of Experts）模型特有的并行维度，将不同 expert 分配到不同卡，每张卡只加载一部分 expert 的权重，减少 per-card 显存占用。EP 和 TP/PP 正交——TP 切 hidden dim，PP 切层，EP 切 expert。DeepSeek-V3 等 MoE 模型推理时三者组合使用。"
+      }
+    ],
+    "long-context-serving": [
+      {
+        "text": "为什么长上下文请求和短上下文请求不能混合调度？",
+        "answer": "一个 128K 请求的 KV cache 可达 40GB（以 70B 模型为例），可能占满整张卡的剩余显存，挤掉几十个 4K 请求的 KV cache 空间。混合调度会导致短请求排队或 KV cache 被 evict，TPOT 剧烈抖动。生产建议隔离部署长短上下文实例池。"
+      },
+      {
+        "text": "Chunked prefill 是什么？它如何缓解长 prompt 对其他请求的阻塞？",
+        "answer": "Chunked prefill 将长 prompt 切成多个 chunk（如每 chunk 8192 tokens）逐 chunk 做 prefill。chunk 间可以穿插短请求的 decode，减少阻塞。同时不需要一次性分配完整 KV cache 空间，可以按 chunk 渐进分配。代价是总 prefill 时间增加和 attention 需要回溯已处理 chunk 的 KV cache。"
+      },
+      {
+        "text": "Ring Attention 解决什么问题？它和 Tensor Parallelism 是什么关系？",
+        "answer": "Ring Attention 解决单卡显存放不下整个 KV cache 的问题——将 context 分段到不同 GPU，每 GPU 只存一段 KV cache，通过环形通信逐步交换 KV block 完成 full attention。它和 TP 正交：TP 切 hidden dimension，Ring Attention 切 sequence dimension，两者可组合使用。"
+      }
+    ],
+    "vectordb-ops": [
+      {
+        "text": "Milvus 和 Qdrant 在架构上最核心的区别是什么？各自的优劣？",
+        "answer": "Milvus 是 shared-storage 架构——query/data/index node 分离，底层存 S3/MinIO，存算分离、弹性扩缩容好但组件多运维复杂。Qdrant 是 shared-nothing 架构——每个节点存本地数据，Raft 做副本同步，运维简单但扩缩容需要 resharding。数据量 <10M 向量 Qdrant 足够，>100M Milvus 更合适。"
+      },
+      {
+        "text": "向量数据库的 compaction 为什么是重要的运维关注点？",
+        "answer": "向量数据库 append-only + soft delete 的写入方式会产生大量小 segment 和已删除向量。Compaction 合并小 segment、清理删除数据、重建索引。运维关注：(1) compaction 期间 CPU/IO 占用高需错峰限速；(2) 大批写入后必须等 compaction 完成再 benchmark，否则查询走未索引的 growing segment 性能差几倍。"
+      },
+      {
+        "text": "向量数据库分片（shard）越多越好吗？分片数怎么定？",
+        "answer": "不是。分片多了每 shard 数据少、local top-K 更准，但 merge 开销和网络 round-trip 增加。而且全局 top-K 是从各 shard 的 local top-K merge 而来，过多 shard 的 merge 开销不可忽视。经验值：单 shard 控制在 1-5M 向量，recall@10 > 95%。副本（replica）用于读扩展而非分片。"
+      }
+    ],
+    "embedding-service": [
+      {
+        "text": "Embedding 推理为什么天然适合大 batch？和 LLM decode 有什么区别？",
+        "answer": "Embedding 模型是 encoder-only，没有自回归的串行依赖——一次 forward pass 处理整个输入序列输出固定维度向量。多个请求可以拼成一个 batch 做一次 forward，GPU 利用率远高于 LLM decode（后者每步只生成一个 token，受限于内存带宽而非算力）。"
+      },
+      {
+        "text": "TEI（Text Embeddings Inference）的哪些关键参数直接影响性能和稳定性？",
+        "answer": "三个关键参数：(1) `--max-batch-tokens` 控制单 batch 总 token 数，防止长文本拼 batch 后 OOM；(2) `--max-concurrent-requests` 控制排队上限，防止请求堆积；(3) `--max-batch-requests` 控制 batch 内最大请求数。配合动态 batching（攒够 batch_size 或超过 max_wait_time 一起推理）使用。"
+      },
+      {
+        "text": "Matryoshka Representation Learning（MRL）对 embedding 服务部署有什么意义？",
+        "answer": "MRL 训练的模型支持截断维度（如 1536→768→256），低维度推理更快且向量存储更省。在精度要求不高的场景可以用低维度降低向量数据库存储成本和检索延迟。Precision-recall tradeoff 可控，是成本优化的重要手段。"
+      }
+    ],
+    "index-type-selection": [
+      {
+        "text": "HNSW 索引的 M 参数和 ef_search 参数分别控制什么？如何调优？",
+        "answer": "M 是每个节点的连接数——越大 recall 越高、内存占用越多（图结构额外占 10-30% 内存），默认 16。ef_search 是查询时的搜索宽度——运行时可调，越大 recall 越高但延迟越大。调优策略：先固定 M=16，调 ef_search 找到 recall 和延迟的平衡点。需要更高 recall baseline 再提 M（M=32 或 64）。"
+      },
+      {
+        "text": "IVF-PQ 的 '两级索引' 是指什么？为什么它能大幅降低内存占用？",
+        "answer": "IVF（Inverted File）将向量空间聚类成 nlist 个 centroid，查询时只搜最近的 nprobe 个 cluster。PQ（Product Quantization）将高维向量切子空间做码本量化，每子向量用 8-bit 码字表示——1536 维 FP32 向量（6KB）压缩到 ~192 bytes（32x 压缩）。两级组合实现大幅内存降低，十亿级向量可行。"
+      },
+      {
+        "text": "DiskANN 为什么能在 SSD 上实现 <5ms 的查询延迟？关键技术是什么？",
+        "answer": "DiskANN 用 Vamana graph（比 HNSW 更紧凑，精确 degree bound），内存只保留压缩向量和图 metadata。查询时通过 beam search 访问 SSD 上的邻居节点，用 compressed vector 做预过滤减少 SSD 读取次数。单台 64GB 内存机器可索引 10 亿 96 维向量。"
+      }
+    ],
+    "hybrid-search": [
+      {
+        "text": "为什么纯向量搜索对精确匹配（如产品编号、法条编号）表现差？",
+        "answer": "向量搜索基于语义相似度，embedding 模型倾向于将低频 token（产品编号、法条编号）映射到通用表示而非精确表示——语义相近的不同编号可能有非常接近的 embedding。BM25 全文搜索基于 term frequency 精确匹配关键词，恰好互补。这就是 hybrid search 的必要性。"
+      },
+      {
+        "text": "Reciprocal Rank Fusion（RRF）和归一化加权融合的区别是什么？",
+        "answer": "RRF 只用排名（score = Σ 1/(k + rank_i)，k 通常 60），不依赖原始分数量纲，但丢掉分数信息——第 1 名 0.99 和 0.51 被同等对待。归一化加权对两路分数做 min-max normalize 再加权（α × vec_score + (1-α) × bm25_score），保留分数差异信息但依赖归一化质量。"
+      },
+      {
+        "text": "Cross-encoder reranker 为什么比 bi-encoder 精度更高？代价是什么？",
+        "answer": "Cross-encoder 同时编码 query 和 document（拼接后过一次 transformer），能捕获 query-document 间的交互特征。Bi-encoder 独立编码 query 和 document，只通过 cosine similarity 计算相似度，丢失了交互信息。代价是每个 query-document pair 都需过一次 transformer，计算量大——50 个候选延迟 50-200ms。"
+      }
+    ],
+    "chunking-data-update": [
+      {
+        "text": "Semantic chunking 和固定窗口 chunking 的核心区别是什么？为什么 recall 更高？",
+        "answer": "Semantic chunking 用 embedding 模型检测语义断点（相邻句子相似度骤降处切分），而固定窗口按 token 数机械切分。Semantic chunking 保证每个 chunk 语义完整——不会把一个论点切成两半，检索时 chunk 和 query 的语义匹配更准确，recall 通常高 5-10%。"
+      },
+      {
+        "text": "Late Chunking 和传统的 '先 chunk 再 embed' 有什么区别？解决了什么问题？",
+        "answer": "传统 pipeline 每个 chunk 独立编码，chunk 内的代词（它、这个）因上下文截断无法正确理解。Late Chunking 先对完整文档过 long-context encoder 得到 token-level embeddings，再在 token embedding 上按 chunk 边界做 mean pooling——每个 chunk 的向量包含全文档上下文。需要 long-context embedding 模型（8K+ input），计算量更大。"
+      },
+      {
+        "text": "向量数据库的增量更新 pipeline 一般包括哪些步骤？",
+        "answer": "四步：(1) 文档级 CDC（Change Data Capture）监听变更事件（S3 event notification、数据库 WAL）；(2) 变更文档重新 chunk + embed；(3) 向量数据库 upsert（旧向量 delete + 新向量 insert）；(4) 版本管理——新版本写入后旧版本标记过期但不立即删除，支持回滚。"
+      }
+    ],
+    "mcp-server": [
+      {
+        "text": "MCP 协议的三大原语（Tools、Resources、Prompts）各自的作用是什么？",
+        "answer": "Tools：server 声明可调用的工具（name、description、input JSON Schema），client 通过 `tools/call` 调用。Resources：server 暴露只读数据源（文件、数据库、API），client 通过 URI 读取上下文。Prompts：server 提供预定义 prompt 模板供 client 选择使用。Tools 是执行动作，Resources 是获取信息，Prompts 是辅助生成。"
+      },
+      {
+        "text": "MCP server 在生产环境中通常用什么传输方式？和本地开发有什么区别？",
+        "answer": "本地开发用 stdio 传输——client 通过 spawn 子进程运行 server，简单但不能远程访问。生产环境用 SSE（Server-Sent Events）或 Streamable HTTP——MCP server 作为独立服务（Docker/K8s 部署），前置 API Gateway 做认证和限流。MCP 2025-03 版本新增 OAuth 2.1 认证框架。"
+      },
+      {
+        "text": "MCP tool 调用的 input 来自 LLM 生成，这在安全上有什么含义？",
+        "answer": "LLM 生成的 tool input 是不可信输入——可能包含 prompt injection 构造的恶意参数。必须做严格的 JSON Schema validation（拒绝不符合 schema 的输入）和权限检查（tool handler 内验证操作权限）。不能假设 LLM 总是生成符合预期的参数。"
+      }
+    ],
+    "a2a-protocol": [
+      {
+        "text": "A2A 和 MCP 的定位有什么区别？它们是竞争关系吗？",
+        "answer": "MCP 解决 Agent ↔ Tool 的交互（类似 USB 设备接口），A2A 解决 Agent ↔ Agent 的交互（类似 HTTP 服务间通信）。两者互补：Agent A 通过 A2A 委派任务给 Agent B，Agent B 通过 MCP 调用 tool 完成任务。不是竞争关系。"
+      },
+      {
+        "text": "A2A 中 Task 的生命周期状态有哪些？为什么需要显式状态机？",
+        "answer": "Task 状态：submitted → working → input-required → completed/failed。显式状态机让 client agent 可以查询进度、在 input-required 时提供额外信息、取消或恢复任务。长时间异步任务不可能只有 request-response 两个状态——需要中间状态来表达正在处理、需要输入等情况。"
+      },
+      {
+        "text": "多 Agent 编排中，错误传播的核心挑战是什么？",
+        "answer": "子 Agent 失败时 orchestrator 需要决策：重试（相同 Agent 或切换到备选 Agent）、降级（跳过失败步骤用默认值）、透传错误（终止整个任务）。更复杂的是超时链分配——A 调 B 调 C，总超时怎么分配给每一级？以及并行子任务部分失败时（3 个子 Agent 完成 2 个失败 1 个）如何决策。"
+      }
+    ],
+    "tool-sandbox": [
+      {
+        "text": "E2B、Firecracker、gVisor 三种沙箱技术的隔离级别和适用场景分别是什么？",
+        "answer": "E2B 基于 Firecracker microVM，VM 级隔离，启动 <150ms，API 化托管服务适合快速集成。Firecracker 是底层 microVM 技术（独立 kernel），资源开销极小（~5MB），需自己构建 rootfs 和管理 VM pool。gVisor 是用户态 kernel（拦截系统调用），介于容器和 VM 之间——比容器隔离性强、比 VM 轻量，K8s 原生支持。"
+      },
+      {
+        "text": "Agent 代码执行沙箱的网络策略应该怎么设计？",
+        "answer": "默认 deny-all outbound，白名单放行特定域名/IP（如公司内部 API、pip 仓库）。关键防御点：(1) 阻止访问云元数据 API（169.254.169.254）防止凭证泄露；(2) 阻止内网扫描（RFC 1918 地址段）；(3) DNS 解析也要走白名单或限制目标域名。"
+      },
+      {
+        "text": "沙箱的生命周期管理有哪两种策略？各自的利弊？",
+        "answer": "两种：(1) per-execution 创建——每次 tool call 新建 sandbox，最安全（完全隔离）但启动开销大；(2) session-level 复用——Agent session 内复用同一 sandbox，支持有状态操作（pip install 的包下次可用）但需要定期清理和安全扫描。生产中通常用 session-level + E2B template（预装依赖避免重复安装）。"
+      }
+    ],
+    "agent-memory": [
+      {
+        "text": "Agent 记忆的三个层次（工作记忆、短期记忆、长期记忆）分别存什么、用什么存？",
+        "answer": "工作记忆：当前 session 的 context window（system prompt + 对话历史 + tool 结果），在 LLM context 中。短期记忆：session 内的推理 scratchpad、中间结果，存 Redis/内存。长期记忆：跨 session 的用户偏好、历史摘要、学到的 fact，存向量数据库（非结构化知识）+ PostgreSQL JSONB（结构化数据）。"
+      },
+      {
+        "text": "Context window 128K 不够用时，有哪三种管理策略？",
+        "answer": "三种策略组合使用：(1) Sliding window——只保留最近 N 轮完整对话 + system prompt；(2) Summarization——对旧 context 用 LLM 做摘要压缩替代原文；(3) Retrieval——不把所有历史放 context，RAG 检索相关历史片段注入。生产中典型配置：system prompt + 最近 3 轮完整对话 + 历史摘要 + RAG 检索的相关记忆。"
+      },
+      {
+        "text": "Scratchpad 为什么对复杂任务的 Agent 很重要？有哪两种实现方式？",
+        "answer": "复杂任务中 Agent 需要维护已完成步骤、收集到的信息、待验证假设等中间状态。两种实现：(1) 放在 context 中——占 token 但 LLM 能直接读写；(2) 作为 tool（read_scratchpad / write_scratchpad），存在外部存储。后者更灵活但增加 tool call 开销。Schema 要对 LLM 友好——清晰的 section 结构和 key-value 格式。"
+      }
+    ],
+    "long-task-checkpoint": [
+      {
+        "text": "Agent 任务的 checkpoint 需要保存哪些最小状态才能恢复？",
+        "answer": "四部分：(1) Task state——当前步骤、整体 plan 和进度；(2) Context snapshot——最近对话历史或摘要、system prompt、RAG 结果；(3) Scratchpad——中间产物和已验证结论；(4) Tool state——外部系统的不可回滚状态记录（已创建的资源、已发送的消息）。序列化为 JSON 保证 LLM 友好和人类可读。"
+      },
+      {
+        "text": "Checkpoint 的三种触发方式分别是什么？各适合什么场景？",
+        "answer": "三种：(1) 时间间隔（每 N 分钟自动保存）——通用保险策略；(2) 步骤边界（每完成一个 sub-task 保存）——恢复点更精确；(3) 关键操作前（执行不可逆操作如发邮件、提交代码前强制保存）——回滚安全网。推荐组合：关键操作前同步写 PostgreSQL，日常间隔异步写 S3。"
+      },
+      {
+        "text": "从 checkpoint 恢复执行时有什么挑战？为什么不是简单加载状态？",
+        "answer": "三个挑战：(1) 外部世界在中断期间可能变化（文件被修改、API 返回变了），恢复后需要 re-validate 假设；(2) checkpoint 太旧导致 context 与现实不一致，需要 staleness check；(3) 恢复后可能重复执行已完成的操作，tool call 需要幂等设计。恢复时需构建 recovery prompt 明确告诉 LLM 当前进度。"
+      }
+    ],
+    "agent-concurrency": [
+      {
+        "text": "Agent 并发和传统微服务并发的核心区别是什么？",
+        "answer": "传统微服务是请求级并发——每个请求 ms 级完成，靠连接池和水平扩展。Agent 是 session 级并发——每个 Agent 可能运行数分钟到数小时，持续占用 LLM endpoint。100 个并发 Agent 每 5 秒调一次 LLM 就是 20 req/s 持续负载，burst 时可达 100+ req/s。"
+      },
+      {
+        "text": "为什么 token 维度限流比请求维度限流更合理？",
+        "answer": "请求维度限流（N req/s）过于粗糙——1K token 请求和 100K token 请求消耗的 GPU 资源天差地别。Token 维度限流按 input + output tokens 消耗计算，更准确反映资源占用。实现：客户端侧 Agent SDK 追踪 token budget，网关侧统计 token 消耗超 quota 返回 429。"
+      },
+      {
+        "text": "什么是 retry storm？如何通过背压机制防止？",
+        "answer": "Retry storm 是 LLM endpoint 过载时所有 Agent 立即重试导致的雪崩效应——重试请求进一步加剧拥塞，形成正反馈循环。防止方法：(1) 指数退避重试（而非立即重试）；(2) LLM API 返回 429 + Retry-After header 指导等待时间；(3) Agent 层实现降级策略——切到更小模型或暂停后台任务等待资源恢复。"
+      }
+    ],
+    "ai-gateway-arch": [
+      {
+        "text": "AI Gateway 解决了 Agent 直连 LLM 的哪些核心问题？",
+        "answer": "四个问题：(1) API key 散落在各 Agent 中无法统一管理和轮换；(2) 无法跨 Agent 全局限流——一个 Agent 超发耗尽配额影响所有人；(3) 切换模型提供商需改每个 Agent 代码；(4) 无法统一做 logging、cost tracking、audit trail。Gateway 作为中间代理层统一解决。"
+      },
+      {
+        "text": "LiteLLM 和 Portkey 的定位有什么区别？",
+        "answer": "LiteLLM 是开源 Python 统一 API 代理——将所有 LLM 提供商统一为 OpenAI-compatible API，核心是 key management + model alias + fallback + spend tracking，部署简单（单进程 + PostgreSQL）适合中小规模。Portkey 功能更丰富——semantic cache、guardrails、A/B testing、analytics，有 SaaS 版免运维但有数据主权考量。"
+      },
+      {
+        "text": "AI Gateway 的中心化部署和 Sidecar 模式各有什么优劣？",
+        "answer": "中心化：所有 Agent 通过同一 Gateway 集群，统一管控简单但是单点瓶颈。Sidecar：每个 Agent 旁挂 Gateway proxy（类似 Envoy），本地做 cache + 限流，延迟更低（localhost 通信）、容错更好（中心挂了本地 cache 续命），但运维复杂度高。Agent 数量 <200 用中心化，>200 且延迟敏感用 Sidecar。"
+      }
+    ],
+    "model-routing-fallback": [
+      {
+        "text": "三级 Fallback 策略（primary → fallback → degraded）的设计原则是什么？",
+        "answer": "Primary 是首选模型（如 Claude Opus），正常时全部流量走这里。Fallback 是备选模型（如 GPT-4o），primary 返回 5xx 或超时时切换。Degraded 是最后防线（如自建 Llama-8B），所有外部 API 不可用时保证服务不中断但质量下降。关键：回滚在 Gateway 配置层面（改路由权重），秒级生效。"
+      },
+      {
+        "text": "Fallback 到不同模型时 prompt 格式不兼容怎么办？",
+        "answer": "不同模型的 system prompt 格式可能不同（Claude 用 XML tags，GPT 用 markdown），Gateway 层做 prompt 转换。实现：为每个 fallback 模型配置 prompt transformer——输入是通用格式的 prompt，输出是目标模型格式。这要求 Gateway 理解 prompt 结构而非简单转发。"
+      },
+      {
+        "text": "Circuit breaker 在 AI Gateway 中如何工作？什么时候触发和恢复？",
+        "answer": "连续 N 次请求（如 5 次）返回 5xx 或超时后 circuit breaker 打开——暂停向该 endpoint 发送请求（避免浪费超时等待时间），所有流量切到 fallback。Circuit open 后定期（如每 30 秒）放行一个探测请求——如果成功则 circuit 关闭恢复正常流量，失败则继续 open。"
+      }
+    ],
+    "token-rate-limiting": [
+      {
+        "text": "Token budget 的层级化模型是怎么设计的？为什么需要层级？",
+        "answer": "层级：Organization → Team → Project → Agent → Session。每层有独立的 token quota（日/周/月）和 rate limit（tokens/min）。需要层级是因为不同粒度的控制目标不同：Organization 控总预算，Team 做成本归因，Project 追踪单项目 ROI，Agent/Session 防失控。"
+      },
+      {
+        "text": "Token 计费有'预计算'和'后计算'两种方式，分别用于什么场景？",
+        "answer": "预计算：请求发送前用 tiktoken 对 input 做 tokenize 得到精确 token 数，用于准入控制（判断是否超限）。后计算：LLM 返回 usage.total_tokens 字段，用于实际记账（包含 output tokens，只有响应完成后才知道）。两者互补——预计算做门禁，后计算做账本。"
+      },
+      {
+        "text": "一个 Agent 进入无限循环疯狂消耗 token，有哪些防护措施？",
+        "answer": "三层防护：(1) 每个 session 设 token 上限（如 1M tokens/session），超限自动终止 Agent；(2) 单次 request 的 max_tokens 限制避免 output 失控；(3) 实时监控 token consumption rate——短时间内消耗速率异常加速时触发告警和自动限流。Gateway 侧统计 sliding window 内的 token 消耗做异常检测。"
+      }
+    ],
+    "prompt-semantic-cache": [
+      {
+        "text": "精确 cache、语义 cache、prefix cache 分别在哪个层面实现？各解决什么问题？",
+        "answer": "精确 cache 在 Gateway 层——hash prompt 做 key 存 Redis，相同请求直接返回缓存 response，省 token 成本。语义 cache 在 Gateway 层——对 prompt 做 embedding 查向量数据库找相似请求，命中率高但有返回不准确风险。Prefix cache 在 LLM 引擎层——vLLM/SGLang 缓存 KV cache 中间计算结果，加速推理但不省 output token 成本。"
+      },
+      {
+        "text": "语义 cache 的最大风险是什么？如何安全地使用？",
+        "answer": "最大风险是相似的 prompt 返回错误答案——'北京的天气' 和 '上海的天气' 语义相似度可能 >0.9 但答案完全不同。安全做法：(1) 阈值设高（>0.98）；(2) 只对 deterministic 场景启用（temperature=0 的分类/抽取）；(3) 附带 cache source 标记让调用方知道是缓存结果；(4) 定期抽样验证 cache stale rate。"
+      },
+      {
+        "text": "Anthropic 的 prompt caching 和 Gateway 层的精确 cache 有什么区别？",
+        "answer": "Anthropic prompt caching 是 LLM 提供商层面的 prefix cache——缓存 system prompt 和前缀的 KV state，后续请求共享相同前缀只需计算新增部分，缓存 token 价格仅为普通 input token 的 10%。Gateway 精确 cache 缓存完整 response——完全跳过 LLM 调用。前者省 input 计算成本，后者省全部成本。Agent 场景两者组合使用效果最佳。"
+      }
+    ],
+    "model-ab-canary": [
+      {
+        "text": "模型 A/B 测试中 sticky routing 为什么重要？怎么实现？",
+        "answer": "同一用户在同一 session 内如果跳模型，体验不一致（风格、能力差异明显），用户会困惑。Sticky routing 确保同一 session 始终走同一模型。实现：Gateway 用 session_id 做 hash → model 映射（consistent hashing），或在 session 创建时随机分配模型并记录到 Redis。"
+      },
+      {
+        "text": "模型金丝雀发布的自动回滚条件应该包括哪些指标？",
+        "answer": "三类指标：(1) 可靠性——error rate > 基线 1.5x 时回滚；(2) 性能——latency P99 > 基线 2x 时回滚；(3) 质量——LLM-as-judge score < 基线 0.9x 时回滚。回滚操作在 Gateway 配置层（改路由权重），秒级生效。关键是回滚不涉及部署变更，只是流量切换。"
+      },
+      {
+        "text": "Shadow testing 的原理是什么？和 A/B 测试有什么区别？",
+        "answer": "Shadow testing 将所有请求同时发给新旧两个模型，用旧模型的 response 返回用户，新模型的 response 只记录不展示——对用户零风险。离线分析两者差异找出新模型表现差的 case。和 A/B 的区别是 A/B 会将新模型 response 展示给部分用户，有影响体验的风险。Shadow 的代价是 LLM 成本翻倍。"
+      }
+    ],
+    "llm-tracing": [
+      {
+        "text": "传统 APM 为什么不能满足 LLM 可观测的需求？",
+        "answer": "传统 APM 追踪 HTTP 请求和数据库查询——延迟 ms 级、payload KB 级。LLM 调用延迟秒级、payload 百 KB 级，最关键的信息是内容质量（response 正确性、幻觉、敏感信息泄露），传统 APM 无法记录 prompt/response 全文和做质量分析。需要 LLM 专用 tracing 工具。"
+      },
+      {
+        "text": "Langfuse 的数据模型是如何组织 Agent 调用链的？",
+        "answer": "Trace → Span 层级结构。一个 Agent session 是一个 Trace，包含多种 Span：Generation span 记录 LLM 调用（prompt、completion、model、token usage、latency）、Retrieval span 记录 RAG 查询和结果、Tool Call span 记录 tool input/output。Span 之间有 parent-child 关系形成调用树。"
+      },
+      {
+        "text": "OTel GenAI semantic conventions 的意义是什么？为什么要和传统 trace 统一？",
+        "answer": "GenAI semantic conventions 标准化了 LLM trace 的 attribute 名（gen_ai.system、gen_ai.request.model、gen_ai.usage.input_tokens 等），让不同工具（Langfuse、Phoenix、Jaeger）的数据互通。统一后 LLM trace 和传统微服务 trace 可以在同一个 UI 中串联：用户请求 → API Server → Agent → LLM Call → Tool Call 全链路可见。"
+      }
+    ],
+    "token-latency-cost": [
+      {
+        "text": "TTFT 和 TPOT 分别衡量什么？在 Agent 场景中各自的 SLA 目标通常是多少？",
+        "answer": "TTFT（Time To First Token）是用户发出请求到看到第一个字的时间，影响感知速度，P99 目标通常 <2s。TPOT（Time Per Output Token）是 token 间间隔，影响 streaming 流畅度，P99 目标 <100ms。Agent 场景下 E2E 延迟可能分钟级（多轮 tool call），需要区分 LLM inference time 和 Agent thinking time。"
+      },
+      {
+        "text": "成本监控中，为什么需要设置 '单 session 成本上限' 告警？",
+        "answer": "Agent 可能进入无限循环——反复调用 LLM + tool 不收敛，token 消耗指数增长。一个失控的 Agent session 可能在几分钟内花掉数十美元。单 session 成本 > $5 时自动告警可以在早期发现失控 Agent，防止成本雪球。配合自动终止机制（超限 kill session）效果更好。"
+      },
+      {
+        "text": "Grafana dashboard 监控 Agent 系统时，推荐用什么数据源？",
+        "answer": "三种数据源配合：(1) Langfuse PostgreSQL 直连——查询 LLM trace 详情和统计数据；(2) OTel Metrics → Prometheus → Grafana——实时指标（request rate、latency 分位、error rate）；(3) 自建 ClickHouse 或 BigQuery——成本归因分析和历史趋势。实时面板 30s 刷新，成本面板 5min 刷新。"
+      }
+    ],
+    "eval-pipeline": [
+      {
+        "text": "Agent 评测的四个核心维度是什么？各自衡量什么？",
+        "answer": "四维度：(1) 正确性（Correctness）——回答是否 factually correct；(2) 相关性（Relevance）——回答是否切题，RAG 场景分 retrieval relevance 和 generation relevance；(3) 安全性（Safety）——是否有害内容、PII 泄露、prompt injection；(4) 效率——token 用量和 tool call 次数是否合理。"
+      },
+      {
+        "text": "LLM-as-Judge 的 position bias 是什么？如何缓解？",
+        "answer": "Position bias 指在 A/B 对比评估中，LLM judge 倾向于偏好放在前面（或后面）位置的答案，而非基于质量判断。缓解方法：交换 A/B 的顺序做两次评分取平均——如果两次结果不一致说明存在 bias，需要调整 judge prompt 或用多 judge 投票。"
+      },
+      {
+        "text": "评测 pipeline 中 golden dataset 和 production sample 各自的作用是什么？",
+        "answer": "Golden dataset 是人工标注的 question-answer pair，作为确定性的回归检测基准——每次变更跑 golden dataset 对比分数。Production sample 是线上真实查询的抽样，反映实际用户行为分布，发现 golden dataset 覆盖不到的 edge case。两者互补：golden dataset 保底，production sample 保真。"
+      }
+    ],
+    "guardrails-safety": [
+      {
+        "text": "Agent 的安全风险为什么比普通 ChatBot 更大？",
+        "answer": "Agent 不只是说话，还能执行操作——调 API、写代码、发邮件。Prompt injection 不仅能让 Agent 说错话，还能操纵 Agent 执行未授权操作（删数据、发钓鱼邮件）。加上 Agent 有 context 中的敏感信息（用户数据、内部文档），泄露风险也更大。"
+      },
+      {
+        "text": "双向 guardrails（输入 + 输出）分别检查什么？",
+        "answer": "输入 guardrails：(1) prompt injection detection——分类模型判断是否有 injection 攻击；(2) topic filter——限制只讨论业务话题；(3) PII detection + masking——识别并脱敏 prompt 中的 PII。输出 guardrails：(1) PII scan——防止 response 泄露 PII；(2) content safety——有害内容过滤；(3) factual grounding check——是否基于 context 回答。"
+      },
+      {
+        "text": "PII 脱敏的三步流程是什么？为什么需要 de-masking？",
+        "answer": "三步：(1) Detection——用 NER 模型（Microsoft Presidio）识别 PII entity；(2) Masking——替换为占位符（'张三' → '<PERSON_1>'）保持语义完整；(3) De-masking——LLM 响应中引用了占位符时替换回原始值返回用户。需要 de-masking 是因为 Agent 可能需要在回答中引用用户姓名等信息——脱敏只对 LLM 隐藏 PII，不影响最终用户体验。"
+      }
+    ],
+    "agent-e2e-observability": [
+      {
+        "text": "Agent 系统的 trace propagation 和传统微服务有什么不同？",
+        "answer": "传统微服务通过 HTTP header 传播 W3C Trace Context，请求-响应 ms 级完成。Agent 系统的 trace 需要跨 A2A Task（在 metadata 中携带 traceparent）和 MCP 调用（在 JSON-RPC params 中注入 trace context）传播，链路持续分钟到小时，中间有异步等待和用户交互。需要自定义 propagator 适配非 HTTP 传输。"
+      },
+      {
+        "text": "为什么 trace span 上需要携带 business context attribute？",
+        "answer": "单看 trace 只能看到调用链路和延迟，无法关联到业务意义。携带 user_id、team_id、agent_type、task_type 等 attribute 后可以：(1) 从用户反馈直接找到对应 trace；(2) 从成本异常定位具体 Agent session；(3) 按 team/agent_type 做聚合分析。实现了从业务指标到技术链路的双向钻取。"
+      },
+      {
+        "text": "用什么工具链实现 traces + metrics + logs 三支柱统一查看？",
+        "answer": "推荐 OTel 生态：OTel SDK（Agent 端采集）→ OTel Collector（统一收集）→ Grafana Tempo（traces）+ Prometheus（metrics）+ Loki（logs）→ Grafana dashboard 统一展示。Grafana 支持从 trace 跳转到对应时间段的 metrics 和 logs（Exemplar 关联），实现跨三支柱的钻取。"
+      }
+    ]
+  }
+}

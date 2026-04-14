@@ -272,6 +272,342 @@
         "text": "Multus 是什么？Pod 多 NIC 是怎么实现的？什么场景需要？",
         "answer": "Multus 是一个 CNI meta-plugin：它包装真正的 CNI（calico/cilium 等），让一个 Pod 同时接多个网络。原理是 Pod annotation 里声明额外网络的 NetworkAttachmentDefinition CRD，Multus 调用对应 CNI 给 Pod 加额外 iface（net1, net2, ...）。常用于 NFV、低延迟交易、多平面场景（管理 + 数据 + 存储分离）。"
       }
+    ],
+    "pv-pvc-lifecycle": [
+      {
+        "text": "PV 的三种 accessMode（RWO/ROX/RWX）分别限制的是什么？RWO 能不能同时被同一节点上的两个 Pod 使用？",
+        "answer": "accessMode 限制的是节点维度的挂载方式：RWO 只允许一个节点读写挂载，ROX 多节点只读，RWX 多节点读写。RWO 允许同一节点上多个 Pod 同时使用（因为它限制的是节点不是 Pod）。1.22+ 引入了 ReadWriteOncePod（RWOP）才是严格的单 Pod 独占。"
+      },
+      {
+        "text": "PV 的 reclaimPolicy 为 Retain 时，PVC 删除后 PV 处于什么状态？怎样才能重新绑定？",
+        "answer": "PV 进入 Released 状态，数据保留但不再可用——不会自动绑定新 PVC。要复用需要手动清除 PV 的 spec.claimRef 字段使其回到 Available，或者删掉 PV 重新创建。Delete 策略下 PV 和底层存储资源会一起被回收。"
+      },
+      {
+        "text": "WaitForFirstConsumer 解决什么问题？不用它时 PVC 绑定可能出什么错？",
+        "answer": "解决存储拓扑和调度拓扑不匹配的问题。默认 Immediate 模式下 PVC 创建即绑定 PV，可能绑到 zone-a 的盘，但 Pod 被调度到 zone-b——挂载失败。WaitForFirstConsumer 延迟到 Pod 调度时再绑定，让 scheduler 综合考虑存储和计算拓扑。GPU 训练场景下存储在特定机柜，必须用这个模式。"
+      }
+    ],
+    "storageclass-dynamic": [
+      {
+        "text": "StorageClass 的 parameters 字段传给谁？provisioner、parameters、reclaimPolicy 三者的关系是什么？",
+        "answer": "parameters 传给 provisioner（CSI driver）作为创建卷时的参数（如 type=gp3、iops=10000）。provisioner 决定谁来创建卷，parameters 决定创建什么样的卷，reclaimPolicy 决定卷用完了怎么处理。三者组合定义了一类存储的完整生命周期行为。"
+      },
+      {
+        "text": "一个集群有 ssd 和 hdd 两个 StorageClass，PVC 不指定 storageClassName 时用哪个？怎么控制？",
+        "answer": "用被标记为 default 的那个（annotation storageclass.kubernetes.io/is-default-class=true）。如果没有 default 或有多个 default，PVC 会绑定失败或行为不确定。最佳实践是有且只有一个 default StorageClass，其他显式指定。"
+      },
+      {
+        "text": "allowedTopologies 在 StorageClass 里起什么作用？给一个 GPU 集群的实际场景。",
+        "answer": "限制动态创建的卷只能出现在指定拓扑域（zone/rack/node）。GPU 集群场景：A100 节点在 zone-gpu，训练数据盘必须和 GPU 在同一 zone 避免跨 zone IO 延迟，通过 allowedTopologies 限制 PV 只创建在 zone-gpu，配合 WaitForFirstConsumer 确保 Pod+PV 共同落在同一拓扑域。"
+      }
+    ],
+    "csi-architecture": [
+      {
+        "text": "CSI 的三个 gRPC service（Identity/Controller/Node）分别部署在哪里？为什么要分开？",
+        "answer": "Identity 两边都有（注册+探活）。Controller 跑在中心化的 Deployment 里（1-2 副本），负责 CreateVolume/DeleteVolume/Snapshot 等不需要在特定节点执行的操作。Node 跑在 DaemonSet 里每个节点一个，负责 NodeStageVolume/NodePublishVolume 等必须在目标节点执行的挂载操作。分开是因为职责和部署拓扑不同。"
+      },
+      {
+        "text": "CSI sidecar 容器（external-provisioner、external-attacher 等）的职责是什么？为什么需要它们？",
+        "answer": "sidecar 是 K8s 社区维护的标准桥接组件，watch K8s 对象（PVC、VolumeAttachment 等）并翻译成 CSI gRPC 调用。CSI driver 只需要实现 gRPC 接口，不需要感知 K8s API——这是关注点分离的核心：driver 厂商只管存储逻辑，K8s 集成由 sidecar 处理。"
+      },
+      {
+        "text": "CSI driver 怎么向 kubelet 注册自己？注册失败 Pod 会出什么症状？",
+        "answer": "Node plugin 通过 node-driver-registrar sidecar 把 CSI driver 的 unix socket 路径注册到 kubelet 的 plugin 目录（/var/lib/kubelet/plugins_registry/）。注册失败时，kubelet 不认识该 CSI driver，Pod 会卡在 ContainerCreating，events 报 'unknown CSI driver' 或 'volume mount timeout'。"
+      }
+    ],
+    "volume-expansion-snapshot": [
+      {
+        "text": "在线扩容（Online Expansion）和离线扩容的区别是什么？哪些条件必须满足才能在线扩容？",
+        "answer": "在线扩容是 PVC 被 Pod 挂载使用中直接扩大容量，不需要先 unmount。离线扩容需要先停 Pod 解绑。在线扩容需要：StorageClass 标记 allowVolumeExpansion=true，CSI driver 支持 ONLINE 模式的 NodeExpandVolume，底层存储支持热扩（如 EBS gp3/io2）。文件系统还需要支持在线 resize（ext4/xfs 都支持）。"
+      },
+      {
+        "text": "VolumeSnapshot 和 VolumeSnapshotContent 的关系类似于什么？恢复流程是怎样的？",
+        "answer": "类似 PVC 和 PV 的关系——VolumeSnapshot 是用户侧声明，VolumeSnapshotContent 是管理员/provisioner 侧的实际快照对象。恢复流程：创建新 PVC 时在 dataSource 字段引用 VolumeSnapshot 名字，CSI driver 从快照创建新卷，PVC 绑定后 Pod 挂载即可使用恢复的数据。"
+      },
+      {
+        "text": "PVC clone 和从 Snapshot 恢复有什么区别？什么场景选 clone？",
+        "answer": "Clone 是直接从一个已有 PVC 创建新 PVC（dataSource 指向 PVC），不需要先创快照再恢复，少一步。但 clone 要求源 PVC 和新 PVC 在同一 namespace、同一 StorageClass。适合快速复制训练数据集给多个实验 Pod——不想管理 snapshot 生命周期时用 clone 更直接。"
+      }
+    ],
+    "ephemeral-projected-volume": [
+      {
+        "text": "emptyDir 的生命周期是什么？medium=Memory 时有什么特殊行为？",
+        "answer": "emptyDir 与 Pod 同生共死——Pod 删除时数据清零，容器 crash 重启不影响。medium=Memory 时底层用 tmpfs（内存文件系统），IO 极快但占用容器的内存 cgroup 配额。如果 tmpfs 使用量超过 sizeLimit，kubelet 会驱逐 Pod。GPU 训练常用 memory-backed emptyDir 做模型 checkpoint 的临时缓存。"
+      },
+      {
+        "text": "projected volume 能把哪几种来源投射到同一个目录？给一个具体的组合场景。",
+        "answer": "能投射 secret、configMap、downwardAPI、serviceAccountToken 四种来源到同一个挂载点。场景：AI 推理 Pod 需要在 /etc/app-config/ 下同时放模型配置（configMap）、API 密钥（secret）、Pod 名和 namespace（downwardAPI），用 projected volume 一次挂载避免三个独立挂载点。"
+      },
+      {
+        "text": "configMap volume 和 env 引用 configMap 有什么关键行为差异？",
+        "answer": "volume 挂载的 configMap 支持热更新——kubelet 定期同步（默认约 60s），文件内容会自动变。env 引用的 configMap 只在容器启动时读一次，后续 configMap 变更不会生效，必须重启 Pod。需要动态配置的场景（如 feature flag）应该用 volume 挂载。"
+      }
+    ],
+    "high-perf-storage-csi": [
+      {
+        "text": "Lustre CSI 驱动在 AI 训练集群的典型部署方式是什么？它和普通块存储 CSI 有何本质不同？",
+        "answer": "Lustre 是并行文件系统，CSI driver 在每个节点上执行 mount.lustre 挂载到 Lustre 集群。和块存储的本质不同：块存储一个卷只能挂到一个节点（RWO），Lustre 天然支持多节点同时读写同一个文件系统（RWX），多个训练 Pod 能并发读同一份数据集而不需要复制。"
+      },
+      {
+        "text": "JuiceFS 在 K8s 环境下的缓存机制是怎样的？缓存失效会有什么影响？",
+        "answer": "JuiceFS 在每个节点本地（SSD/内存）维护数据块缓存，首次读从对象存储拉取，后续读命中本地缓存。缓存是基于数据块的 content hash，不变数据永不失效。训练场景下第一个 epoch 冷启动慢（需要从 S3 拉数据），后续 epoch 全部命中本地缓存，IO 性能接近本地 SSD。"
+      },
+      {
+        "text": "Alluxio 的 FUSE mount 方式在 K8s 里有什么性能瓶颈？怎么优化？",
+        "answer": "FUSE 是用户态文件系统，每次 IO 要从内核态切到用户态再回来，syscall 开销大，小文件随机读延迟明显。优化手段：开启 kernel_cache 让 page cache 缓存 FUSE 数据减少来回切换；用 alluxio-fuse 的本地 worker 做二级缓存；大文件场景预读（readahead）调大。对于 GPU 训练的大批量顺序读，影响较小。"
+      }
+    ],
+    "affinity-topology-spread": [
+      {
+        "text": "nodeAffinity 的 requiredDuringSchedulingIgnoredDuringExecution 中 'IgnoredDuringExecution' 是什么意思？会导致什么问题？",
+        "answer": "意思是调度时必须满足亲和条件，但 Pod 跑起来后如果节点 label 变了（不再满足条件），Pod 不会被驱逐。这可能导致 GPU 节点被重新标记后，原本调度到该节点的 Pod 仍在运行但不符合预期拓扑。目前 K8s 没有 RequiredDuringExecution 的驱逐版本。"
+      },
+      {
+        "text": "topologySpreadConstraints 的 maxSkew=1, whenUnsatisfiable=DoNotSchedule 在三个 zone 各有 2/2/0 个 Pod 时，新 Pod 能调度到哪？",
+        "answer": "只能调度到 zone-c（0 个 Pod 的那个）。maxSkew=1 要求任意两个拓扑域的 Pod 数差值不超过 1，当前 skew 已经是 2（2-0），只有往 zone-c 加才能缩小 skew。如果 zone-c 没有可用节点，Pod 会 Pending。"
+      },
+      {
+        "text": "nodeAffinity preferred 权重（weight 1-100）是怎么参与调度评分的？给一个多条件权衡的例子。",
+        "answer": "scheduler 的 Score 阶段把所有满足的 preferred 项的 weight 加到节点得分上。例如：preferredDuringScheduling weight=80 匹配 gpu-type=a100，weight=20 匹配 zone=us-east-1a。同时满足的节点得 100 分，只有 A100 但不在目标 zone 得 80 分，scheduler 优先选高分节点但不强制。"
+      }
+    ],
+    "taints-tolerations-advanced": [
+      {
+        "text": "NoSchedule、PreferNoSchedule、NoExecute 三种 taint effect 分别在什么时候起作用？",
+        "answer": "NoSchedule：调度时硬拒——没有匹配 toleration 的 Pod 不会被调度到该节点，但已经跑着的 Pod 不受影响。PreferNoSchedule：调度时软拒——尽量不调度过来，但资源不够时还是会。NoExecute：不仅拒绝新调度，还会驱逐已经在运行的没有匹配 toleration 的 Pod。"
+      },
+      {
+        "text": "tolerationSeconds 是什么？在 GPU 节点维护场景下怎么用？",
+        "answer": "tolerationSeconds 只对 NoExecute taint 生效，表示 Pod 容忍这个 taint 多久后被驱逐。GPU 节点维护场景：给节点打 NoExecute taint，训练 Pod 的 toleration 设 tolerationSeconds=3600，表示'给我 1 小时做 checkpoint 保存再驱逐'，而非立刻被杀。不设 tolerationSeconds 则无限期容忍。"
+      },
+      {
+        "text": "GPU 节点通常打什么 taint？为什么不靠 nodeSelector 就够了？",
+        "answer": "典型 taint：nvidia.com/gpu=present:NoSchedule。仅用 nodeSelector 只能保证 GPU Pod 调度到 GPU 节点，但不能阻止非 GPU Pod 也被调度过来占用 CPU/内存资源。taint 是反向保护——把非 GPU 工作负载排斥出去，保证昂贵的 GPU 节点资源专供训练任务。"
+      }
+    ],
+    "priority-preemption": [
+      {
+        "text": "PriorityClass 的 value 值范围是多少？system-cluster-critical 和 system-node-critical 各是多少？",
+        "answer": "用户可用范围是 0 到 10 亿（1000000000）。system-cluster-critical 是 2000000000，system-node-critical 是 2000001000，都超过用户可用范围——保证系统组件永远不被用户 Pod 抢占。用户自定义的 PriorityClass 最高只能到 10 亿。"
+      },
+      {
+        "text": "preemptionPolicy=Never 的 PriorityClass 有什么用？给一个 AI 训练场景。",
+        "answer": "高优先级但不抢占：排队时排在低优先级前面，但不会杀掉已运行的 Pod 腾空间。AI 场景：实验性训练任务设高 priority + preemptionPolicy=Never，让它比 batch 任务优先获得空闲资源，但不会杀掉正在跑的生产训练任务导致 checkpoint 丢失。"
+      },
+      {
+        "text": "scheduler 抢占的完整流程是什么？被抢占的 Pod 有优雅退出的机会吗？",
+        "answer": "scheduler 发现高优 Pod 无法调度 → 遍历节点找到'杀掉某些低优 Pod 后能容纳高优 Pod'的候选节点 → 选最优节点 → 给被抢占 Pod 设 deletionTimestamp → 被抢占 Pod 走正常终止流程（preStop + grace period）→ 资源释放后高优 Pod 被调度过来。被抢占 Pod 有完整的优雅退出机会。"
+      }
+    ],
+    "dra-structured-request": [
+      {
+        "text": "DRA（Dynamic Resource Allocation）和传统 device plugin 的核心区别是什么？",
+        "answer": "device plugin 是纯计数模型——向 scheduler 报告'我有 8 个 GPU'，scheduler 只知道数量不知道属性。DRA 使用 ResourceClaim 声明结构化需求（如 memory>=80GiB、interconnect=nvlink），scheduler 能基于属性匹配，实现拓扑感知和多设备协同分配。"
+      },
+      {
+        "text": "ResourceClaim 中的 CEL 表达式能做什么？给一个 GPU 选择的具体例子。",
+        "answer": "CEL 表达式用于描述设备属性过滤条件。例如：device.attributes['gpu.memory'].compareTo(quantity('80Gi')) >= 0 && device.attributes['gpu.model'] == 'A100'，表示要求 GPU 显存不低于 80GiB 且型号为 A100。scheduler 评估 CEL 表达式来匹配可用设备，比 device plugin 的纯数量请求精确得多。"
+      },
+      {
+        "text": "DRA 的 structured parameters 模式和 classic DRA 有什么不同？为什么 K8s 社区转向 structured？",
+        "answer": "classic DRA 由外部 driver 做分配决策（scheduler 调用 driver 的 gRPC），scheduler 无法预判结果，导致调度循环低效。structured parameters 把设备属性建模为 K8s 原生对象，scheduler 自己用 CEL 评估匹配，不需要外部调用。好处是调度可预测、可模拟、支持抢占回滚。"
+      }
+    ],
+    "karpenter-gpu-scaling": [
+      {
+        "text": "Karpenter 的 NodePool 和 cluster-autoscaler 的 node group 有什么本质区别？",
+        "answer": "cluster-autoscaler 基于预定义的 node group（固定实例类型列表），扩容只能从已有 group 里选。Karpenter 的 NodePool 定义的是约束（requirements），Karpenter 根据 pending Pod 的实际需求在约束范围内动态选最优实例类型。这意味着 Karpenter 能自动选择性价比最优的 GPU 实例而不需要提前枚举所有可能的 node group。"
+      },
+      {
+        "text": "Karpenter 的 consolidation 机制是什么？对 GPU 节点有什么特殊考量？",
+        "answer": "consolidation 是 Karpenter 持续检测是否能把多个低利用率节点的 Pod 合并到更少节点上，腾出的节点回收降低成本。GPU 节点的特殊考量：GPU 训练任务通常长时间运行且不可中断，consolidation 需要配合 do-not-disrupt annotation 或 PDB 保护关键任务，避免为了节省一个节点而杀掉跑了几小时的训练 Job。"
+      },
+      {
+        "text": "Karpenter 的 drift 检测是什么？给一个 GPU 驱动升级的场景。",
+        "answer": "drift 检测是 Karpenter 发现已有节点的实际配置和 NodePool 期望配置不一致时，自动替换节点。GPU 场景：更新 NodePool 的 AMI 到包含新 NVIDIA 驱动的版本，Karpenter 发现现有节点用旧 AMI（drift），会优雅地 cordon+drain 旧节点并启动新 AMI 的节点，实现滚动式 GPU 驱动升级。"
+      }
+    ],
+    "custom-scheduler-framework": [
+      {
+        "text": "Scheduling Framework 的 Filter 和 Score 阶段分别做什么？一个节点如果在 Filter 被淘汰，还会进入 Score 吗？",
+        "answer": "Filter 是硬性筛选——不满足条件的节点直接淘汰（如资源不足、taint 不匹配）。Score 是对通过 Filter 的节点打分排名——选最优节点。被 Filter 淘汰的节点不会进入 Score 阶段。先过滤再排序，两阶段串行。"
+      },
+      {
+        "text": "写一个自定义 Score plugin 的典型场景是什么？它怎么影响 GPU 调度？",
+        "answer": "场景：GPU 碎片最小化——希望 Pod 尽量堆叠到已有部分 GPU 被占的节点上，而不是分散到空节点。自定义 Score plugin 给'剩余 GPU 数恰好满足请求'的节点打高分，给'剩余 GPU 远大于请求'的节点打低分，实现 bin-packing 策略减少碎片。plugin 实现 ScoreExtensions 接口注册到 framework。"
+      },
+      {
+        "text": "CoScheduling（gang scheduling）解决什么问题？不用它时分布式训练会怎样？",
+        "answer": "CoScheduling 保证一组 Pod 要么全部调度成功，要么全部不调度。不用它时分布式训练的问题：8 个 worker 只调度成功 6 个，2 个 Pending，已启动的 6 个空等浪费 GPU。更严重的是两个训练 Job 互相锁死——各占一半 GPU，谁也凑不齐。CoScheduling 通过 PodGroup CRD + Permit 阶段实现 all-or-nothing。"
+      }
+    ],
+    "rbac-model": [
+      {
+        "text": "Role 和 ClusterRole 的区别是什么？ClusterRole 能不能被 RoleBinding（而非 ClusterRoleBinding）引用？",
+        "answer": "Role 是 namespace 级，只能授权本 namespace 的资源。ClusterRole 是集群级，可以授权集群范围资源（如 nodes、namespaces）。ClusterRole 可以被 RoleBinding 引用——效果是把 ClusterRole 定义的权限限制在 RoleBinding 所在 namespace。这是复用权限模板的标准做法。"
+      },
+      {
+        "text": "ClusterRole aggregation 是什么？K8s 内置的 admin/edit/view 角色用了它吗？",
+        "answer": "aggregation 通过 aggregationRule.clusterRoleSelectors 自动合并匹配 label 的 ClusterRole 规则到一个聚合角色里。K8s 内置的 admin/edit/view 都是聚合角色——CRD 定义时带上 rbac.authorization.k8s.io/aggregate-to-admin=true label，对应 rules 自动合并进 admin ClusterRole，不需要手动修改。"
+      },
+      {
+        "text": "最小权限原则在 RBAC 里怎么落地？给一个 AI 平台的多租户权限设计示例。",
+        "answer": "原则：只授予完成任务所需的最小 verbs+resources+resourceNames。AI 平台示例：训练团队的 Role 只允许 create/get/list Job 和 Pod（不给 delete Deployment），且 resourceNames 限定特定 PVC 名字前缀；平台管理员用 ClusterRole 管节点和 namespace；模型服务团队只给 Deployment+Service 的 get/update 不给 create。"
+      }
+    ],
+    "serviceaccount-oidc": [
+      {
+        "text": "projected ServiceAccount token 和传统的 Secret-based token 有什么关键区别？",
+        "answer": "projected token 有三个关键改进：(1) 有过期时间（默认 1h，自动轮换），传统 token 永不过期；(2) 有 audience 声明，限定谁能消费这个 token；(3) 不存储在 Secret 对象里（减少泄露面）。1.24+ 不再自动创建 Secret-based token，强制使用 projected token。"
+      },
+      {
+        "text": "IRSA（IAM Roles for Service Accounts）的工作原理是什么？token 是怎么变成 AWS 凭证的？",
+        "answer": "EKS 集群有一个 OIDC provider URL 注册到 AWS IAM。Pod 内的 projected SA token 由这个 OIDC provider 签发。AWS STS 的 AssumeRoleWithWebIdentity 验证 token 签名后发放临时 IAM 凭证。SDK 通过环境变量自动感知这个流程。核心是把 K8s SA token 当 OIDC identity token 用，IAM 信任这个 OIDC provider。"
+      },
+      {
+        "text": "GKE Workload Identity 和 IRSA 的思路一样吗？有什么实现差异？",
+        "answer": "思路一样——都是把 K8s SA 映射到云 IAM 身份。差异：GKE Workload Identity 不需要手动配 OIDC provider，GKE 自动管理。映射方式是通过 IAM policy binding 把 GCP SA 绑到 K8s SA（格式 serviceAccount:project.svc.id.goog[namespace/ksa-name]）。Pod 直接拿到 GCP token，不经过 STS exchange 这一步。"
+      }
+    ],
+    "pod-security-standards": [
+      {
+        "text": "Pod Security Standards 的三个级别（Privileged/Baseline/Restricted）分别允许什么？",
+        "answer": "Privileged：无限制，允许所有特权操作。Baseline：禁止已知的高危配置（hostNetwork、hostPID、privileged containers、hostPath），但允许非 root 以外的一般配置。Restricted：最严格——必须 non-root、drop ALL capabilities、readOnlyRootFilesystem、不允许 privilege escalation。"
+      },
+      {
+        "text": "怎么给 namespace 启用 Pod Security Admission？enforce/audit/warn 三种模式有什么区别？",
+        "answer": "通过 namespace label：pod-security.kubernetes.io/enforce=restricted。enforce 直接拒绝不合规 Pod；audit 允许创建但在审计日志记录违规；warn 允许创建但给用户返回警告信息。最佳实践是先用 warn+audit 观察影响，确认无误后开 enforce。"
+      },
+      {
+        "text": "GPU Pod 通常需要哪些特权豁免？怎么在 Restricted 级别下处理？",
+        "answer": "GPU Pod 需要访问 /dev/nvidia* 设备文件（通过 device plugin 自动挂载，不需要 hostPath）。如果用 NVIDIA device plugin 标准方式，Pod 本身不需要 privileged 或 hostPath，可以满足 Restricted 级别。但 GPU operator 的某些组件（如 driver installer）需要 privileged，这些放在独立 namespace 用 Privileged 级别，业务 namespace 保持 Restricted。"
+      }
+    ],
+    "secret-external-secrets": [
+      {
+        "text": "K8s Secret 默认在 etcd 中是加密存储的吗？怎么启用 encryption at rest？",
+        "answer": "默认不加密——etcd 中是 base64 编码的明文，能直接读取。启用 encryption at rest 需要配置 EncryptionConfiguration（apiserver 的 --encryption-provider-config），指定加密 provider（aescbc/aesgcm/secretbox/kms）。推荐用 KMS provider 对接云 KMS 服务，密钥不落盘。"
+      },
+      {
+        "text": "External Secrets Operator（ESO）的工作流程是什么？ExternalSecret 和 SecretStore 分别干什么？",
+        "answer": "SecretStore 定义连接外部密钥管理系统的方式（如 Vault 地址+认证方式）。ExternalSecret 声明'从 SecretStore 的哪个 key 同步到 K8s 的哪个 Secret'。ESO controller watch ExternalSecret，定期从外部系统拉取最新值写入 K8s Secret。这样 Secret 的 source of truth 在 Vault/AWS SM 里，K8s 里的是缓存副本。"
+      },
+      {
+        "text": "用 ESO 同步 Vault 密钥到 K8s Secret 时，Secret 更新了但 Pod 没感知到——为什么？怎么解决？",
+        "answer": "K8s Secret 更新后，通过 env 引用的 Pod 不会感知变化（需要重启）。通过 volume 挂载的 Pod 能在约 60s 后感知文件更新，但进程不一定会重新读取配置文件。解决方案：(1) 用 Reloader 等工具检测 Secret 变化自动触发滚动更新；(2) 应用代码 watch 配置文件变化；(3) ESO 配合 hash annotation 触发 Deployment rollout。"
+      }
+    ],
+    "admission-opa-kyverno": [
+      {
+        "text": "ValidatingAdmissionWebhook 和 MutatingAdmissionWebhook 的执行顺序是什么？为什么这个顺序重要？",
+        "answer": "先 Mutating 再 Validating。这个顺序保证了 Mutating webhook 可以注入默认值（如 sidecar、resource limits），然后 Validating webhook 在最终版本上做合规检查。如果反过来，Validating 检查的可能是 Mutating 修改前的版本，导致安全规则被绕过。"
+      },
+      {
+        "text": "OPA Gatekeeper 的 ConstraintTemplate 和 Constraint 分别是什么？为什么要分两层？",
+        "answer": "ConstraintTemplate 定义 Rego 策略逻辑（如'容器必须有 resource limits'），编译成可复用的模板。Constraint 是模板的实例化——指定参数和作用范围（如'namespace=production 的 Pod 必须有 CPU limit >= 100m'）。分两层实现了策略逻辑和策略配置的解耦，安全团队写模板，平台团队按需实例化。"
+      },
+      {
+        "text": "Kyverno 的 ClusterPolicy 和 OPA Gatekeeper 在使用体验上有什么核心区别？",
+        "answer": "Kyverno 用 YAML 写策略（不需要学 Rego），validate/mutate/generate 三种操作在同一个 ClusterPolicy 里声明，支持基于 kubectl 的 CLI 测试。Gatekeeper 需要写 Rego（学习曲线陡），但 Rego 更强大——能做跨资源关联查询、复杂逻辑计算。简单策略 Kyverno 更快上手，复杂策略 Gatekeeper 更灵活。"
+      }
+    ],
+    "multi-tenancy-gpu": [
+      {
+        "text": "vCluster 的实现原理是什么？它和 namespace 隔离的本质区别在哪？",
+        "answer": "vCluster 在宿主集群的一个 namespace 里运行一个独立的 K8s control plane（轻量 API server + syncer）。租户看到的是一个'完整的集群'，有自己的 namespace/CRD/RBAC。本质区别：namespace 隔离共享同一个 API server 和 CRD 空间，租户能感知到彼此；vCluster 提供 API 级别的硬隔离，租户完全看不到其他租户。"
+      },
+      {
+        "text": "Hierarchical Namespaces（HNC）解决什么问题？在 GPU 共享集群里怎么用？",
+        "answer": "HNC 让 namespace 形成父子树结构，父 namespace 的 RBAC/NetworkPolicy/ResourceQuota 自动传播到子 namespace。GPU 集群场景：顶层 team-ml namespace 设总 GPU quota = 32，下面 team-ml-training 和 team-ml-inference 各自分配子 quota，HNC 自动确保子 namespace 总和不超过父 quota，省去手动维护。"
+      },
+      {
+        "text": "在多租户 GPU 集群中，ResourceQuota 和 LimitRange 分别控制什么？只用 ResourceQuota 够吗？",
+        "answer": "ResourceQuota 控制 namespace 级总量上限（如 requests.nvidia.com/gpu=8 表示该 namespace 最多申请 8 块 GPU）。LimitRange 控制单个 Pod/Container 的默认值和上下限（如单个 Pod 最多 4 GPU）。只用 ResourceQuota 不够——一个 Pod 可能一次请求全部 8 GPU 把 namespace quota 吃满，LimitRange 防止单个工作负载独占。"
+      }
+    ],
+    "hpa-vpa": [
+      {
+        "text": "HPA v2 的 custom metrics 和 external metrics 有什么区别？各用什么场景？",
+        "answer": "custom metrics 是 K8s 对象关联的指标（如 Pod 的 QPS、Deployment 的 queue_length），通过 custom.metrics.k8s.io API 暴露。external metrics 是和 K8s 对象无关的外部指标（如 SQS 队列深度、Kafka lag），通过 external.metrics.k8s.io API 暴露。推理服务用 custom metrics 按 GPU 利用率扩缩，训练数据管线用 external metrics 按消息队列积压扩缩。"
+      },
+      {
+        "text": "VPA 的 updateMode 有哪几种？为什么 'Auto' 模式在生产环境有风险？",
+        "answer": "Off：只推荐不执行；Initial：只在 Pod 创建时应用推荐值；Auto（含 Recreate）：运行中的 Pod 也会被驱逐重建以应用新推荐值。Auto 的风险是 VPA 可能在业务高峰期驱逐 Pod 更新 resource request，导致短暂容量下降。生产环境常用 Off 模式看推荐值，手动或结合 CI 更新。"
+      },
+      {
+        "text": "HPA 和 VPA 能同时用在同一个 Deployment 上吗？有什么限制？",
+        "answer": "不建议同时基于 CPU 指标使用——HPA 水平加减副本时 VPA 可能同时调整 CPU request，两者冲突导致震荡。解决方案：HPA 用 custom metrics（如 QPS）做水平伸缩，VPA 用 Off 模式只推荐 CPU/memory request 值，人工更新。或者用 Multidimensional Pod Autoscaler（MPA）统一协调。"
+      }
+    ],
+    "keda-event-scaling": [
+      {
+        "text": "KEDA 的 ScaledObject 和 HPA 是什么关系？KEDA 替代了 HPA 吗？",
+        "answer": "KEDA 不替代 HPA，而是在其之上增强。ScaledObject 底层会创建一个 HPA 并管理它。KEDA 的核心价值是：(1) 提供 50+ 内置 scaler（Kafka/RabbitMQ/Prometheus/Cron 等），省去自己写 metrics adapter；(2) 支持 scale-from-zero——HPA 不能缩到 0 副本，KEDA 可以。"
+      },
+      {
+        "text": "KEDA 的 scale-from-zero 是怎么实现的？第一个请求的延迟会怎样？",
+        "answer": "当副本数为 0 时 KEDA 自己轮询 trigger 源（不经过 HPA），检测到事件后把 Deployment replicas 从 0 设为 1（或 minReplicaCount），然后交给 HPA 管后续伸缩。第一个请求的延迟 = KEDA 轮询间隔（pollingInterval，默认 30s）+ Pod 启动时间 + 容器就绪时间，可能几十秒到几分钟。"
+      },
+      {
+        "text": "KEDA 的 cooldownPeriod 和 HPA 的 stabilizationWindowSeconds 有什么区别？",
+        "answer": "cooldownPeriod 是 KEDA 特有的——控制从活跃缩到 0 副本之前的等待时间（防止频繁 0↔1 抖动）。stabilizationWindowSeconds 是 HPA 的——在非零副本之间缩容时取窗口期内的最大推荐值，防止缩容过快。两者作用域不同：cooldownPeriod 管 scale-to-zero，stabilization 管非零缩容。"
+      }
+    ],
+    "etcd-operations": [
+      {
+        "text": "etcd 的 compaction 和 defrag 分别解决什么问题？不做会怎样？",
+        "answer": "compaction 清理历史 revision（etcd 保留每个 key 的所有修改版本），不做会导致 DB 持续膨胀、watch 缓存占用过多内存。defrag 整理物理存储碎片——compaction 只是逻辑删除，磁盘空间不会释放，defrag 才能回收。不做 defrag 可能导致 etcd DB 文件远大于实际数据量，触发默认 2GB 的 quota 限制。"
+      },
+      {
+        "text": "etcd snapshot 和 restore 的标准流程是什么？restore 后集群会发生什么？",
+        "answer": "备份：etcdctl snapshot save /path/to/snap.db（在某个 etcd 成员上执行即可，snapshot 是全量的）。恢复：停掉所有 etcd 成员，每个成员用 etcdctl snapshot restore 从同一份 snap 恢复到各自数据目录（指定不同 name 和 peer URL），然后重启集群。恢复后 cluster ID 和 member ID 全部变化，apiserver 需要重连。"
+      },
+      {
+        "text": "怎么监控 etcd 健康？哪些指标异常需要立即告警？",
+        "answer": "关键指标：(1) etcd_server_has_leader=0 表示集群脑裂或 quorum 丢失，立即告警；(2) etcd_disk_wal_fsync_duration_seconds p99>10ms 表示磁盘慢，影响写性能；(3) etcd_server_proposals_failed_total 持续增长表示 raft 提议失败；(4) DB size 接近 quota（默认 2GB）。etcd 是 K8s 的大脑，任何一个异常都可能导致整个集群不可用。"
+      }
+    ],
+    "drain-pdb": [
+      {
+        "text": "kubectl drain 执行时依次做了什么？和 cordon 有什么区别？",
+        "answer": "drain = cordon + evict。先 cordon 把节点标记为 SchedulingDisabled（新 Pod 不再调度过来），然后逐个 evict 节点上的 Pod（走 eviction API，尊重 PDB）。单独 cordon 只阻止新调度，不动已有 Pod。drain 完成后节点上只剩 DaemonSet Pod（默认不驱逐，需要 --ignore-daemonsets）。"
+      },
+      {
+        "text": "PDB 的 minAvailable 和 maxUnavailable 有什么区别？同时设会怎样？",
+        "answer": "minAvailable 声明'至少要保持 N 个 Pod 可用'，maxUnavailable 声明'最多允许 N 个 Pod 不可用'——两者是等价的约束的不同表达方式。同时设两个字段是不允许的（API validation 报错）。4 副本时 minAvailable=3 等效于 maxUnavailable=1。"
+      },
+      {
+        "text": "GPU 训练 Pod 被 drain 时，怎么利用 preStop hook 做 checkpoint 保存？",
+        "answer": "在 Pod spec 里配 preStop hook 执行 checkpoint 保存脚本（如调用训练框架的 save_checkpoint API 写到 PVC）。配合 terminationGracePeriodSeconds 设足够长（如 600s）给 checkpoint 写入时间。同时设 PDB maxUnavailable=1 保证不会同时杀掉多个 worker 导致分布式训练崩溃。drain 触发 eviction → preStop 保存 checkpoint → SIGTERM → 新 Pod 从 checkpoint 恢复。"
+      }
+    ],
+    "cluster-upgrade": [
+      {
+        "text": "K8s 的版本偏差策略（version skew policy）允许 kubelet 比 apiserver 低几个版本？为什么？",
+        "answer": "kubelet 可以比 apiserver 低最多 3 个小版本（如 apiserver 1.29，kubelet 最低 1.26）。这是为了支持滚动升级——先升 control plane 再逐批升 node，过程中必然存在版本差。但 kubelet 不能高于 apiserver。etcd 与 apiserver 之间也有兼容矩阵需要遵守。"
+      },
+      {
+        "text": "in-place 升级和 blue-green 升级的区别？GPU 集群适合哪种？为什么？",
+        "answer": "in-place：原地升级节点（drain → upgrade kubelet → uncordon），节省资源但过程中容量下降。blue-green：创建新版本节点池，把工作负载迁过去，再下掉旧池。GPU 集群优先 blue-green——GPU 节点价格高但训练任务不能中断，blue-green 可以先在新池上调度新任务，旧池任务自然完成后回收，零中断。"
+      },
+      {
+        "text": "升级时 GPU 驱动兼容性怎么保证？有哪些容易踩的坑？",
+        "answer": "坑：(1) 新版 kubelet/container runtime 可能不兼容旧版 NVIDIA driver，需要先查 NVIDIA driver 兼容矩阵；(2) 升级节点 OS 内核后 driver 需要重新编译（DKMS），如果 driver 版本不支持新内核会导致 GPU 设备消失；(3) nvidia-device-plugin 版本要和 driver 匹配。最佳实践：用 GPU Operator 统一管理 driver+plugin+container toolkit 的版本组合。"
+      }
+    ],
+    "troubleshooting-methodology": [
+      {
+        "text": "Pod 一直 Pending，系统化的排查顺序是什么？",
+        "answer": "三步定位：(1) kubectl describe pod 看 Events 里的 scheduler 消息——是资源不足（Insufficient cpu/memory/gpu）还是 affinity/taint 不满足？(2) 如果是资源不足，kubectl describe nodes 看各节点的 Allocatable vs Allocated；(3) 如果是 PVC 问题，kubectl get pvc 看是否 Pending——StorageClass 是否存在、provisioner 是否正常、quota 是否超限。"
+      },
+      {
+        "text": "Pod 反复 CrashLoopBackOff，怎么快速定位是应用问题还是环境问题？",
+        "answer": "先 kubectl logs pod --previous 看上一次崩溃的日志——有明确错误就是应用问题。如果日志为空或容器还没来得及输出，kubectl describe pod 看 lastState 的 exit code：OOMKilled(137) 说明内存不够加 resources.limits.memory；exit code 1 通常是应用启动错误（配置文件找不到、依赖服务不通）；exit code 126/127 是命令或镜像问题。"
+      },
+      {
+        "text": "节点 NotReady 的常见原因有哪些？怎么区分是 kubelet 问题还是网络问题？",
+        "answer": "NotReady 意味着 kubelet 停止向 apiserver 汇报心跳。常见原因：(1) kubelet 进程挂了（systemctl status kubelet 查）；(2) 节点到 apiserver 的网络断了（在节点上 curl apiserver:6443 测）；(3) 节点资源耗尽（磁盘满、内存 OOM 导致 kubelet 被杀）。区分方法：SSH 到节点——能 SSH 上去说明基础网络通，查 kubelet 日志和 journalctl 定位具体原因。"
+      }
     ]
   }
 }

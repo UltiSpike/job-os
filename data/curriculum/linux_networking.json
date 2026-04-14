@@ -1,0 +1,356 @@
+{
+  "track": {
+    "slug": "linux-networking",
+    "name": "Linux 网络",
+    "description": "从内核收发包路径到 RDMA 高性能网络的体系化课程。以 AI 基础设施（分布式训练通信、推理服务网络、eBPF 可观测）为主线，强调'能解释内核数据面 + 能调优性能 + 能排障生产问题'三层能力。"
+  },
+  "modules": [
+    {
+      "slug": "net-stack-internals",
+      "name": "内核网络栈",
+      "order_index": 1,
+      "lessons": [
+        {
+          "slug": "tcp-kernel-path",
+          "order_index": 1,
+          "name": "TCP/IP 收发在内核的完整路径",
+          "prereq": [],
+          "est_minutes": 30,
+          "concept_md": "网络包从网线到用户态要经过：NIC DMA 写入 ring buffer → 硬中断触发 driver → NAPI poll 进入 softirq（`net_rx_action`）→ `__netif_receive_skb` 分配 `sk_buff` 并送入协议栈 → IP 层路由判决 → TCP 层重组、ACK、拥塞控制 → 数据拷贝到 socket receive buffer → `epoll` 唤醒用户态进程。发送路径反向：`sendmsg` → TCP 分段 → IP 路由 → `dev_queue_xmit` → Qdisc → driver TX ring → NIC DMA 发出。关键性能观测点：`/proc/net/softnet_stat` 的 dropped/time_squeeze 列反映 softirq 处理压力——AI 推理服务高并发时若 softirq 被单核瓶颈限制（默认绑 CPU0），会导致长尾延迟飙升。`perf top` 看到 `net_rx_action` 占比超过 30% 是信号。理解此路径是所有网络调优和排障的起点，后续的 RSS/RPS、socket buffer tuning、eBPF hook 点都锚定在这条路径上。",
+          "capstone": {
+            "prompt": "生产环境一台 8 卡 GPU 推理节点，每秒处理 2000+ 请求，监控发现 P99 延迟周期性飙到 50ms。`/proc/net/softnet_stat` 显示 CPU0 的 time_squeeze 持续增长，其余 CPU 全为 0。请分析：(1) 为什么所有 softirq 都在 CPU0 上？(2) 如何确认这是网络收包瓶颈而非其他 softirq？(3) 给出具体的 RSS/RPS 调优步骤把负载分散到多核。(4) 调优后如何验证效果？",
+            "depth": 3
+          }
+        },
+        {
+          "slug": "socket-buffer-tuning",
+          "order_index": 2,
+          "name": "Socket 缓冲区与 TCP 调优",
+          "prereq": ["tcp-kernel-path"],
+          "est_minutes": 25,
+          "concept_md": "每个 TCP socket 有独立的 send/receive buffer，由 `net.core.wmem_default/max` 和 `net.core.rmem_default/max` 控制全局默认值，TCP 专用参数 `net.ipv4.tcp_wmem/tcp_rmem` 以 min-default-max 三元组覆盖。TCP autotuning（默认开启）会根据 RTT 和带宽动态调整 buffer 到 max 上限。BDP（Bandwidth-Delay Product）= 带宽 × RTT 决定了理论最优 buffer 大小——100Gbps 链路、0.5ms RTT 的数据中心内网 BDP ≈ 6.25MB，`tcp_rmem` max 需至少 8MB。AI 推理场景中，大模型单次响应可达数十 MB（长文本 streaming），如果 `tcp_wmem` max 过小，发送端 `sk_stream_wait_memory` 阻塞导致 TTFT 抖动。关键诊断：`ss -tim` 看每连接的 `skmem` 字段——`r` 是接收已用、`rb` 是接收上限；`cwnd` × MSS 是当前发送窗口。`netstat -s` 的 `TCPMemoryPressures` 非零说明全局 TCP 内存不足，需要调大 `net.ipv4.tcp_mem`。",
+          "capstone": {
+            "prompt": "线上 vLLM 推理服务通过 Nginx 反代暴露，用户反馈长文本生成（>8K tokens）时 streaming 中间频繁卡顿 3-5 秒。排查发现短文本正常。请分析：(1) 从 socket buffer 角度解释为什么长文本才触发问题；(2) 用 `ss -tim` 如何定位瓶颈在发送端还是接收端；(3) 需要调哪些 sysctl 参数、调到多大、依据是什么；(4) Nginx `proxy_buffering` 和 `proxy_buffer_size` 如何与 TCP buffer 配合？",
+            "depth": 3
+          }
+        },
+        {
+          "slug": "routing-policy",
+          "order_index": 3,
+          "name": "路由表与策略路由",
+          "prereq": ["tcp-kernel-path"],
+          "est_minutes": 25,
+          "concept_md": "Linux 的路由决策不是简单查一张表。内核维护多张路由表（main 254、local 255、default 253 及自定义表），`ip rule` 定义的策略规则按 priority 从小到大匹配，决定用哪张表查路由。典型 GPU 节点有两张网卡：eth0 走管理网（SSH、K8s API、kubelet 通信），eth1/bond1 走高速数据网（NCCL 训练流量、存储 IO）。不做策略路由时，默认路由指向 eth0 网关，NCCL 流量也走 eth0——100Gbps 数据网白费。正确做法：`ip rule add from 192.168.1.0/24 table 100`，table 100 里默认路由指向 eth1 网关。更精细的场景用 `iptables -t mangle` 给特定端口打 fwmark 再 `ip rule add fwmark 0x1 table 100`。`ip route get <dst>` 是验证路由决策的最终武器——它显示包实际走哪张表、从哪个 src 出去。K8s 环境中 CNI 插件（Calico/Cilium）会注入大量路由规则，`ip rule show` 经常有几十条，排障时必须从上到下逐条理解匹配逻辑。",
+          "capstone": {
+            "prompt": "一个 8 卡 DGX 节点配置了 eth0（管理网 10.0.0.0/24）和 bond0（数据网 192.168.0.0/24），NCCL 训练时 `nstat` 显示所有流量走 eth0，bond0 上几乎没有流量。请分析：(1) 为什么 NCCL 流量会走 eth0？(2) 如何用策略路由把 NCCL 流量引导到 bond0？(3) 设置后如何用 `ip route get` 验证？(4) 如果节点上还运行着 Calico CNI，策略路由的 priority 需要怎么设置才不会被 Calico 的规则覆盖？",
+            "depth": 3
+          }
+        },
+        {
+          "slug": "tcp-congestion",
+          "order_index": 4,
+          "name": "TCP 拥塞控制",
+          "prereq": ["socket-buffer-tuning"],
+          "est_minutes": 30,
+          "concept_md": "拥塞控制决定 TCP 发送速率，直接影响 AI 训练集群的 allreduce 吞吐。CUBIC 是 Linux 默认算法，基于丢包反馈（loss-based），在数据中心浅 buffer 交换机上容易因为 buffer bloat 或 incast 导致吞吐震荡。BBR（v1/v2/v3）是 Google 的 model-based 算法，用 RTT 和 delivery rate 估算带宽，不依赖丢包信号——在 100Gbps 长肥管道上比 CUBIC 快 2-10 倍达到满速。但 BBR 与 CUBIC 流共存时会抢占带宽（unfairness 问题），BBRv3 部分缓解。DCTCP（Data Center TCP）专为数据中心设计，利用 ECN（Explicit Congestion Notification）交换机标记而非丢包来调速——要求交换机支持 ECN 且端到端启用。NCCL 默认用 TCP socket transport 时，`NCCL_SOCKET_NTHREADS` 和拥塞算法选择直接影响 allreduce 性能。切换算法：`sysctl net.ipv4.tcp_congestion_control=bbr`，需要内核 4.9+ 且加载 `tcp_bbr` 模块。per-socket 指定用 `setsockopt(TCP_CONGESTION)`。诊断拥塞：`ss -ti` 看 `bbr:(bw:...mrtt:...)` 或 `cubic:(cwnd:... ssthresh:...)`。",
+          "capstone": {
+            "prompt": "你们的 GPU 集群使用 TCP socket 做 NCCL 通信（非 RDMA），100Gbps 网卡但 `iperf3` 测试只跑到 40Gbps，延迟低（RTT<0.1ms）、无丢包。请分析：(1) CUBIC 在低延迟网络为什么跑不满带宽？(2) 切换到 BBR 后预期提升多少？BBR 适合这个场景吗？(3) 如果交换机支持 ECN，DCTCP 是否更好？为什么？(4) 如何在不影响管理网流量拥塞算法的前提下，只对 NCCL 端口使用不同算法？",
+            "depth": 3
+          }
+        },
+        {
+          "slug": "interrupt-affinity-multiqueue",
+          "order_index": 5,
+          "name": "中断亲和与多队列网卡",
+          "prereq": ["tcp-kernel-path"],
+          "est_minutes": 25,
+          "concept_md": "现代 100Gbps 网卡（Mellanox ConnectX-7、Intel E810）支持多队列（multi-queue），每个 RX/TX queue 有独立的中断号和 ring buffer。RSS（Receive Side Scaling）在网卡硬件层按包头 hash 分配 RX queue → 对应中断 → 特定 CPU，实现收包并行化。`ethtool -l eth0` 看队列数，`ethtool -x eth0` 看 hash 到 queue 的映射（indirection table），`/proc/interrupts` 看每个 queue 中断绑在哪个 CPU。RPS（Receive Packet Steering）是 RSS 的软件层替代，在 `net_rx_action` 中按 hash 把 skb 发送到目标 CPU 的 backlog——适合网卡 queue 数少于 CPU 核数的情况。XPS（Transmit Packet Steering）做发送方向的 CPU→queue 映射，减少 TX lock 竞争。AI 节点的关键实践：NCCL 通信线程 pin 在特定 NUMA 的 CPU 上（通过 `NCCL_SOCKET_IFNAME` 和 `taskset`），网卡中断也应该 pin 到同一 NUMA 的 CPU——否则跨 NUMA 的中断处理增加数微秒延迟。`irqbalance` 服务默认会动态迁移中断，生产 GPU 节点通常禁用它，手动设置 `/proc/irq/<N>/smp_affinity_list`。",
+          "capstone": {
+            "prompt": "一台 DGX H100 节点有 8 张 ConnectX-7（每张 4 port），NCCL allreduce 训练时 `mpstat` 显示 CPU 0-7 负载 90%+，其余 CPU 接近 idle，`perf top` 全是 `mlx5_cq_comp`。请分析：(1) 为什么中断集中在 CPU 0-7？(2) 如何查看当前每个网卡 queue 的中断 affinity？(3) 给出把中断分散到 NUMA-local CPU 的完整脚本思路；(4) 为什么不能简单地开启 irqbalance 解决？",
+            "depth": 3
+          }
+        }
+      ]
+    },
+    {
+      "slug": "net-namespace-veth",
+      "name": "容器网络基石",
+      "order_index": 2,
+      "lessons": [
+        {
+          "slug": "netns-veth-pair",
+          "order_index": 1,
+          "name": "Network Namespace 与 veth pair",
+          "prereq": ["tcp-kernel-path"],
+          "est_minutes": 25,
+          "concept_md": "Network namespace 是 Linux 内核的网络隔离单元，每个 namespace 有独立的网络设备列表、路由表、iptables 规则、socket 列表。容器 runtime 为每个容器（K8s 中是 Pod sandbox）创建一个 netns，通过 `/proc/<pid>/ns/net` 引用。veth（virtual ethernet）是成对出现的虚拟网卡——往一端写入的帧会从另一端读出，天然适合跨 namespace 通信。手动复现容器网络的核心操作：`ip netns add ns1` → `ip link add veth0 type veth peer name veth1` → `ip link set veth1 netns ns1` → 分别配 IP → `ip netns exec ns1 ping <veth0-ip>`。每个 veth pair 在内核中是 `net_device` 结构体的两个实例互相引用（`peer` 指针），`dev_queue_xmit` 在一端直接调用另一端的 `netif_rx`，不经过物理 NIC——但仍然过 netfilter（iptables）和 tc qdisc，这是理解容器网络策略的关键。性能方面，veth 的单流吞吐受限于单核 softirq，100Gbps 级别场景需要考虑 macvlan/ipvlan 或 SR-IOV 直通。",
+          "capstone": {
+            "prompt": "你需要在一台裸机上手动用 netns + veth 搭建两个「容器」互通的网络。请写出完整命令序列并回答：(1) 两个 netns 之间 veth 直连和通过 bridge 连接的区别是什么？各适合什么场景？(2) 在 veth pair 上抓包，两端都能抓到同一个包吗？(3) veth 流量是否经过宿主机的 iptables？(4) 如果 Pod 间通信延迟要求 <10μs，veth 方案是否合适？",
+            "depth": 2
+          }
+        },
+        {
+          "slug": "linux-bridge",
+          "order_index": 2,
+          "name": "Linux Bridge 与容器桥接网络",
+          "prereq": ["netns-veth-pair"],
+          "est_minutes": 25,
+          "concept_md": "Linux bridge 是内核中的二层交换机实现（`struct net_bridge`），多个网络设备 attach 到同一个 bridge 后，bridge 根据 MAC 表（FDB, Forwarding Database）在端口间转发帧。Docker 默认的 bridge 网络就是：docker0 bridge + 每容器一个 veth pair（宿主端 attach 到 docker0，容器端作为 eth0）。Bridge 工作流：帧从某端口进入 → 查 FDB 表找目标 MAC 对应的端口 → 如果找到则单播转发、找不到则 flood all ports → 同时学习源 MAC 到入端口的映射。`bridge fdb show` 看 MAC 表，`brctl showstp docker0` 看 STP 状态。关键细节：`net.bridge.bridge-nf-call-iptables=1` 时，bridge 转发的帧也会经过 iptables 的 FORWARD 链——这是 K8s NetworkPolicy 和 kube-proxy iptables 模式能对 Pod 流量生效的基础，但也带来性能开销。AI 集群中 bridge 模式的瓶颈在于：所有容器流量汇聚到 bridge 的单个 CPU 上做软件转发，100Gbps 场景下成为瓶颈。这是生产环境转向 macvlan/SR-IOV 的动力。",
+          "capstone": {
+            "prompt": "用 ip 命令手动搭建一个等价于 Docker bridge 网络的拓扑：一个 bridge、两个 netns、NAT 出公网。请回答：(1) 完整的命令序列是什么？(2) bridge 的 FDB 表是怎么建立的？`bridge fdb show` 能看到什么？(3) `bridge-nf-call-iptables` 这个 sysctl 关闭后，K8s NetworkPolicy 会失效吗？为什么？(4) 如果两个 Pod 在同一节点同一 bridge 上，流量路径中经过几次 netfilter？",
+            "depth": 2
+          }
+        },
+        {
+          "slug": "macvlan-ipvlan-detail",
+          "order_index": 3,
+          "name": "Macvlan/IPvlan 模式详解",
+          "prereq": ["linux-bridge"],
+          "est_minutes": 25,
+          "concept_md": "macvlan 和 ipvlan 都实现「让容器直接出现在物理网络上」而不经过 bridge 转发，性能接近物理网卡。macvlan 给每个子接口分配独立 MAC 地址——交换机看到多个 MAC，转发到同一物理端口。四种模式：bridge（子接口间本地转发）、VEPA（强制经交换机 hairpin）、private（子接口间完全隔离）、passthru（独占物理 NIC）。ipvlan 所有子接口共享父接口的 MAC，仅用 IP 区分——避免 MAC 地址爆炸问题，对交换机 MAC 表友好。L2 模式工作在二层（ARP 解析），L3 模式工作在三层（直接路由，不做 ARP）。GPU Pod 直通物理网络的典型选择：ipvlan L2 模式用于需要和物理网络同二层的场景（如 RDMA over RoCE 需要 L2 邻居发现），macvlan bridge 模式用于 Pod 间需要本地低延迟通信且交换机 MAC 表不是瓶颈的场景。CNI 插件如 `macvlan` 和 `ipvlan` 直接用 `ip link add link eth0 type macvlan/ipvlan` 创建子接口移入 Pod netns。局限：macvlan 子接口和父接口之间默认不能通信（需要交换机 hairpin 或额外路由），ipvlan 不能和父接口相同 IP 段通信（kernel 短路优化）。",
+          "capstone": {
+            "prompt": "你的 GPU 集群要让 Pod 直接使用物理网络 IP（不走 overlay），以便 RDMA RoCEv2 流量能正常的 L2 邻居发现。请分析：(1) macvlan 和 ipvlan 哪个更适合？为什么？(2) 如果选 macvlan bridge 模式，Pod 访问宿主机上的 kubelet 10250 端口会失败，为什么？怎么解决？(3) 交换机 MAC 表容量只有 4K，128 Pod 节点会有问题吗？(4) 如何测试 macvlan 下 Pod 的 RDMA 连通性？",
+            "depth": 2
+          }
+        },
+        {
+          "slug": "vlan-vxlan-geneve",
+          "order_index": 4,
+          "name": "VLAN/VXLAN/GENEVE 隧道",
+          "prereq": ["linux-bridge"],
+          "est_minutes": 30,
+          "concept_md": "VLAN（802.1Q）在二层帧中插入 4 字节 tag 实现同一物理交换机上的逻辑隔离，最多 4094 个 VLAN ID——对大规模容器网络不够用。VXLAN（RFC 7348）是三层 overlay：原始二层帧封装在 UDP（默认端口 4789）中传输，24-bit VNI 支持 1600 万个虚拟网络。内核中 VXLAN 由 `vxlan` 模块实现（`ip link add type vxlan`），FDB 表存储 inner MAC → outer VTEP IP 的映射，可静态配置或通过组播/控制面学习。Flannel VXLAN 模式和 Calico VxlanMode 都是这个机制。GENEVE（RFC 8926）是 VXLAN 的进化版，支持可变长度 TLV 选项头——Cilium 和 OVN 优先使用 GENEVE 因为它能携带元数据（如安全标签、trace ID）。关键性能影响：VXLAN/GENEVE 封装增加 50-54 字节包头开销，导致内层 MTU 从 1500 降到 ~1450——如果应用层不感知，会触发 IP 分片或 PMTUD 失败。AI 集群中 jumbo frame（MTU 9000）是标配，overlay MTU 应设为 8950 以避免分片。`ip link set vxlan0 mtu 8950` 或通过 CNI 配置 MTU。排障关键：`ip -d link show vxlan0` 看 VNI、端口、TTL 等参数；`bridge fdb show dev vxlan0` 看 VTEP 映射表。",
+          "capstone": {
+            "prompt": "集群使用 Flannel VXLAN 模式，训练任务 NCCL allreduce 吞吐只有裸金属的 60%，`ethtool -S eth0` 显示大量 `tx_errors`。请分析：(1) VXLAN 封装对 MTU 的影响——假设物理网络 MTU 9000，内层 MTU 应设多少？(2) 如果 NCCL 发送 64KB 消息，封装后会怎样？(3) PMTUD 在这个场景下有什么问题？(4) 用 `tc qdisc` 或 offload 能否缓解封装性能开销？(5) 为什么 AI 集群通常避免 overlay 而选 BGP 或 flat 网络？",
+            "depth": 3
+          }
+        }
+      ]
+    },
+    {
+      "slug": "netfilter-ebpf",
+      "name": "数据面",
+      "order_index": 3,
+      "lessons": [
+        {
+          "slug": "iptables-chains-tables",
+          "order_index": 1,
+          "name": "iptables 五链四表全解析",
+          "prereq": ["tcp-kernel-path"],
+          "est_minutes": 30,
+          "concept_md": "iptables 是 Linux netfilter 框架的用户态工具，操作内核中 5 条链（PREROUTING → INPUT/FORWARD/OUTPUT → POSTROUTING）和 4 张表（raw → mangle → nat → filter）的规则。包进入内核后按链的顺序经过 hook 点，每个 hook 点上按表优先级依次匹配规则。理解这套架构的核心是**表和链的交叉矩阵**：nat 表只出现在 PREROUTING/OUTPUT/POSTROUTING（新连接的首包才过 nat，后续包由 conntrack 自动转换），filter 表出现在 INPUT/FORWARD/OUTPUT。kube-proxy iptables 模式在 nat 表的 PREROUTING 和 OUTPUT 链插入 KUBE-SERVICES 跳转链，匹配 ClusterIP 后 DNAT 到后端 Pod IP——每个 Service 的每个 endpoint 一条规则。规则数量 = Services × Endpoints，5000 Service 集群轻松过万条规则，`iptables -L -n` 一次遍历消耗毫秒级 CPU。这就是 K8s 后来推 ipvs 和 eBPF 替代方案的直接原因。排障核心工具：`iptables -t nat -L KUBE-SERVICES -n --line-numbers` 看 Service 规则，`iptables -t nat -L KUBE-SEP-xxx -n` 看具体 endpoint DNAT 目标。`-v` 加计数器看规则命中次数。",
+          "capstone": {
+            "prompt": "集群有 3000 个 Service，运维发现 `iptables-save` 输出超过 10 万行，节点 CPU 每隔 30 秒有一个 spike。请分析：(1) CPU spike 的原因是什么？kube-proxy 是怎么更新 iptables 的？(2) 一个 Pod 访问 ClusterIP 时，包从 OUTPUT 链到达后端 Pod 的完整 iptables 路径是什么？(3) 如何量化 iptables 规则数对 per-packet 延迟的影响？(4) 迁移到 IPVS 或 Cilium eBPF 模式分别能解决什么问题？",
+            "depth": 3
+          }
+        },
+        {
+          "slug": "conntrack-nat",
+          "order_index": 2,
+          "name": "Conntrack 与 NAT 状态追踪",
+          "prereq": ["iptables-chains-tables"],
+          "est_minutes": 25,
+          "concept_md": "conntrack（connection tracking）是 netfilter 的有状态核心——它追踪每条连接（五元组）的状态（NEW/ESTABLISHED/RELATED/INVALID），使得 NAT 和有状态防火墙规则成为可能。内核在 `nf_conntrack` hash 表中存储 conntrack entry，每条连接占约 300 字节（含 NAT 映射）。`nf_conntrack_max` 控制最大条目数——默认值通常按内存计算（每 GB 内存 16384 条），K8s 节点跑大量短连接 Pod 时极易耗尽。`conntrack -L` 显示当前所有连接，`conntrack -C` 显示当前计数。当表满时新连接的首包被 `nf_conntrack_drop` 丢弃——表现为间歇性连接失败，`dmesg` 出现 `nf_conntrack: table full, dropping packet`。K8s 场景下 conntrack 的典型问题：(1) NodePort Service 的 SNAT 导致 conntrack 表膨胀——每个外部连接占两条 entry（original + reply）；(2) UDP DNS 查询使用相同源端口导致 conntrack 冲突（race condition），解决方案是 `net.netfilter.nf_conntrack_udp_timeout=10` 或用 `nodelocaldns` 避免 SNAT；(3) 短连接高频场景下 TIME_WAIT 状态的 conntrack entry 占位 120 秒（可调 `nf_conntrack_tcp_timeout_time_wait`）。",
+          "capstone": {
+            "prompt": "集群 200 节点跑训练任务，某天多个节点 Pod 间歇性 DNS 解析失败、Service 连接超时。`dmesg` 显示 `nf_conntrack: table full`。请分析：(1) `conntrack -S` 中哪个字段确认是 table full 导致丢包？(2) 为什么训练任务会导致 conntrack 表膨胀——NCCL 通信和 checkpoint 写入各产生什么类型的连接？(3) 临时扩容 `nf_conntrack_max` 后内存开销如何估算？(4) 长期方案：如何用 Cilium 的 conntrack-free Service 实现来根治？",
+            "depth": 3
+          }
+        },
+        {
+          "slug": "nftables-migration",
+          "order_index": 3,
+          "name": "nftables 与 iptables 迁移",
+          "prereq": ["iptables-chains-tables"],
+          "est_minutes": 20,
+          "concept_md": "nftables 是 Linux 内核 3.13+ 引入的 iptables 后继者，统一了 iptables/ip6tables/arptables/ebtables 四套工具为一套 `nft` 命令行。核心改进：(1) 用户态规则编译为字节码在内核虚拟机执行，一条 nft 规则可表达 iptables 多条规则的逻辑（如 set 匹配替代 N 条链式规则），O(1) 集合查找替代 O(N) 线性遍历；(2) 原子规则替换——`nft -f ruleset.nft` 一次性加载完整规则集，没有 iptables-restore 的瞬间不一致窗口；(3) 统一的 netlink 接口，便于程序化管理。K8s 1.29 的 kube-proxy 新增 nftables 后端模式（`--proxy-mode=nftables`），用 nft 集合（set）存储 Service → Endpoint 映射——5000 Service 场景下规则条数从 iptables 的 ~50000 降到 ~2000，per-packet 匹配延迟下降 70%。RHEL 9 / Debian 12+ 已默认 nftables，旧的 iptables 命令通过 `iptables-nft` 适配层翻译为 nftables 规则——但混用 iptables-legacy 和 iptables-nft 会导致规则不可见的 bug。迁移检查：`iptables -V` 确认是 legacy 还是 nf_tables 后端；`nft list ruleset` 看完整规则集。",
+          "capstone": {
+            "prompt": "你们集群升级到 RHEL 9 节点后，kube-proxy iptables 规则「消失」——`iptables -L` 显示空但 Service 正常工作。请分析：(1) 为什么规则「消失」了？RHEL 9 的 iptables 实际是什么？(2) 如何正确查看当前生效的规则？(3) 如果要切换到 kube-proxy nftables 模式，需要哪些前置条件？(4) nftables 模式下 Service 规则数量为什么大幅下降？",
+            "depth": 2
+          }
+        },
+        {
+          "slug": "ebpf-fundamentals",
+          "order_index": 4,
+          "name": "eBPF 基础：程序类型与 map",
+          "prereq": ["iptables-chains-tables"],
+          "est_minutes": 35,
+          "concept_md": "eBPF（extended Berkeley Packet Filter）允许在内核中安全运行用户定义的沙箱程序，不需要修改内核源码或加载内核模块。程序类型决定了 eBPF 程序的 hook 点和能力：`BPF_PROG_TYPE_XDP` attach 在网卡驱动层（最早的包处理点），可以在 softirq 之前做 drop/redirect/pass——Cilium 用 XDP 实现高性能 L3/L4 负载均衡，单核处理 >10Mpps；`BPF_PROG_TYPE_SCHED_CLS` attach 在 tc（traffic control）的 ingress/egress 上，Cilium 的 per-Pod 策略执行在这里；`BPF_PROG_TYPE_SOCKET_FILTER` attach 在 socket 上做包过滤。eBPF map 是内核中的键值存储，程序和用户态通过 map 共享数据。常用 map 类型：`BPF_MAP_TYPE_HASH`（通用 hash 表，Cilium 存 conntrack entry）、`BPF_MAP_TYPE_LPM_TRIE`（最长前缀匹配，用于路由/CIDR 查找）、`BPF_MAP_TYPE_PERF_EVENT_ARRAY`（向用户态推送事件）、`BPF_MAP_TYPE_RINGBUF`（高效环形缓冲区，perf_event_array 的替代）。Cilium 的数据面用 eBPF 完全替代了 kube-proxy：Service DNAT 在 tc/XDP 层完成，conntrack 用 BPF hash map 替代 nf_conntrack——绕过整个 netfilter 栈，per-packet 延迟降低 5-10 倍。开发 eBPF 程序的工具链：libbpf（C）、cilium/ebpf（Go）、aya（Rust）。",
+          "capstone": {
+            "prompt": "你要向团队解释为什么从 kube-proxy iptables 迁移到 Cilium eBPF 数据面。请回答：(1) Cilium 用哪些 eBPF 程序类型分别实现了什么功能？(2) Cilium 的 conntrack 为什么不用内核 nf_conntrack 而自己在 BPF map 中实现？这带来什么好处和风险？(3) XDP 模式和 tc 模式的 Cilium 分别在什么位置处理包？性能差异多大？(4) 如果 eBPF verifier 拒绝了 Cilium 的程序（内核版本过低），会发生什么？",
+            "depth": 3
+          }
+        },
+        {
+          "slug": "ebpf-observability",
+          "order_index": 5,
+          "name": "eBPF 网络可观测",
+          "prereq": ["ebpf-fundamentals"],
+          "est_minutes": 25,
+          "concept_md": "eBPF 让网络可观测从「在固定位置抓包」进化为「在内核任意函数上埋点」。Hubble 是 Cilium 的可观测层——通过 eBPF 在 datapath 关键位置（socket connect/close、L3/L4/L7 事件）采集流日志，提供 `hubble observe` CLI 和 UI 查看 Pod 间流量、DNS 请求、HTTP 状态码。无需 tcpdump 就能看到完整的 service map。pwru（packet, where are you?）是 Cilium 团队的包追踪工具——用 kprobe/fentry attach 到内核网络栈的数百个函数上，追踪单个包在内核中经过的每一个函数和返回值。`pwru --filter-dst 10.0.0.5 --filter-dport 80` 可以精确看到包从 `netif_receive_skb` → `ip_rcv` → `nf_hook_slow`（netfilter）→ `tcp_v4_rcv` 的完整路径，如果包被某个 hook 丢弃，能看到是哪个函数返回了 NF_DROP。bpftrace 提供类似 DTrace 的高级语法，`bpftrace -e 'kprobe:tcp_retransmit_skb { printf(\"retrans: %s\\n\", comm); }'` 实时监控 TCP 重传。在 AI 集群中的应用：(1) 用 Hubble 监控 NCCL 通信的 TCP 连接状态和流量矩阵；(2) 用 pwru 排查 NetworkPolicy 或 iptables 规则意外丢包；(3) 用 bpftrace 追踪 `tcp_retransmit_skb` 定位训练集群中的网络抖动源。",
+          "capstone": {
+            "prompt": "NCCL allreduce 训练任务偶尔超时，怀疑是间歇性丢包。tcpdump 抓了 10 分钟没有发现异常。请分析：(1) tcpdump 为什么可能抓不到丢包证据？(2) 如何用 pwru 追踪被丢弃的包——具体的 filter 和预期输出是什么？(3) 如何用 bpftrace 统计每秒 TCP 重传次数和源目标 IP？(4) 如果集群部署了 Cilium，Hubble 能提供什么额外信息？",
+            "depth": 3
+          }
+        }
+      ]
+    },
+    {
+      "slug": "rdma-hpc-networking",
+      "name": "高性能网络",
+      "order_index": 4,
+      "lessons": [
+        {
+          "slug": "rdma-verbs",
+          "order_index": 1,
+          "name": "RDMA 概念与 Verbs API",
+          "prereq": ["tcp-kernel-path"],
+          "est_minutes": 35,
+          "concept_md": "RDMA（Remote Direct Memory Access）允许一台机器直接读写远程机器的内存，绕过双方的 CPU 和内核协议栈——实现 kernel bypass + zero-copy。用户态程序通过 Verbs API（libibverbs）直接操作网卡硬件队列：创建 QP（Queue Pair，发送队列 SQ + 接收队列 RQ）、注册 MR（Memory Region，pin 住物理页供网卡 DMA 访问）、post Send/Receive WR（Work Request）到 QP、poll CQ（Completion Queue）获取完成通知。三种操作类型：SEND/RECV（双方参与，类似 TCP），RDMA Write（单方写远端内存，远端 CPU 无感知），RDMA Read（单方读远端内存）。RDMA Write 是分布式训练的核心——NCCL allreduce 的 IB transport 用 RDMA Write 直接把梯度数据写到对端 GPU 或 host 内存，省去了 TCP 的拷贝-系统调用-拥塞控制-ACK 整条开销路径。延迟对比：TCP 走内核栈约 30-50μs，RDMA 端到端约 1-3μs。吞吐对比：单流 TCP 在 100Gbps 上很难跑满（受限于 CPU 和协议栈开销），RDMA 单 QP 即可跑满 200Gbps（HDR InfiniBand）。用户态 RDMA 编程的核心挑战是内存管理——MR 注册要求物理页 pin 住（不能 swap），大量 MR 注册可能耗尽 `ulimit -l`（locked memory limit），需设置 unlimited。",
+          "capstone": {
+            "prompt": "你要向团队解释为什么分布式训练从 TCP 切到 RDMA 后 allreduce 吞吐提升 3 倍。请回答：(1) 画出 TCP 发送路径和 RDMA Write 路径的对比——各经过哪些组件？(2) Verbs API 的 QP、MR、CQ 分别对应 TCP 编程中的什么概念？(3) 为什么 RDMA 要求 Memory Region 物理页 pin 住？如果不 pin 会怎样？(4) NCCL 使用 RDMA Write 还是 SEND/RECV？为什么？",
+            "depth": 3
+          }
+        },
+        {
+          "slug": "ib-vs-roce",
+          "order_index": 2,
+          "name": "InfiniBand vs RoCEv2 选型",
+          "prereq": ["rdma-verbs"],
+          "est_minutes": 30,
+          "concept_md": "RDMA 有三种传输协议：InfiniBand（IB）、RoCE（RDMA over Converged Ethernet）v1/v2、iWARP。AI 集群主流选 IB 或 RoCEv2。InfiniBand 是独立的网络体系——专用交换机、子网管理器（SM/OpenSM/UFM）、基于 credit 的流控（无丢包网络），HDR 200Gbps、NDR 400Gbps、XDR 800Gbps。IB 的优势是确定性低延迟和无丢包保证——credit-based flow control 在链路层就控制发送速率，不需要 TCP 式的拥塞控制。代价是专用硬件成本高、运维需要 IB 专业知识（`ibstat`、`ibdiagnet`、SM 管理）。RoCEv2 把 RDMA 封装在标准以太网 UDP 上（端口 4791），复用现有以太网交换机基础设施——成本低、运维团队熟悉。但以太网本质上是有丢包的，RoCEv2 依赖 DCB（Data Center Bridging）特性保证无丢包：PFC（Priority Flow Control，IEEE 802.1Qbb）在端口 buffer 满时发 PAUSE 帧暂停发送方，ECN（Explicit Congestion Notification）+ DCQCN（Data Center QCN）实现端到端拥塞控制。PFC 的风险是 deadlock——环形拓扑中 PFC 帧循环传播导致整个网络暂停（PFC storm）。生产实践：`mlnx_qos` 配置 PFC 优先级，`cma_roce_tos` 设置 RoCE DSCP 值映射到 PFC 优先级。选型决策：预算充足 + 超大规模训练（>1000 GPU）→ IB；成本敏感 + 中小规模 + 复用以太网基础设施 → RoCEv2。",
+          "capstone": {
+            "prompt": "你要为一个 512 卡 H100 训练集群选择网络方案：IB NDR 或 RoCEv2 400GbE。请回答：(1) 从 NCCL allreduce 性能角度，两者差距有多大？数据来源是什么？(2) RoCEv2 需要配置哪些 DCB 特性？每个特性解决什么问题？(3) PFC storm 是什么？如何预防？(4) 如果预算必须选 RoCEv2，有哪些必须的网络交换机要求？",
+            "depth": 3
+          }
+        },
+        {
+          "slug": "gpudirect-rdma",
+          "order_index": 3,
+          "name": "GPUDirect RDMA 与 GDR Copy",
+          "prereq": ["rdma-verbs"],
+          "est_minutes": 30,
+          "concept_md": "标准 RDMA 路径：GPU 显存 → `cudaMemcpy` 到 host memory → RDMA NIC DMA 从 host memory 发出。这个 GPU→CPU→NIC 的两次拷贝是瓶颈。GPUDirect RDMA（GDR）让网卡直接 DMA 访问 GPU 显存——通过 `nvidia-peermem` 内核模块在 PCIe 层建立 GPU BAR 空间和 RDMA NIC 之间的 peer-to-peer 映射。数据路径变为 GPU 显存 → PCIe → RDMA NIC，绕过 CPU 和 host memory。NCCL 的 IB transport 在检测到 GDR 可用时自动启用（`NCCL_NET_GDR_LEVEL=5`），单卡 allreduce 带宽提升 20-40%。前提条件：(1) GPU 和 RDMA NIC 在同一 PCIe root complex 下（否则跨 NUMA 的 P2P 要过 CPU QPI/UPI 总线，性能反而下降）；(2) `nvidia-peermem` 模块已加载（`lsmod | grep nvidia_peermem`）；(3) IOMMU 关闭或配置为 passthrough（IOMMU 会拦截 P2P DMA）。GDR Copy 是 GPUDirect RDMA 的补充——对于小消息（<64KB），GDR 的 PCIe BAR mapping 反而比 host bounce buffer 慢（BAR 空间是 uncacheable 的 MMIO），GDR Copy 用 CPU 显式拷贝 GPU BAR 空间来加速小消息，阈值由 `NCCL_GDRCOPY` 环境变量控制。DGX/HGX 系统的 PCIe 拓扑设计保证每张 GPU 都有一张「本地」RDMA NIC——`nvidia-smi topo -m` 的 NIC 列显示 PIX（同一 PCIe Switch）关系。",
+          "capstone": {
+            "prompt": "分布式训练开启 GPUDirect RDMA 后性能反而下降 15%。`nvidia-smi topo -m` 显示 GPU0 到 mlx5_0 是 SYS（跨 NUMA）。请分析：(1) 为什么 GDR 在跨 NUMA 拓扑下性能下降？数据路径是什么？(2) 如何正确检查 GPU-NIC 的 PCIe 亲和关系？(3) 给出 NCCL 环境变量配置让每张 GPU 只用拓扑最近的 NIC；(4) `nvidia-peermem` 模块没有加载时 NCCL 的 fallback 行为是什么？",
+            "depth": 3
+          }
+        },
+        {
+          "slug": "nccl-transport",
+          "order_index": 4,
+          "name": "NCCL Transport 层",
+          "prereq": ["rdma-verbs", "gpudirect-rdma"],
+          "est_minutes": 30,
+          "concept_md": "NCCL（NVIDIA Collective Communications Library）的 transport 层负责选择 GPU 间通信的物理路径。三种 transport：(1) P2P（NVLink/PCIe）——同节点 GPU 间直接 DMA，NVLink 带宽 900GB/s（NVSwitch，H100），PCIe Gen5 约 64GB/s，`NCCL_P2P_LEVEL` 控制启用粒度；(2) SHM（Shared Memory）——同节点但无 P2P 能力时退化到 host memory 中转，性能最差；(3) NET——跨节点通信，包含 Socket（TCP）和 IB（RDMA/InfiniBand verbs）两个子 plugin，由 `NCCL_NET_PLUGIN` 指定。NCCL 初始化时自动探测拓扑：读取 PCIe 树、NVLink 连接、RDMA NIC 位置，构建最优的 ring/tree/nvls 通信拓扑。`NCCL_DEBUG=INFO` 输出选择的 transport、channel 数量和拓扑图——这是调优的第一步。关键环境变量：`NCCL_SOCKET_IFNAME`（指定 socket transport 使用的网卡，避免走管理网），`NCCL_IB_HCA`（指定 IB transport 使用的 HCA 设备，如 `mlx5_0:1` 表示设备 0 端口 1），`NCCL_CROSS_NIC=1`（允许跨 NIC rail 通信），`NCCL_NET_GDR_LEVEL`（GPUDirect RDMA 启用级别），`NCCL_ALGO`（通信算法：Ring/Tree/CollNet/NVLSTree），`NCCL_NCHANNELS_PER_NET_PEER`（每对节点的网络 channel 数）。CollNet 是 NCCL 的 in-network reduction——利用 InfiniBand SHARP 在交换机上做 allreduce 聚合，进一步减少网络流量。排障核心：`NCCL_DEBUG=INFO` + `NCCL_DEBUG_SUBSYS=NET,GRAPH` 可以看到 transport 选择理由、channel 分配和 ring/tree 拓扑——如果看到 `NET/Socket` 而不是 `NET/IB` 说明 RDMA 没有正确启用。",
+          "capstone": {
+            "prompt": "64 节点 H100 训练，`NCCL_DEBUG=INFO` 日志显示跨节点通信使用 `NET/Socket` 而非 `NET/IB`，allreduce 带宽只有 5GB/s（预期 >50GB/s）。请排查：(1) 列出所有可能导致 NCCL 回退到 Socket transport 的原因（至少 5 个）；(2) 如何确认 RDMA NIC 在容器内可见且功能正常？(3) `NCCL_IB_HCA` 和 `NCCL_SOCKET_IFNAME` 应该怎么设？(4) 修复后如何验证确实走了 IB transport 且启用了 GDR？",
+            "depth": 3
+          }
+        },
+        {
+          "slug": "multus-sriov-k8s",
+          "order_index": 5,
+          "name": "Multus + SR-IOV 在 K8s 上的 RDMA",
+          "prereq": ["nccl-transport", "netns-veth-pair"],
+          "est_minutes": 30,
+          "concept_md": "K8s 默认每个 Pod 只有一张网卡（eth0，由主 CNI 管理）。GPU 训练 Pod 需要额外的高速 RDMA 网卡。Multus CNI 是 meta-plugin——它允许 Pod 通过 `NetworkAttachmentDefinition` CRD 附加多张网卡，主 CNI 仍然负责 eth0（集群网络），Multus 调用额外 CNI 插件创建 net1/net2 等接口。SR-IOV（Single Root I/O Virtualization）在物理网卡上创建多个 VF（Virtual Function）——每个 VF 是独立的 PCIe 设备，可以直通给 Pod 获得接近裸金属的性能。部署栈：sriov-network-operator → 自动创建 VF（`echo 8 > /sys/class/net/eth1/device/sriov_numvfs`）→ sriov-device-plugin 向 kubelet 注册 VF 为 extended resource（如 `intel.com/sriov_rdma`）→ Pod 请求资源 + Multus annotation → device-plugin Allocate VF → sriov-cni 把 VF 移入 Pod netns 并配 IP。RDMA 需要额外配置：`rdma system set netns exclusive` 使 RDMA 设备跟随 netns，或使用 `rdma-shared-device-plugin` 以 shared 模式暴露 RDMA 设备。关键问题：VF 数量有限（通常 per-PF 最多 128 个），需要合理规划；VF 的 RDMA 功能需要固件和驱动支持（Mellanox ConnectX-6+ 默认支持）；SR-IOV VF 绕过了宿主机网络栈，NetworkPolicy 对 VF 流量不生效——安全策略需在交换机或 VF QoS 层面实施。",
+          "capstone": {
+            "prompt": "你要在 K8s 集群上为 GPU 训练 Pod 配置 RDMA 网络：每个 Pod 需要 8 张 GPU + 对应的 RDMA NIC。请设计完整方案并回答：(1) sriov-network-operator 的 SriovNetworkNodePolicy 怎么写才能自动创建 VF？(2) Pod 的 annotation 和 resource request 怎么写？(3) 如何保证每张 GPU 分配到拓扑最近的 RDMA VF？(4) SR-IOV VF 直通后 Cilium NetworkPolicy 对 RDMA 流量是否生效？安全如何保证？",
+            "depth": 3
+          }
+        },
+        {
+          "slug": "prefill-decode-network",
+          "order_index": 6,
+          "name": "Prefill-Decode 分离的网络拓扑",
+          "prereq": ["nccl-transport", "socket-buffer-tuning"],
+          "est_minutes": 25,
+          "concept_md": "大规模 LLM 推理的趋势是 disaggregated serving——Prefill（计算密集）和 Decode（内存带宽密集）阶段分离到不同 GPU 上运行。Prefill 节点处理 prompt，生成 KV cache，然后通过网络传输 KV cache 到 Decode 节点继续自回归生成。KV cache 传输的带宽需求：以 Llama 3 70B 为例，FP16 精度下每个 token 的 KV cache 约 1.3MB（80 层 × 8 头 × 128 维度 × 2(K+V) × 2 字节），4K context 的 KV cache 约 5.2GB——Prefill 节点在毫秒级完成计算后必须在 <10ms 内传完，要求 >400Gbps 的网络带宽。传输协议选择：(1) TCP + zero-copy sendfile——简单但 CPU 开销大，适合 RoCEv2 环境没有 IB verbs 时的 fallback；(2) RDMA Write 直传——mooncake-transfer-engine、Nixlp 等框架用 RDMA 直接写 Decode 端 GPU 显存，延迟最低；(3) NCCL Send/Recv——复用 NCCL 基础设施但 overhead 高于原生 verbs。网络拓扑设计：Prefill-Decode 之间需要独立的高速网络平面（与训练网络复用或独立），避免和推理请求流量、监控流量竞争带宽。实践中 Prefill 和 Decode 节点通常在同一机柜或相邻机柜，leaf-spine 拓扑下保证跨 ToR 带宽充足。关键观测指标：KV cache transfer latency（P99 <10ms）、网络利用率（应持续 >70%）、Decode 端等待 KV cache 的 stall time。",
+          "capstone": {
+            "prompt": "你要设计一个 Llama 3 70B 的 disaggregated serving 系统：16 Prefill GPU + 32 Decode GPU，要求 TTFT <200ms。请回答：(1) 估算 4K context 的 KV cache 大小和所需传输带宽；(2) 用 RDMA Write 传输时，Prefill 端和 Decode 端的内存管理怎么做？(3) 网络拓扑如何设计保证 Prefill→Decode 带宽？(4) 如果传输延迟偶尔 spike 到 50ms，排障从哪里入手？",
+            "depth": 3
+          }
+        }
+      ]
+    },
+    {
+      "slug": "net-troubleshoot",
+      "name": "网络排障",
+      "order_index": 5,
+      "lessons": [
+        {
+          "slug": "ss-ip-ethtool",
+          "order_index": 1,
+          "name": "ss/ip/ethtool 基础排障",
+          "prereq": ["tcp-kernel-path"],
+          "est_minutes": 20,
+          "concept_md": "`ss` 是 `netstat` 的现代替代，直接读取内核 netlink 接口而非 `/proc/net/tcp`，万级连接下快两个数量级。`ss -tlnp` 看监听端口+进程，`ss -ti` 看每条 TCP 连接的内部状态（cwnd、rtt、retrans、skmem），`ss -s` 看全局 socket 统计。AI 推理服务排障第一步：`ss -ti dst <backend-ip>` 看到 `retrans:5` 说明有重传，`skmem:(r128000,rb2097152)` 说明接收 buffer 使用率低可能是发送端瓶颈。`ip` 命令族覆盖 L2-L3 全部配置：`ip addr` 看 IP/MAC，`ip route` 看路由表，`ip neigh` 看 ARP/NDP 表（ARP 表满导致间歇丢包是经典问题），`ip rule` 看策略路由，`ip link` 看接口状态和 MTU。`ip -s link show eth0` 的 `RX errors/dropped` 和 `TX errors/dropped` 是网卡层丢包第一信号。`ethtool` 深入网卡硬件层：`ethtool eth0` 看速率协商（Speed: 100000Mb/s）、双工模式，`ethtool -S eth0` 看网卡硬件统计（rx_dropped_by_queue、tx_pause 等，含义因驱动而异），`ethtool -k eth0` 看 offload 状态（tso/gso/gro），`ethtool -g eth0` 看 ring buffer 大小。GPU 节点上 `ethtool -S` 的 `rx_out_of_buffer` 持续增长说明 ring buffer 太小——`ethtool -G eth0 rx 8192` 扩大。",
+          "capstone": {
+            "prompt": "一台推理节点上的 vLLM 服务间歇性返回 502，Nginx 日志显示 upstream timeout。请用 ss/ip/ethtool 三件套排障：(1) 如何确认 vLLM 进程在监听且 TCP backlog 没有溢出？(2) `ss -ti` 哪些字段能区分是网络丢包还是应用处理慢？(3) `ethtool -S` 中哪些计数器指向网卡层丢包？(4) 如果发现 `ip neigh` 中后端 IP 状态是 STALE/FAILED，说明什么？",
+            "depth": 2
+          }
+        },
+        {
+          "slug": "tcpdump-wireshark",
+          "order_index": 2,
+          "name": "tcpdump 与 Wireshark 抓包分析",
+          "prereq": ["ss-ip-ethtool"],
+          "est_minutes": 25,
+          "concept_md": "tcpdump 在 libpcap 层面（AF_PACKET socket）捕获经过指定接口的包，是网络排障的「最终真相」——如果 tcpdump 看到包了，说明内核协议栈确实收到了；看不到，问题在更底层（网卡、交换机）。关键用法：`tcpdump -i eth0 -nn host 10.0.0.5 and port 8080 -w /tmp/cap.pcap` 抓包写文件后用 Wireshark 分析。容器场景下抓包位置很关键：在宿主机 veth 端抓到的是封装前的包（可能有 VXLAN header），在 Pod netns 内抓到的是 Pod 视角的包。`nsenter -n -t <pid> tcpdump -i eth0` 进入 Pod netns 抓包。Wireshark 分析技巧：(1) `tcp.analysis.retransmission` 过滤重传——看重传间隔判断是 RTO 重传（指数退避）还是 Fast Retransmit（3 个 dup ACK）；(2) `tcp.analysis.zero_window` 过滤零窗口——接收方 buffer 满了；(3) `tcp.time_delta > 0.1` 找慢响应；(4) Statistics → TCP Stream Graph → Round Trip Time 看 RTT 变化趋势。生产注意事项：高流量接口上不加 filter 的 tcpdump 会导致 CPU 飙升和丢包（tcpdump 本身在用户态处理每个包），必须用 BPF filter 缩小范围。`tcpdump -c 10000` 限制包数避免磁盘爆炸。",
+          "capstone": {
+            "prompt": "推理服务反代链路 Client → Nginx → vLLM，客户端报 TTFT（Time To First Token）>5s 但 vLLM 日志显示处理仅 200ms。请设计抓包方案：(1) 在哪些位置抓包才能定位延迟在 Client→Nginx 还是 Nginx→vLLM？(2) Nginx 是 Pod 部署的，如何进入它的 netns 抓包？(3) 用 Wireshark 的哪些分析功能定位 TCP 层延迟？(4) 如果发现 Nginx→vLLM 方向有大量 TCP Zero Window，说明什么？怎么解决？",
+            "depth": 3
+          }
+        },
+        {
+          "slug": "ebpf-tracing",
+          "order_index": 3,
+          "name": "eBPF 追踪 bpftrace/pwru",
+          "prereq": ["ebpf-observability", "tcpdump-wireshark"],
+          "est_minutes": 30,
+          "concept_md": "tcpdump 只能在 AF_PACKET 这一个观测点抓包——如果包在到达这个点之前就被丢弃（如 XDP drop、netfilter drop、tc action），tcpdump 看不到。eBPF 追踪工具补全了这个盲区。pwru 的原理：用 kprobe/fentry 批量 attach 到内核网络栈的所有函数（`__netif_receive_skb`、`ip_rcv`、`nf_hook_slow`、`tcp_v4_rcv` 等数百个），通过 skb 指针跟踪同一个包在不同函数间的传递。输出类似：`[__netif_receive_skb] → [ip_rcv] → [ip_rcv_finish] → [nf_hook_slow(NF_DROP)]`——最后一行告诉你包被 netfilter 丢弃了。`pwru` 的 filter 支持五元组和 netns，适合在容器环境追踪特定 Pod 的丢包。bpftrace 更灵活——自定义 probe 语法可以 attach 到任意内核函数或 tracepoint：`kprobe:nf_hook_slow { @[kstack] = count(); }` 统计每个 netfilter hook 的调用栈，定位哪条 iptables 规则导致 drop。`tracepoint:skb:kfree_skb` 是追踪丢包的核心 tracepoint——内核每次释放被丢弃的 skb 时触发，附带丢弃原因（reason 字段，5.17+ 内核）。在 AI 集群的实际应用：训练任务间歇性 timeout → 先用 `bpftrace` 的 `kfree_skb` tracepoint 确认丢包位置和原因 → 如果是 netfilter → 用 `pwru` 追踪具体被哪条 iptables 规则 drop → 修复规则或切换到 Cilium eBPF 数据面。",
+          "capstone": {
+            "prompt": "NCCL 训练任务偶尔在某个节点 timeout，tcpdump 在 Pod 的 eth0 上没有看到对端发来的包（但对端 tcpdump 显示已发出）。请用 eBPF 工具排查：(1) 包到达了宿主机物理网卡但没到 Pod eth0，可能被丢在哪些位置？(2) 用 pwru 怎么追踪这个包的内核路径？给出具体命令；(3) 如果 pwru 显示包在 `nf_hook_slow` 被 NF_DROP，如何定位是哪条 iptables 规则？(4) 如果丢包发生在 tc ingress qdisc，用什么工具排查？",
+            "depth": 3
+          }
+        },
+        {
+          "slug": "mtu-mss-pmtud",
+          "order_index": 4,
+          "name": "MTU/MSS 问题与 PMTUD",
+          "prereq": ["vlan-vxlan-geneve", "tcpdump-wireshark"],
+          "est_minutes": 25,
+          "concept_md": "MTU（Maximum Transmission Unit）是链路层单帧最大载荷——以太网默认 1500 字节，jumbo frame 9000 字节。MSS（Maximum Segment Size）是 TCP 单段最大数据量 = MTU - IP头(20) - TCP头(20) = 1460（标准以太网）。TCP 在三次握手的 SYN 包中交换 MSS option，双方取较小值。PMTUD（Path MTU Discovery）让发送方发现路径上最小 MTU：发送端设置 IP 头的 DF（Don't Fragment）标志，路径上 MTU 不足的路由器返回 ICMP Fragmentation Needed 消息携带 next-hop MTU——发送端据此降低发送包大小。问题在于：很多防火墙/安全组错误地丢弃 ICMP，导致 PMTUD 失败（黑洞），表现为 TCP 握手成功（SYN 包小）但大数据包无法传输（挂起/超时）——这是 overlay 网络最常见的「能 ping 通但传不了数据」的根因。VXLAN 封装增加 50 字节包头（外层 Ethernet 14 + IP 20 + UDP 8 + VXLAN 8），物理网络 MTU 1500 时内层 MTU 只有 1450——如果 Pod 发送 1500 字节的帧，外层封装后 1550 超过物理 MTU。解决方案：(1) 全链路配 jumbo frame（物理交换机 + 服务器网卡 MTU 9000）；(2) CNI 正确设置 Pod 内 MTU（如 Calico 的 `vxlanMTU: 8950`）；(3) TCP MSS clamping（`iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu`）。排障：`ping -M do -s 1472 <dst>` 测试路径 MTU；`tcpdump` 看是否有 ICMP Fragmentation Needed 回来；`ip route get <dst>` 看缓存的 PMTU 值。",
+          "capstone": {
+            "prompt": "Calico VXLAN 模式的集群，跨节点 Pod 间 `curl` 小请求正常但下载大文件卡住不动。`ping -s 1400` 正常、`ping -s 1450` 超时。请分析：(1) 为什么小包正常大包卡住？从 MTU/MSS/PMTUD 角度完整解释；(2) 抓包应该看什么来确认是 PMTUD 黑洞？(3) 给出三种不同层次的修复方案（物理层/CNI 层/iptables 层）；(4) 修复后如何全面验证各种包大小都正常？",
+            "depth": 3
+          }
+        },
+        {
+          "slug": "rdma-perftest",
+          "order_index": 5,
+          "name": "RDMA perftest 与 IB 诊断",
+          "prereq": ["rdma-verbs", "ib-vs-roce"],
+          "est_minutes": 25,
+          "concept_md": "perftest 是 RDMA 的 iperf——`ib_write_bw`、`ib_read_bw`、`ib_send_bw` 分别测试 RDMA Write/Read/Send 的带宽，`ib_write_lat` 等测试延迟。基本用法：server 端 `ib_write_bw -d mlx5_0`，client 端 `ib_write_bw -d mlx5_0 <server-ip>`，输出每种消息大小的带宽和延迟。关键参数：`-s <size>` 指定消息大小，`-n <iters>` 指定迭代次数，`-F` 不使用 CPU warm-up（测试冷启动性能），`--report_gbits` 以 Gbps 为单位输出。GPU 场景加 `--use_cuda=0` 测试 GPUDirect RDMA 带宽——直接从 GPU0 显存到远端。IB 诊断工具：`ibstat` 看 HCA 端口状态（State: Active、Physical state: LinkUp、Rate: 400）——Rate 不是预期值说明链路协商有问题（线缆质量或交换机端口配置）；`ibdiagnet` 做全网健康检查——扫描子网拓扑、检测链路错误、发现端口 down/degraded，输出报告文件；`ibswitches` 列出子网内所有交换机；`iblinkinfo` 显示所有链路状态和速率。RoCEv2 环境用 `show_gids` 查看 GID 表（相当于 RDMA 的 IP 地址），`rdma link show` 看 RDMA 设备状态。常见问题：(1) perftest 报 `Couldn't find matching GID` ——RoCE 的 GID 表没有包含使用的 IP，检查 RoCE 网卡是否配了 IP；(2) 带宽远低于标称值——检查 `ethtool -S` 的 `rx_pci_signal_integrity` 和 `phy_corrected_bits`，可能是光模块或线缆问题；(3) `ibdiagnet` 报 `symbol error` ——物理层错误，需要更换线缆。",
+          "capstone": {
+            "prompt": "新部署的 400Gbps NDR IB 集群，`ib_write_bw` 测试两节点间带宽只有 200Gbps（预期 ~380Gbps）。请排查：(1) `ibstat` 应该看哪些字段确认链路状态正常？(2) 如果 Rate 显示 200Gbps 而非 400Gbps，可能原因是什么？(3) `ibdiagnet` 报告中哪些错误计数器需要关注？(4) 如果链路正常但带宽仍低，perftest 的哪些参数需要调优（QP 数、outstanding WR 数等）？",
+            "depth": 3
+          }
+        },
+        {
+          "slug": "llm-streaming-tuning",
+          "order_index": 6,
+          "name": "LLM 推理长连接/SSE 流式调优",
+          "prereq": ["socket-buffer-tuning", "tcpdump-wireshark"],
+          "est_minutes": 25,
+          "concept_md": "LLM 推理服务通过 SSE（Server-Sent Events）或 HTTP/2 streaming 逐 token 推送响应——每个 token 生成耗时 30-100ms，单次请求持续数十秒。这种模式对网络栈的挑战：(1) Nagle 算法（`TCP_NODELAY`）——默认 TCP 会等凑够一个 MSS 再发送，SSE 的小消息（几十字节/token）会被延迟最多 200ms，必须设 `TCP_NODELAY` 或在 Nginx 中 `proxy_set_header Connection ''` + `tcp_nodelay on`；(2) Nginx `proxy_buffering on`（默认）会缓存 upstream 完整响应再转发给 client——对 streaming 是灾难性的，必须 `proxy_buffering off` 或设 `X-Accel-Buffering: no` header；(3) keepalive 管理——推理请求持续数十秒，`proxy_read_timeout` 默认 60s 可能不够（超长文本生成），设为 300s+；Nginx upstream keepalive 连接数需大于并发请求数，否则频繁新建 TCP 连接增加 TTFT；(4) HTTP/2 的流控——HTTP/2 有连接级和流级 window，默认 initial window size 65535 字节，高吞吐场景需要调大（Nginx 的 `http2_recv_buffer_size`）；(5) 反代链路的 buffer 叠加效应——Client → CDN/LB → Nginx → vLLM，每一层的 buffer 都可能导致 token 延迟。`curl -N` 加 `-v` 测试 streaming 实际到达时间间隔，对比 vLLM 日志中的 token 生成时间间隔——差值就是网络+反代引入的延迟。生产配置模板：`proxy_http_version 1.1`（或 grpc_pass 用 HTTP/2），`proxy_buffering off`，`proxy_cache off`，`tcp_nodelay on`，`proxy_read_timeout 300s`，`keepalive_timeout 300s`。",
+          "capstone": {
+            "prompt": "用户反馈 LLM 服务的 streaming 输出不是逐 token 流畅出现，而是每 2-3 秒一批。vLLM 日志显示每个 token 间隔 50ms 正常生成。链路：Client → AWS ALB → Nginx (Pod) → vLLM (Pod)。请排查：(1) 列出链路中每个组件可能引入 buffering 的配置项；(2) 如何用 curl 测试确认是哪一层引入的延迟？(3) Nginx 需要哪些配置才能正确透传 SSE streaming？(4) AWS ALB 对 streaming 有什么已知限制？有没有替代方案？",
+            "depth": 3
+          }
+        }
+      ]
+    }
+  ]
+}

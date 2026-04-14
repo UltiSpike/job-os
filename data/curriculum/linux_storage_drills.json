@@ -1,0 +1,355 @@
+{
+  "comment": "Drill questions for Linux 存储 track. 3 per lesson, model answer 2-4 sentences.",
+  "drills": {
+    "block-device-model": [
+      {
+        "text": "/dev/nvme0n1p2 这个设备路径中的 0、n1、p2 分别代表什么？和 /dev/sda2 的命名逻辑有什么区别？",
+        "answer": "nvme0 是第 0 个 NVMe 控制器，n1 是控制器上的第 1 个命名空间（namespace），p2 是第 2 个分区。SCSI 设备 /dev/sda2 中 sd 是 SCSI disk 前缀，a 表示第一个探测到的设备（探测顺序依赖的，重启可能变化），2 是分区号。NVMe 命名包含控制器和 namespace 层级，天然稳定不依赖探测顺序。"
+      },
+      {
+        "text": "为什么建议用 /dev/disk/by-id/ 下的符号链接而不是 /dev/nvme* 直接引用设备？",
+        "answer": "by-id 下的链接基于设备的硬件序列号生成（如 nvme-Samsung_SN850_S5xxxx），不会因为 PCIe 拓扑变化或设备探测顺序变化而改名。直接用 /dev/nvme0n1 在添加新 NVMe 设备或调整 PCIe 插槽后可能指向不同的物理盘，导致挂载错误的设备。fstab 和 LVM 配置中应始终使用 by-id 或 UUID。"
+      },
+      {
+        "text": "512e（512-byte emulation）磁盘的逻辑扇区 512B 但物理扇区 4KiB，对文件系统有什么影响？",
+        "answer": "如果文件系统或分区未按 4KiB 对齐，一次逻辑写可能跨越两个物理扇区，导致 SSD 执行读-改-写（read-modify-write）操作，写放大严重。mkfs 时用 -b 4096（ext4）或确认 XFS 自动检测到 4KiB 物理扇区大小。parted 的 align-check opt 可验证分区对齐。"
+      }
+    ],
+    "nvme-architecture": [
+      {
+        "text": "NVMe 的 Submission Queue 和 Completion Queue 是什么关系？为什么每个 CPU 核一组队列对？",
+        "answer": "应用提交 I/O 命令到 Submission Queue（SQ），NVMe 控制器执行后将结果写入对应的 Completion Queue（CQ），并通过 MSI-X 中断通知 CPU。每个 CPU 核独立的 SQ/CQ 对消除了多核竞争——不需要锁来保护队列，每个核可以独立提交和收割 I/O，这是 NVMe 高 IOPS 的架构基础。"
+      },
+      {
+        "text": "NVMe 相比 SATA SSD 在队列深度上的差距是多少？这对 AI 训练数据并发读取意味着什么？",
+        "answer": "SATA（AHCI）只有 1 个命令队列，深度最大 32；NVMe 支持最多 65535 个队列，每个队列深度最大 65536。AI 训练中 DataLoader 的多个 worker 进程并发读取数据时，NVMe 可以为每个 worker 对应的 CPU 核分配独立队列，请求不互相阻塞，总 IOPS 随并发数线性增长直到设备带宽饱和。"
+      },
+      {
+        "text": "如何查看一块 NVMe SSD 实际创建了多少个 I/O 队列？如果队列数少于 CPU 核数会怎样？",
+        "answer": "用 nvme id-ctrl /dev/nvme0n1 查看 NCQR（CQ 请求数）和 NSQR（SQ 请求数），或 dmesg | grep nvme 查看启动时分配的队列数。如果队列数少于 CPU 核数，多个核会共享队列导致锁竞争，降低高并发下的 IOPS。内核 NVMe 驱动默认尝试为每个核创建一个队列对，但受限于设备支持的最大队列数。"
+      }
+    ],
+    "ext4-vs-xfs": [
+      {
+        "text": "XFS 的 reflink（cp --reflink）机制是什么？为什么适合训练数据集版本管理？",
+        "answer": "reflink 创建文件副本时不拷贝数据块，而是让新旧文件共享相同的物理数据块，写入时才 CoW（Copy-on-Write）分离。对训练数据集做版本管理时，cp --reflink 秒级创建 TB 级数据集副本且几乎不占额外空间——只有修改的部分才分配新块。比 LVM snapshot 更轻量，且是文件级操作不需要管理块设备。"
+      },
+      {
+        "text": "为什么 ImageNet 原始格式（1400 万张小 JPEG）在 XFS 和 ext4 上的性能表现不同？",
+        "answer": "ext4 对小文件有 inline data 优化（<60B 的数据直接存在 inode 中），且 dir_index 特性用 HTree 加速目录查找。XFS 的 B+ tree 目录索引在海量条目时性能更稳定，但创建/删除大量小文件时其日志（journaling）开销更大。实际测试中 ext4 在海量小文件场景的 create/unlink 吞吐通常高于 XFS 15-30%。"
+      },
+      {
+        "text": "XFS 不支持在线缩容，这在什么实际场景下会成为问题？",
+        "answer": "当 LVM 需要从一个 VG 中收回空间分配给另一个 LV 时——比如最初给训练数据分了 4TB 太多想缩到 2TB 还给 checkpoint 卷。ext4 可以 resize2fs 在线缩容再 lvreduce，XFS 只能备份数据 → 删除 LV → 创建更小的 LV → 恢复数据。规划 XFS 卷时必须预留足够增长空间，避免缩容需求。"
+      }
+    ],
+    "mount-tuning": [
+      {
+        "text": "noatime 和 relatime 有什么区别？为什么 AI 训练场景建议用 noatime 而不是默认的 relatime？",
+        "answer": "relatime（默认）在访问时间比修改时间旧时更新 atime，减少但不消除 atime 写入。noatime 完全禁止更新 atime，零元数据写入开销。训练数据反复被 DataLoader 读取，relatime 仍会在首次访问时写 atime（因为初始 atime < mtime），累积大量元数据 I/O。noatime 彻底消除这些写入。"
+      },
+      {
+        "text": "NVMe SSD 的 discard（TRIM）选项有哪些配置方式？为什么不推荐实时 discard？",
+        "answer": "三种方式：(1) mount -o discard 实时 TRIM——每次删除文件立即发 TRIM 命令，引入延迟毛刺（TRIM 命令可能阻塞 NVMe 控制器数百微秒）；(2) fstrim.timer 定期批量 TRIM——systemd timer 每周/每天跑一次 fstrim，将 TRIM 集中处理，避免实时影响；(3) 内核 6.2+ 的 discard=async 异步 discard——TRIM 在后台异步执行。推荐 fstrim.timer 或 discard=async。"
+      },
+      {
+        "text": "如何在不卸载文件系统的情况下修改 mount 选项？",
+        "answer": "使用 mount -o remount,noatime,lazytime /data 即可热修改 mount 选项。remount 只能修改部分选项（如 noatime、ro/rw），某些选项（如 data=writeback→data=ordered）需要卸载后重新挂载。修改后需要同步更新 /etc/fstab 否则重启后恢复旧选项。mount | grep /data 可验证当前生效的选项。"
+      }
+    ],
+    "fs-benchmark": [
+      {
+        "text": "fio 测试 NVMe 性能时为什么必须先 precondition（预处理）SSD？",
+        "answer": "新盘或 TRIM 后的 SSD 有大量空闲 NAND 块可直接写入（不需要 GC），测出的写性能远高于稳态。precondition 用顺序写（fio --rw=write --bs=1M）填满整个设备触发 SSD 内部 GC（Garbage Collection），使其进入稳态。之后测出的性能才反映生产环境中持续使用的真实表现。"
+      },
+      {
+        "text": "fio 的 ioengine 参数选 libaio、io_uring 和 sync 分别适用什么场景？",
+        "answer": "sync（同步 read/write）——基线测试，单线程顺序 I/O 性能；libaio（Linux AIO）——高并发异步 I/O 测试（需要 O_DIRECT），是传统的异步 benchmark 引擎；io_uring——内核 5.1+ 的新异步引擎，支持 buffered I/O 异步且性能更优，是 2025 年推荐的默认 ioengine。选 io_uring 测出的结果最接近现代应用的真实 I/O 路径。"
+      },
+      {
+        "text": "如何用 fio 模拟 PyTorch DataLoader 8 个 worker 并发顺序读训练数据的场景？",
+        "answer": "fio --name=dataloader --rw=read --bs=1M --iodepth=16 --numjobs=8 --ioengine=libaio --direct=1 --size=10G --filename=/data/testfile。numjobs=8 模拟 8 个 worker 进程，bs=1M 模拟大块读取，iodepth=16 模拟每个 worker 的预取队列深度，direct=1 使用 O_DIRECT 避免 Page Cache 干扰测试结果。关注输出中的聚合 bandwidth（总读取带宽）和 clat p99（尾延迟）。"
+      }
+    ],
+    "lvm-basics": [
+      {
+        "text": "LVM 的 Physical Extent（PE）是什么？默认大小为什么是 4MiB？",
+        "answer": "PE 是 LVM 最小的空间分配单位——LV 的大小必须是 PE 的整数倍。默认 4MiB 是在管理粒度和元数据开销之间的平衡：PE 太小（如 4KiB）导致 PV 元数据膨胀（每个 PE 需要一条映射记录）；PE 太大（如 256MiB）导致小 LV 浪费空间。4MiB 对 TB 级存储来说空间浪费可忽略且元数据紧凑。"
+      },
+      {
+        "text": "LVM 在线扩容 LV 的完整步骤是什么？有什么风险？",
+        "answer": "lvextend -L +200G /dev/data-vg/train-data 扩展逻辑卷，然后 xfs_growfs /data（XFS）或 resize2fs /dev/data-vg/train-data（ext4）在线扩展文件系统。风险点：(1) VG 空间不足需要先添加 PV；(2) resize2fs 不加 -p 可能不显示进度，长时间无输出像是挂起；(3) 操作期间不要断电——虽然是在线安全操作，但断电可能导致元数据不一致。"
+      },
+      {
+        "text": "LVM 对比直接用 NVMe 裸设备，I/O 延迟增加大约多少？什么场景下这个开销不可接受？",
+        "answer": "LVM 通过 device-mapper 增加一层地址映射，典型开销 2-5μs。对大块顺序 I/O（训练数据读取、checkpoint 写入）影响可忽略（<1%）。但对 QD1 4K 随机读（延迟 ~10μs 的 NVMe），额外 3μs 意味着 30% 延迟增加——向量数据库的 HNSW 查询对此敏感。此场景可考虑裸设备直接挂载文件系统。"
+      }
+    ],
+    "thin-provisioning": [
+      {
+        "text": "LVM thin provisioning 的 allocate-on-write 机制是什么？和普通 LV 的区别？",
+        "answer": "普通 LV 在 lvcreate 时立即从 VG 分配所有 PE，即使未写入数据空间也已占用。Thin LV 只在实际写入时才从 thin pool 分配数据块（allocate-on-write），因此可以创建总容量超过 pool 实际大小的多个 thin LV（超配）。代价是需要持续监控 pool 使用率，pool 满时所有 thin LV 冻结写入。"
+      },
+      {
+        "text": "LVM thin snapshot 的 CoW（Copy-on-Write）在写入时具体做什么？对写性能影响多大？",
+        "answer": "首次写入一个已被 snapshot 的数据块时，thin pool 先将原始块拷贝到新位置（保留给 snapshot 引用），再将新数据写入原位置。这导致一次逻辑写变成一次读 + 两次写（3x 写放大）。对 checkpoint 大块顺序写影响显著——首次写入后续 epoch 不再触发 CoW，但每次新建 snapshot 后首次覆盖写都有 3x 开销。"
+      },
+      {
+        "text": "thin pool 满了会发生什么？如何配置自动扩展？",
+        "answer": "thin pool 数据或元数据用满时，所有关联的 thin LV 暂停写入（I/O 挂起，不是报错），直到人工扩展 pool。配置自动扩展：在 /etc/lvm/lvm.conf 中设置 thin_pool_autoextend_threshold=70（使用率达 70% 触发）和 thin_pool_autoextend_percent=20（每次扩展 20%），同时确保 VG 有足够剩余空间。dmeventd 守护进程必须运行才能触发自动扩展。"
+      }
+    ],
+    "devicemapper-container": [
+      {
+        "text": "overlay2 storage driver 的 copy-up 机制是什么？什么时候触发？",
+        "answer": "当容器写入一个来自只读 lower layer 的文件时，OverlayFS 将整个文件从 lower layer 拷贝到可写的 upper layer（copy-up），后续读写都在 upper layer 进行。触发时机：首次对只读层文件做 write/chmod/chown 操作。大文件 copy-up 开销大——修改容器内一个 5GB 模型文件的一个字节也会拷贝整个 5GB。"
+      },
+      {
+        "text": "为什么 Docker 的 devicemapper loopback 模式性能极差？",
+        "answer": "loopback 模式在文件系统上创建一个稀疏文件（/var/lib/docker/devicemapper/data），通过 loop 设备将其映射为块设备，再在块设备上创建 thin pool。I/O 路径：容器写入 → dm-thin → loop 设备 → 宿主机文件系统 → 物理块设备——双层文件系统开销。加上 loop 设备的单线程 I/O 处理，整体写性能可能只有 direct-lvm 模式的 1/10。"
+      },
+      {
+        "text": "containerd 从 devicemapper 迁移到 overlay2 需要哪些前提条件？数据如何迁移？",
+        "answer": "前提：(1) 宿主机内核支持 OverlayFS（3.18+，生产用 4.0+）；(2) /var/lib/containerd 所在文件系统支持 d_type（XFS 必须 ftype=1，ext4 默认支持）。迁移步骤：停止所有容器 → 修改 containerd config 的 snapshotter 为 overlayfs → 删除旧 devicemapper 数据 → 重启 containerd → 重新拉取镜像。无法原地迁移镜像数据，必须重新拉取。"
+      }
+    ],
+    "dm-crypt-luks": [
+      {
+        "text": "LUKS2 格式相比 LUKS1 有哪些关键改进？",
+        "answer": "LUKS2 引入：(1) JSON 元数据格式替代二进制，支持扩展和自定义字段；(2) Argon2id 密钥派生函数替代 PBKDF2——抗 GPU 暴力破解（Argon2 是 memory-hard 算法）；(3) 最多 32 个 key slot（LUKS1 只有 8 个）；(4) token 机制——支持 TPM2/FIDO2/systemd-cryptenroll 自动解锁；(5) 在线 reencryption——不卸载卷即可更换加密算法或密钥。"
+      },
+      {
+        "text": "dm-crypt 加密对 NVMe SSD 性能的影响大约是多少？瓶颈在哪里？",
+        "answer": "现代 CPU 有 AES-NI 指令集硬件加速，dm-crypt（AES-XTS-256）的吞吐通常 >5 GB/s 单核，多核并行可达 20+ GB/s——超过单块 NVMe 的带宽（3-7 GB/s）。实际性能损失约 2-5%。瓶颈不在加密计算而在 dm-crypt 的 I/O 路径——额外的 bio 分配和上下文切换。内核 5.9+ 的 inline encryption 支持可将加密卸载到 SSD 控制器，进一步消除软件开销。"
+      },
+      {
+        "text": "GPU 节点重启后如何自动解锁 LUKS 加密卷而不把密钥存在磁盘上？",
+        "answer": "推荐方案：systemd-cryptenroll 将 LUKS key slot 绑定到 TPM2 芯片——解锁时 TPM2 基于 PCR（Platform Configuration Register）验证系统完整性后释放密钥。无需密钥文件，密钥密封在 TPM2 硬件中。替代方案：网络密钥服务器（如 Tang/Clevis）——节点启动时通过网络从 Tang 服务器获取解密密钥，物理搬走硬盘无法解密。"
+      }
+    ],
+    "io-scheduler": [
+      {
+        "text": "为什么 NVMe 设备推荐用 none（无调度器）而不是 mq-deadline？",
+        "answer": "NVMe 控制器内部有自己的调度逻辑且队列深度极大（64K），软件层的 mq-deadline 额外做排序和合并反而增加 1-3μs 延迟。none 让请求直接下发到硬件队列，在 NVMe 的多队列架构下这是最优路径。mq-deadline 的存在意义是为旋转盘减少寻道——NVMe 无寻道时间，调度器无用。"
+      },
+      {
+        "text": "如何用 udev 规则为 NVMe 和 HDD 自动设置不同的 I/O scheduler？",
+        "answer": "在 /etc/udev/rules.d/60-io-scheduler.rules 写入两条规则：ACTION==\"add|change\", KERNEL==\"nvme*\", ATTR{queue/scheduler}=\"none\" 和 ACTION==\"add|change\", KERNEL==\"sd*\", ATTR{queue/rotational}==\"1\", ATTR{queue/scheduler}=\"mq-deadline\"。rotational==1 匹配旋转盘，0 匹配 SSD。udevadm trigger 立即生效。"
+      },
+      {
+        "text": "bfq 调度器的核心机制是什么？在 AI 训练场景中有什么问题？",
+        "answer": "bfq（Budget Fair Queueing）为每个进程分配 I/O 预算（budget），按预算比例公平调度——类似 CPU 的 CFS。保证交互式进程低延迟。问题：(1) 每个 I/O 请求的调度开销 ~5-10μs，NVMe 场景下开销占比过大；(2) 公平调度限制了单进程吞吐——训练数据加载需要尽可能独占带宽，bfq 会限流。服务器场景用 cgroup v2 的 io.weight 替代 bfq 做公平调度。"
+      }
+    ],
+    "page-cache-direct-io": [
+      {
+        "text": "训练数据集 2TB 远大于内存 256GB，为什么 Page Cache 对第二个 epoch 的加速几乎为零？",
+        "answer": "Page Cache 使用 LRU（最近最少使用）淘汰策略。2TB 数据集顺序扫描一遍后，缓存中只保留最后读入的 ~256GB 数据，前面的页面已被淘汰。第二个 epoch 从头读取时，所需页面早已被淘汰——缓存命中率接近 0%。这就是经典的「sequential scan thrashing」问题。"
+      },
+      {
+        "text": "O_DIRECT 对应用层 buffer 有什么对齐要求？不满足会怎样？",
+        "answer": "O_DIRECT 要求用户态 buffer 地址、文件偏移量和 I/O 大小都必须对齐到逻辑扇区大小（通常 512B 或 4KiB，取决于设备和文件系统）。不满足对齐要求时 read/write 系统调用直接返回 EINVAL 错误。应用需要用 posix_memalign() 或 aligned_alloc() 分配对齐的 buffer。PyTorch 的 DataLoader 默认不使用 O_DIRECT，需要自定义 Dataset 类实现。"
+      },
+      {
+        "text": "posix_fadvise(POSIX_FADV_DONTNEED) 和 O_DIRECT 有什么区别？哪个更适合训练数据读取？",
+        "answer": "FADV_DONTNEED 在 buffered read 之后主动释放该文件的 Page Cache 页面——数据经过 cache 但读完立即丢弃，不污染缓存。O_DIRECT 完全绕过 cache，DMA 直接到用户 buffer。FADV_DONTNEED 保留了 readahead 预读优化（对顺序读有利），而 O_DIRECT 没有预读。训练数据大文件顺序读推荐 buffered read + FADV_DONTNEED——兼顾预读性能和缓存清洁。"
+      }
+    ],
+    "io-uring": [
+      {
+        "text": "io_uring 的 Submission Queue 和 Completion Queue 为什么用共享内存 ring buffer？比 syscall 好在哪里？",
+        "answer": "ring buffer 通过 mmap 在用户态和内核态共享——应用写 SQE 无需 syscall，内核写 CQE 也无需通知。一次 io_uring_enter() 可批量提交/收割多个 I/O，amortize syscall 开销。传统 pread 每次 I/O 一次 syscall（上下文切换 ~1μs），高 IOPS 场景下 syscall 开销占比可达 20-30%。io_uring 的 SQPOLL 模式更进一步——内核线程轮询 SQR，实现真正的零 syscall I/O。"
+      },
+      {
+        "text": "io_uring 的 SQPOLL 模式为什么能做到零 syscall？有什么代价？",
+        "answer": "SQPOLL 模式启动一个内核轮询线程（sq_thread）持续检查 SQ ring 中是否有新条目，有就直接提交给块层——应用只需写 SQE 到共享内存即可，无需调用 io_uring_enter()。代价：(1) 持续占用一个 CPU 核用于轮询（即使无 I/O 也在空转，可配 idle timeout）；(2) 需要 CAP_SYS_NICE 或 root 权限。适合持续高 IOPS 的场景，间歇性 I/O 浪费 CPU。"
+      },
+      {
+        "text": "在容器环境中使用 io_uring 有什么限制？seccomp 默认允许吗？",
+        "answer": "Docker/containerd 的默认 seccomp profile 在早期版本（Docker 20.10 之前）阻止了 io_uring_setup/io_uring_enter/io_uring_register 系统调用。即使允许了 syscall，io_uring 的内存锁定（RLIMIT_MEMLOCK）限制在容器中可能过低——需要在 Pod securityContext 中设置足够的 ulimit。K8s 1.28+ 的默认 seccomp profile（RuntimeDefault）通常已放行 io_uring，但需要验证具体 runtime 版本。"
+      }
+    ],
+    "cgroup-io-control": [
+      {
+        "text": "cgroup v2 的 io.max 和 io.weight 有什么本质区别？",
+        "answer": "io.max 是硬上限（throttling）——写入 rbps=500M 则该 cgroup 的读取带宽绝不超过 500MB/s，无论设备多空闲。io.weight 是比例分配——权重 200 的 cgroup 在竞争时获得权重 100 的 cgroup 两倍带宽，但无竞争时可用满设备带宽。io.max 保证「不超过」，io.weight 保证「不少于比例」。训练场景通常用 io.max 限制 checkpoint 写入不抢数据读取带宽。"
+      },
+      {
+        "text": "为什么 cgroup v2 的 io.max 对 buffered write 可能不生效？如何解决？",
+        "answer": "buffered write 先写入 Page Cache（进程瞬间返回），脏页回写（writeback）由内核 flusher 线程执行——flusher 的 I/O 不一定计入原进程的 cgroup。内核 5.16+ 引入 writeback-aware cgroup：脏页回写时追踪其来源 cgroup 并应用 io.max 限制。需要确保内核版本足够且 cgroup v2 的 memory 和 io controller 同时启用（writeback 需要 memory controller 追踪脏页归属）。"
+      },
+      {
+        "text": "K8s Pod 目前没有原生 I/O limit 字段，有哪些 workaround？",
+        "answer": "三种方案：(1) init container 在启动时写入 /sys/fs/cgroup/<pod-cgroup>/io.max——需要 privileged 或特定 capabilities；(2) 自定义 device plugin 或 webhook 在 Pod 创建时自动注入 io.max 配置；(3) 使用 io.latency controller（设延迟目标而非带宽上限）通过 kubelet 的 cgroup 配置。社区 KEP-2595 提议在 Pod spec 中加入 io limit 字段但尚未 GA。"
+      }
+    ],
+    "vectordb-io-pattern": [
+      {
+        "text": "HNSW 索引的图遍历为什么产生高度随机的 I/O？和传统 B+ tree 索引有什么不同？",
+        "answer": "HNSW 从入口节点出发，每跳根据向量距离选择最近邻跳转——下一个访问的节点在物理存储上的位置完全不可预测（取决于查询向量和图结构），产生真正的随机 I/O。B+ tree 的叶子节点物理连续，范围扫描是顺序 I/O。HNSW 的每跳读取 4-16KB（一个邻居列表），通常需要 50-200 跳完成一次查询。"
+      },
+      {
+        "text": "向量数据库为什么普遍选择 mmap 而不是 O_DIRECT 来访问索引文件？",
+        "answer": "mmap 让操作系统自动管理内存——热点节点（频繁被遍历的上层节点）自动留在 Page Cache，冷节点按需 page fault 加载。应用不需要自己实现缓存策略。O_DIRECT 需要应用自己管理 buffer pool，实现 LRU/LFU 淘汰，复杂度高且难以超越内核的 MGLRU 算法。mmap 的缺点是 page fault 不可控——可能在查询关键路径上触发磁盘读取导致延迟毛刺。"
+      },
+      {
+        "text": "madvise(MADV_RANDOM) 对向量数据库的 mmap 访问有什么优化效果？",
+        "answer": "MADV_RANDOM 告诉内核不要做预读（readahead）——默认 readahead 在 page fault 时会多读相邻的 128KB 数据。HNSW 遍历的下一跳位置完全随机，预读的数据 99% 不会被使用，浪费 I/O 带宽和 Page Cache 空间。设置 MADV_RANDOM 后 page fault 只读取实际需要的 4KB 页面，有效 I/O 量大幅减少。"
+      }
+    ],
+    "nfs-pnfs": [
+      {
+        "text": "NFSv4 的 nconnect=16 mount 选项做了什么？为什么能提升训练数据读取性能？",
+        "answer": "nconnect=16 让 NFS 客户端为同一 mount 点创建 16 条 TCP 连接，I/O 请求分散到多条连接并行传输。单条 TCP 连接受拥塞窗口和单核 CPU 处理限制，带宽通常 2-4 Gbps。16 条连接可以利用 25GbE/100GbE 链路的全部带宽。限制：服务端需要支持多连接 session（NFSv4.1+），且连接数不宜过大——超过 CPU 核数后收益递减反而增加上下文切换开销。"
+      },
+      {
+        "text": "pNFS 的 file layout 是如何实现并行 I/O 的？",
+        "answer": "客户端向 MDS（Metadata Server）请求 layout 信息——MDS 返回文件数据在哪些 DS（Data Server）上的哪些偏移范围。客户端根据 layout 直接向多个 DS 并行读写数据，绕过 MDS。类似 Lustre 的 striping——文件按 stripe 分散到多个 DS。关键区别：pNFS 是 NFSv4.1 的标准扩展，兼容现有 NFS 客户端（内核 2.6.31+），部署门槛比 Lustre 低得多。"
+      },
+      {
+        "text": "NFS 在海量小文件场景（如 ImageNet 1400 万张图片）性能为什么极差？",
+        "answer": "NFS 对每个文件操作（open/stat/read/close）都需要网络往返——1400 万文件的 ls 或 stat 产生 1400 万次 RPC 调用（即使有 readdir/readdirplus 批量读目录，返回的属性缓存很快过期）。每次 RPC 的网络延迟 ~0.1-1ms，累积耗时巨大。解决方案：将小文件打包为 WebDataset tar 格式（每个 tar 包含数千张图片），NFS 上存储数千个大 tar 文件而非数千万个小文件。"
+      }
+    ],
+    "lustre-parallel": [
+      {
+        "text": "Lustre 的 stripe count 和 stripe size 如何影响训练数据的读取带宽？",
+        "answer": "stripe count 决定文件数据分布在多少个 OST 上——count=8 表示数据条带化到 8 个 OST，理论聚合带宽 = 8 × 单 OST 带宽。stripe size 决定每个条带的大小——size=4M 表示每 4MB 切换到下一个 OST。训练数据大文件顺序读时，stripe count 应尽可能大（最大化带宽），stripe size 设为 1-4MB（匹配 NVMe 的最优顺序读块大小）。过小的 stripe size 导致频繁切换 OST 增加元数据开销。"
+      },
+      {
+        "text": "Lustre 的 MDT 和 OST 分别处理什么？如何判断瓶颈在 MDT 还是 OST？",
+        "answer": "MDT 处理元数据操作（ls/stat/open/mkdir/rename），OST 处理数据 I/O（read/write）。MDT 瓶颈表现：ls 大目录慢、文件 open 延迟高、lctl get_param mdt.*.stats 显示高 mds_getattr 负载。OST 瓶颈表现：数据读写吞吐低、iostat 显示 OST 后端磁盘忙。lfs df -h 看 OST 容量分布是否均匀——倾斜严重导致个别 OST 过载成为带宽瓶颈。"
+      },
+      {
+        "text": "256 个训练节点同时做 checkpoint 写入对 Lustre 有什么冲击？如何优化？",
+        "answer": "256 节点 × 30GB = 7.68TB 瞬时写入压力。如果 checkpoint 文件都写到同一目录（同一 MDT），MDT 元数据操作（create/open）成为瓶颈。数据层面如果 stripe count 过大，所有 OST 同时承受写入可能触发网络拥塞。优化：(1) 分散 checkpoint 目录到不同 MDT（DNE）；(2) 错峰写入——不同 rank 的 checkpoint 写入时间错开；(3) 使用 Lustre PFL 让 checkpoint 文件的 stripe 配置自适应文件大小。"
+      }
+    ],
+    "gpfs-beegfs": [
+      {
+        "text": "GPFS 的 token-based 分布式锁和 Lustre 的锁机制有什么核心区别？",
+        "answer": "GPFS 使用 token（令牌）管理并发访问——客户端持有 token 期间可自由读写对应的字节范围，无需每次操作都联系锁管理器。token 冲突时通过 revoke/grant 协议在客户端间迁移。Lustre 使用 LDLM（Lustre Distributed Lock Manager），锁粒度是 extent 级别，冲突时客户端向 MDT 申请锁然后等待。GPFS 的 token 模型在多客户端并发写同一文件时更高效（完整 POSIX 语义），Lustre 的 lockahead 则需要应用端配合。"
+      },
+      {
+        "text": "BeeGFS 的 FUSE 模式和内核模块模式有什么性能差异？",
+        "answer": "FUSE 模式每次 I/O 经过用户态-内核态两次上下文切换（应用 → VFS → FUSE daemon → 网络 → 返回），增加约 10-30μs 延迟。内核模块模式 I/O 直接在内核中处理，延迟与 Lustre 客户端相当。大块顺序 I/O 差异 ~10%（延迟占比低），但 4K 随机 I/O FUSE 可能慢 2-3 倍。选择 FUSE：不想编译/维护内核模块、快速 PoC、安全策略禁止加载第三方内核模块。"
+      },
+      {
+        "text": "在 128 节点 GPU 集群上选存储方案，成本因素如何影响 Lustre vs GPFS vs BeeGFS 的决策？",
+        "answer": "GPFS（IBM Storage Scale）需要商业许可证，按容量或节点数收费，128 节点集群可能数十万到数百万美元/年。Lustre 开源免费但运维复杂度高——需要专职存储工程师。BeeGFS 开源且部署简单，企业版有商业支持但费用远低于 GPFS。如果团队有 Lustre 运维经验选 Lustre，预算充裕且需要多站点/自动分级存储选 GPFS，快速起步中等规模选 BeeGFS。"
+      }
+    ],
+    "ceph-rbd-cephfs": [
+      {
+        "text": "Ceph 的 Placement Group（PG）数量设置不当会有什么后果？",
+        "answer": "PG 过少（如 10 个 PG 分布在 100 个 OSD 上）导致数据分布不均匀——少数 OSD 存储量远大于其他，热点 OSD 成为性能瓶颈。PG 过多（如每个 OSD 上数千个 PG）导致 OSD 内存消耗膨胀（每个 PG 占 ~30MB 内存）且 peering 过程缓慢。推荐公式：PG = OSD数 × 100 / 副本数，向上取 2 的幂。Ceph Nautilus+ 支持 autoscaler 自动调整 PG 数量。"
+      },
+      {
+        "text": "为什么 CephFS 的 kernel mount 比 FUSE mount 快 30-50%？",
+        "answer": "CephFS kernel client（mount.ceph）在 VFS 层直接与 MDS/OSD 通信，I/O 路径全在内核中完成。FUSE client（ceph-fuse）每次 I/O 需要 VFS → FUSE → 用户态 ceph-fuse 进程 → 内核网络栈 → MDS/OSD，多了两次用户态-内核态切换。对大块顺序 I/O 差异 ~15%，对元数据密集操作（ls/stat）差异可达 50%，因为元数据操作次数多、每次切换的相对开销大。"
+      },
+      {
+        "text": "Rook-Ceph 在 K8s 上部署 Ceph 的核心架构是什么？",
+        "answer": "Rook 是 K8s operator，通过 CephCluster CRD 声明式管理 Ceph 集群。Rook operator 监听 CRD 变化，自动部署和管理 Mon（监控）、Mgr（管理）、OSD（存储）等 Ceph 守护进程为 K8s Pod。CephBlockPool/CephFilesystem CRD 定义存储池参数（副本数、压缩、纠删码），StorageClass 关联 ceph-csi provisioner 提供 PV 动态供给。OSD Pod 直接使用节点的 NVMe 裸设备（通过 deviceFilter 或 useAllDevices）。"
+      }
+    ],
+    "juicefs-alluxio": [
+      {
+        "text": "JuiceFS 的元数据引擎为什么不用对象存储而单独部署 Redis/TiKV？",
+        "answer": "对象存储的 LIST/HEAD 操作延迟 50-200ms，ls 一个包含 10000 文件的目录需要多次 LIST API 调用耗时数秒。JuiceFS 将元数据（文件名、目录结构、权限、chunk 映射）存储在 Redis/TiKV 中，单次元数据操作延迟 <1ms。数据仍存对象存储享受低成本大容量，元数据独立存储解决对象存储元数据操作慢的根本问题。这是 JuiceFS 实现 POSIX 语义的关键设计。"
+      },
+      {
+        "text": "JuiceFS 的本地缓存如何工作？缓存命中率取决于什么？",
+        "answer": "JuiceFS 将从对象存储读取的数据块（4MB chunk 拆分为 64KB slice）缓存到本地 NVMe（默认路径 /var/jfsCache）。缓存淘汰用 LRU。命中率取决于：(1) 缓存容量 vs 数据集大小——100TB 数据集，节点 7.68TB 缓存，全集命中率 ~7.68%；(2) 数据访问模式——如果训练 shuffle 后不同 epoch 访问相同数据分片，缓存可复用；(3) 预热策略——juicefs warmup 预先拉取热数据到缓存。"
+      },
+      {
+        "text": "JuiceFS 和 Alluxio 在架构上最大的区别是什么？",
+        "answer": "JuiceFS 是完整的文件系统——自己管理元数据和数据分块，对象存储只是持久化后端，客户端看到的是 POSIX 文件系统。Alluxio 是数据编排/缓存层——不管理元数据，而是代理底层存储（S3/HDFS/NFS）的命名空间，客户端通过 Alluxio 访问底层存储的数据并自动缓存。JuiceFS 适合「把对象存储当文件系统用」，Alluxio 适合「统一多个异构存储的访问入口」。"
+      }
+    ],
+    "object-storage-s3": [
+      {
+        "text": "为什么训练数据不应该以原始小文件形式存入 S3？量化性能问题。",
+        "answer": "S3 的 GET 请求延迟 ~10-50ms（含 TLS 握手）。ImageNet 1400 万张小图片逐个 GET，即使并发 1000，14000 秒 = 3.8 小时才能遍历一遍。LIST 操作每次最多返回 1000 个 key，列举 1400 万 key 需要 14000 次 LIST 调用。打包为 1GB 的 tar/WebDataset 格式后，只需 ~14000 次大文件 GET（每次几秒），并发 100 可在分钟级完成。小文件 → 大文件打包是 S3 上训练数据管理的第一原则。"
+      },
+      {
+        "text": "MinIO 的 Erasure Code（纠删码）和三副本有什么区别？存储效率如何？",
+        "answer": "三副本存储效率 1/3（3x 冗余），任意丢失 2 个副本可恢复。EC:4+2 用 4 个数据分片 + 2 个校验分片，存储效率 4/6 = 66%（1.5x 冗余），可容忍任意 2 个节点故障。EC 存储效率远高于三副本，但重建（rebuild）时需要读取剩余所有分片做计算，CPU 开销和网络带宽消耗更大。AI 场景训练数据通常是一次写多次读（WORM），EC 的重建开销可以接受，存储成本节省显著。"
+      },
+      {
+        "text": "S3 multipart upload 的 part size 设置如何影响大文件上传性能？",
+        "answer": "part size 决定并行度和重试粒度——30GB checkpoint 用 256MB part size 产生 ~120 个 part，可 120 路并发上传。part size 过小（如 8MB → 3840 个 part）增加 S3 API 调用次数和合并开销；part size 过大（如 1GB → 30 个 part）并行度不足且单 part 失败重传代价高。实践中 64-256MB 是最优范围，配合 AWS SDK 的 TransferConfig 自动管理并发数。S3 限制每个 multipart upload 最多 10000 个 part。"
+      }
+    ],
+    "iostat-blktrace": [
+      {
+        "text": "iostat -x 输出中 %util 对 NVMe 设备为什么不准确？应该看什么指标？",
+        "answer": "iostat 的 %util 基于设备忙碌时间占比计算——传统 HDD 同一时间只能处理一个请求，%util=100% 确实意味着饱和。NVMe 支持数万并发请求（多队列），即使 %util=100% 也可能只用了设备能力的一小部分。应该看 r/s+w/s（IOPS）对比设备 spec，以及 rMB/s+wMB/s（带宽）对比 spec，加上 await/r_await/w_await（延迟是否异常升高）。"
+      },
+      {
+        "text": "biolatency 和 iostat 的 await 有什么区别？什么时候需要 biolatency？",
+        "answer": "iostat 的 await 是时间窗口内所有 I/O 的平均延迟，掩盖了分布信息——平均 0.1ms 可能包含 99.9% 在 0.05ms 和 0.1% 在 50ms 的长尾。biolatency（bcc 工具集）输出延迟直方图，能看到 p50/p99/p999 分布。训练数据加载偶尔卡顿但平均延迟正常时，biolatency 能发现尾延迟问题。biolatency -D 按设备分别统计。"
+      },
+      {
+        "text": "blktrace 输出中 Q→D→C 三个事件分别代表什么？Q→D 延迟高说明什么问题？",
+        "answer": "Q（Queue）= I/O 请求进入块层队列；D（Dispatch）= 请求被下发到设备驱动；C（Complete）= 设备完成请求返回结果。Q→D 延迟高说明请求在块层排队等待——可能原因：(1) I/O scheduler 合并/排序耗时过长；(2) 设备队列满（nr_requests 达上限）导致背压；(3) cgroup io.max throttling。D→C 延迟高则说明设备本身处理慢（硬件问题或固件 GC）。"
+      }
+    ],
+    "nvme-smart": [
+      {
+        "text": "NVMe SMART 的 percentage_used 字段具体怎么计算？到了 100% SSD 就坏了吗？",
+        "answer": "percentage_used 基于 SSD 实际 NAND 写入量（data_units_written + 内部写放大）与厂商标称的 TBW（Total Bytes Written）额定值的比值计算。到 100% 表示达到厂商保修寿命——SSD 不会立刻坏，但不再保证数据完整性，media_errors 可能开始增加。实际上很多 SSD 在 200-300% 仍可用，但生产环境应在 80-90% 时更换。"
+      },
+      {
+        "text": "NVMe SMART 的 critical_warning 字段是位掩码，各 bit 分别代表什么？",
+        "answer": "bit0=温度超过阈值（可能触发 thermal throttling 降速）；bit1=可靠性降级（NVM 子系统检测到内部错误）；bit2=设备进入只读模式（media 或 firmware 故障，数据可读但不可写）；bit3=volatile memory backup 失败（突然断电可能丢数据）；bit4=PMR（Persistent Memory Region）不可靠。任何 bit 非零都应立即告警并安排更换。"
+      },
+      {
+        "text": "如何基于 SMART 数据计算 NVMe SSD 在当前训练工作负载下的剩余寿命？",
+        "answer": "读取 data_units_written（单位 = 512B × 1000），乘以 512000 得总写入字节数。除以 SSD 使用天数得日均写入量。用 SSD 的 TBW 额定值除以日均写入量得额定剩余天数。需要加入写放大系数（WAF，通过 SMART 的 host_write_commands / nand_write_commands 近似计算）。例：TBW=3.5PB，日均写入 5TB，WAF=1.2，则剩余 3500/(5×1.2) ≈ 583 天。"
+      }
+    ],
+    "space-inode-repair": [
+      {
+        "text": "df -h 显示有空余空间但写入报 ENOSPC，可能的原因有哪些？",
+        "answer": "三种常见原因：(1) inode 耗尽——df -i 显示 IUsed 100%，空间有但没有 inode 分配给新文件；(2) ext4 的 reserved blocks（默认 5%）——root 用户预留空间，普通用户看不到。tune2fs -m 0 可释放但不推荐（影响系统稳定性）；(3) 文件系统内部碎片严重——ext4 的 extent tree 或 XFS 的 B+ tree 需要元数据空间，数据块和元数据块分别统计。"
+      },
+      {
+        "text": "一个训练进程删除了 500GB 的旧 checkpoint 但 df 显示空间没释放，为什么？怎么处理？",
+        "answer": "Linux 中如果一个进程仍然持有已删除文件的 fd（file descriptor），内核不会真正释放磁盘空间——文件从目录中消失（ls 看不到）但 inode 和数据块仍被占用。用 lsof +L1 找到持有已删除文件的进程和 fd。解决：(1) 让进程关闭 fd（正常退出或 kill）；(2) 紧急释放：echo > /proc/<pid>/fd/<fd> 将文件截断为 0 字节立即释放空间但进程后续写入会失败。"
+      },
+      {
+        "text": "ext4 的 inode 数量在 mkfs 后不可更改，如何在格式化时为海量小文件场景预留足够 inode？",
+        "answer": "mkfs.ext4 的 -i 参数（bytes-per-inode）控制 inode 密度——默认 -i 16384 表示每 16KB 分配一个 inode。海量小文件场景用 -i 4096（每 4KB 一个 inode）可创建 4 倍数量的 inode，但 inode table 本身也占空间（每个 inode 256B）。更好的方案：直接用 XFS——XFS 动态分配 inode，不存在 inode 耗尽问题。这也是训练数据存储推荐 XFS 的原因之一。"
+      }
+    ],
+    "checkpoint-io-bottleneck": [
+      {
+        "text": "torch.save() 写 checkpoint 慢，可能的应用层瓶颈是什么？",
+        "answer": "torch.save() 内部用 pickle 序列化所有 tensor——序列化是 CPU 密集操作，单线程处理 140GB 参数需要大量 CPU 时间。此外 pickle 产生的数据不是 tensor 的原始字节而是包含类型信息的序列化格式，写入量 > 实际参数大小。替代方案：safetensors 格式直接写入 tensor 的 raw bytes（零序列化开销），或 torch.distributed.checkpoint 多进程并行分片保存。"
+      },
+      {
+        "text": "vm.dirty_ratio 设置过低如何导致 checkpoint 写入变慢？最优值如何确定？",
+        "answer": "vm.dirty_ratio 是 dirty page 占总内存的比例上限——超过此值进程的 write() 被 throttle 等待回写。默认 20%，256GB 节点 = 51GB 上限。140GB checkpoint 写入时很快达到 dirty_ratio，进程被限速到磁盘写入带宽。调优：增大 dirty_ratio 到 40-60%（确保内存不被 dirty page 耗尽导致 OOM），或者直接用 vm.dirty_bytes 设绝对值（如 8GB）。配合 dirty_background_ratio 让回写尽早开始。"
+      },
+      {
+        "text": "异步 checkpoint 如何保证数据一致性？训练不暂停的情况下参数不会在写入过程中被修改吗？",
+        "answer": "异步 checkpoint 的标准做法：在 checkpoint 时刻创建参数的 snapshot（内存中 fork 出子进程利用 CoW 语义，或者 FSDP 的 StateDictType.SHARDED_STATE_DICT 先 gather 到 CPU 内存），然后后台线程异步将 snapshot 写入磁盘。训练继续前进修改 GPU 上的参数不影响已 snapshot 的 CPU 内存副本。代价是需要额外内存存放 snapshot——140GB checkpoint 需要 140GB 额外 CPU 内存。"
+      }
+    ],
+    "nvme-of": [
+      {
+        "text": "NVMe-oF 的三种传输层（RDMA/TCP/FC）在延迟和适用场景上有什么区别？",
+        "answer": "RDMA（RoCEv2/IB）延迟最低（~10μs 附加），适合 GPU 集群（通常已有 RDMA 网络用于 NCCL）。TCP 延迟 ~30-50μs，适合无 RDMA 的标准以太网环境，内核 5.0+ 原生支持。FC 延迟 ~15-25μs，适合已有 FC SAN 基础设施的企业。GPU 训练集群首选 RDMA，成本敏感的开发环境用 TCP 即可。"
+      },
+      {
+        "text": "NVMe-oF 存算分离架构对训练数据加载和 checkpoint 写入的影响分别如何？",
+        "answer": "训练数据加载是大块顺序读（1MB+），网络传输延迟被 pipeline 隐藏——100Gbps RDMA 网络提供 ~12GB/s 带宽，和本地 NVMe 的 5-7GB/s 相当甚至更高（多 target 聚合）。Checkpoint 大块顺序写同理，带宽是瓶颈而非延迟。但向量数据库随机读（4K）对延迟敏感——本地 NVMe 延迟 ~10μs，加上 NVMe-oF TCP ~30-50μs 变成 40-60μs，IOPS 下降约 75%。随机读密集场景不适合远程存储。"
+      },
+      {
+        "text": "NVMe-oF 连接断开时对训练任务有什么影响？如何设计恢复策略？",
+        "answer": "连接断开后所有 in-flight I/O 超时失败，文件系统进入只读或 I/O error 状态——训练进程的 read/write 返回 EIO，通常导致训练崩溃。NVMe-oF 内核 initiator 支持自动重连（ctrl_loss_tmo 和 reconnect_delay 参数），默认 ctrl_loss_tmo=600s 即 10 分钟内持续重试。恢复策略：(1) 设置合理的超时和重试参数；(2) 训练框架捕获 I/O 错误后暂停而非崩溃，等待存储恢复；(3) 多 path（multipath-nvme）连接提供链路冗余。"
+      }
+    ]
+  }
+}

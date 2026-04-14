@@ -1,0 +1,271 @@
+{
+  "comment": "Drill questions for Docker 与容器技术 track. 3 per lesson, model answer 2-4 sentences.",
+  "drills": {
+    "linux-namespaces": [
+      {
+        "text": "Linux 有哪 7 种 namespace？哪一种是最晚加入内核的，为什么它对容器安全至关重要？",
+        "answer": "7 种 namespace：Mount (mnt)、UTS、IPC、PID、Network (net)、User、Cgroup。User namespace 最晚（3.8 内核），它允许容器内 UID 0 映射到宿主机非特权 UID，实现 rootless 容器——即使容器内进程以 root 运行，逃逸后也只是普通用户，大幅降低攻击面。"
+      },
+      {
+        "text": "clone() 和 unshare() 在创建 namespace 时有什么区别？runc 在哪个阶段用哪个？",
+        "answer": "clone() 创建新进程的同时创建新 namespace，子进程直接在新 namespace 中启动。unshare() 让当前进程脱离已有 namespace 进入新的。runc 的 nsexec.c 使用 clone(CLONE_NEWPID|CLONE_NEWNS|...) 创建 init 进程，然后 init 进程内用 unshare(CLONE_NEWNS) 做 pivot_root 前的 mount namespace 隔离。两者配合完成容器沙箱构建。"
+      },
+      {
+        "text": "/proc/<pid>/ns/ 目录下的符号链接有什么用途？如何用它实现 'nsenter 进入一个已有容器' 的操作？",
+        "answer": "/proc/<pid>/ns/ 下每个文件（如 net、mnt、pid）是该进程所属 namespace 的 inode 引用。nsenter 通过 open() 这些文件获取 fd，再调用 setns(fd, 0) 将当前进程切入目标 namespace。docker exec 底层就是 containerd-shim 对容器 init 进程做 nsenter。只要 namespace 文件被 bind mount 保持引用，即使原进程退出 namespace 也不会销毁。"
+      }
+    ],
+    "cgroup-v2-resources": [
+      {
+        "text": "cgroup v1 和 v2 在目录结构上的核心区别是什么？为什么 v2 对容器运行时更友好？",
+        "answer": "v1 每种 controller（cpu、memory、devices 等）各自独立的层级树，进程可能分散在不同树的不同位置。v2 是统一层级（unified hierarchy），一个进程只属于一个 cgroup 节点，所有 controller 挂在同一棵树上。这让容器运行时不需要分别操作多棵树，也消除了 v1 中 controller 间不一致的问题。systemd 从 248 开始默认 v2。"
+      },
+      {
+        "text": "cgroup v2 中 memory.max 和 memory.high 的区别是什么？容器中哪个更适合做 GPU 训练的内存防护？",
+        "answer": "memory.max 是硬限制——超过直接触发 OOM kill。memory.high 是软限制——超过后内核会积极回收（throttle + reclaim），但不立即 kill。GPU 训练建议设 memory.max 为硬上限防止节点宕机，同时 memory.high 设为 max 的 80-90% 做早期预警和回收压力。纯硬限制容易在数据加载高峰时突然 OOM。"
+      },
+      {
+        "text": "cgroup v1 的 devices controller 用白名单/黑名单控制设备访问，v2 改用了什么机制？对 GPU 设备管理有何影响？",
+        "answer": "v2 移除了 devices controller，改用 eBPF 程序（BPF_PROG_TYPE_CGROUP_DEVICE）附加到 cgroup 节点，在 device open 时做 allow/deny 决策。优势是逻辑可编程——NVIDIA Container Toolkit 可以动态生成 eBPF 规则，按 MIG 实例精细控制 /dev/nvidia* 设备号的访问权限，比 v1 的静态白名单灵活得多。"
+      }
+    ],
+    "rootfs-overlayfs": [
+      {
+        "text": "OverlayFS 的 lowerdir、upperdir、workdir、merged 各扮演什么角色？容器写文件时发生了什么？",
+        "answer": "lowerdir 是只读的镜像层（可叠加多个），upperdir 是可写层（容器层），workdir 是 OverlayFS 内部原子操作的暂存区，merged 是最终呈现给容器的统一视图。容器写文件时触发 Copy-on-Write：内核将 lowerdir 中的文件完整复制到 upperdir，再在 upperdir 上修改。首次写有 IO 开销，后续直接在 upperdir 操作。"
+      },
+      {
+        "text": "OverlayFS 的 'whiteout' 文件是什么？为什么 ML 镜像构建时需要关注它？",
+        "answer": "whiteout 是一个 char device(0,0) 文件，标记 '此文件在上层已被删除'——即使 lowerdir 中存在同名文件，merged 视图中也看不到。ML 镜像构建时，如果在上层 RUN 中 pip uninstall 或 rm 大文件，实际只创建了 whiteout 而 lowerdir 层仍然保留原文件，镜像体积不会减小。必须在同一层内完成安装-清理，或用 multi-stage build 避免无效层。"
+      },
+      {
+        "text": "多个容器共享同一个基础镜像时，OverlayFS 如何节省磁盘和内存？这对 GPU 推理服务的冷启动有什么意义？",
+        "answer": "共享基础镜像的容器使用相同的 lowerdir 层（磁盘上只有一份），且内核的 page cache 也是共享的——第一个容器加载的 CUDA 库文件，第二个容器直接命中 cache，无需再次 IO。对 GPU 推理服务而言，大量副本共享同一个含 CUDA + model weights 的 base 层，冷启动只需创建轻量 upperdir，显著减少扩容延迟。"
+      }
+    ],
+    "container-vm-microvm": [
+      {
+        "text": "容器、VM、MicroVM 三者的隔离边界分别在哪一层？安全性和启动速度各有什么 trade-off？",
+        "answer": "容器隔离在内核层（namespace + cgroup），共享宿主内核，启动毫秒级但隔离弱——内核漏洞可逃逸。VM 隔离在 hypervisor 层（独立内核 + 虚拟硬件），启动秒级但隔离强。MicroVM（如 Firecracker）精简了设备模型，只保留 virtio-net/block/vsock，启动 <125ms 同时保持 VM 级隔离。Trade-off：容器最快最轻但最不安全，VM 最安全但最重，MicroVM 在中间取平衡。"
+      },
+      {
+        "text": "Firecracker 是如何做到 <125ms 启动的？它裁减了传统 QEMU 的哪些部分？",
+        "answer": "Firecracker 用 Rust 从零实现极简 VMM：只支持 5 种 virtio 设备（net、block、vsock、balloon、entropy），无 BIOS/UEFI（直接 Linux boot protocol 加载内核），无 PCI 总线（用 MMIO），无 USB/GPU/显卡模拟。攻击面从 QEMU 的几十万行 C 代码缩减到约 5 万行 Rust。配合精简的 guest kernel 和 init，冷启动可 <125ms，内存开销 <5MB/VM。"
+      },
+      {
+        "text": "E2B 用 Firecracker 做 AI 代码沙箱，相比 Docker 容器做沙箱有什么安全优势？GPU passthrough 是否可行？",
+        "answer": "E2B 的 Firecracker MicroVM 提供 VM 级隔离——即使 AI 生成的代码利用内核漏洞，也只攻破 guest 内核而无法逃逸到宿主机。Docker 容器共享宿主内核，内核 0day 直接穿透。但 Firecracker 不支持 GPU passthrough——它没有 VFIO/PCI 设备模型，无法直连 GPU。需要 GPU 的 AI 沙箱可选 Kata Containers（基于 QEMU-lite，支持 VFIO GPU passthrough）或 gVisor（用户态内核拦截 syscall）。"
+      }
+    ],
+    "build-container-from-scratch": [
+      {
+        "text": "用 unshare + pivot_root 手动构建容器，为什么不能用 chroot 替代 pivot_root？",
+        "answer": "chroot 只改变进程的 '/' 路径解析，不改变 mount namespace 的根——进程仍能通过 /proc/1/root、文件描述符或 fchdir 逃出 chroot。pivot_root 真正交换 mount namespace 的根文件系统（old_root 被 umount），之后 old_root 不可达。runc 的实现是：pivot_root 后立即 umount old_root + MNT_DETACH，确保容器进程无法访问宿主文件系统。"
+      },
+      {
+        "text": "runc 的 nsexec.c 为什么要用 C 而不是 Go 实现？它解决了什么 Go runtime 的限制？",
+        "answer": "Go runtime 在 main() 之前会启动多个线程（GC、sysmon 等），而 clone(CLONE_NEWPID) 在多线程环境下会导致只有调用线程进入新 PID namespace，其他线程留在旧 namespace——违反 Linux 要求。nsexec.c 通过 __attribute__((constructor)) 在 Go runtime 启动前执行，此时进程还是单线程，可以安全地做 clone + setns。这是 runc 必须用 CGo 的根本原因。"
+      },
+      {
+        "text": "手动将一个进程放入已有 cgroup v2 的步骤是什么？如何验证限制生效？",
+        "answer": "步骤：(1) mkdir /sys/fs/cgroup/mycontainer 创建子 cgroup；(2) echo '200000 100000' > cpu.max 设限制（200ms/100ms = 2 核）；(3) echo $PID > cgroup.procs 将进程移入。验证：读 cpu.stat 的 nr_throttled 和 throttled_usec 字段——如果进程持续吃 CPU，throttled 计数会增长。也可以用 systemd-cgtop 实时观察该 cgroup 的资源用量。"
+      }
+    ],
+    "dockerfile-semantics": [
+      {
+        "text": "Dockerfile 中两条 RUN 指令之间的 layer cache 何时失效？COPY 指令的 cache key 是怎么计算的？",
+        "answer": "RUN 指令的 cache key 是指令字符串本身——只要文本不变且前面所有层都命中缓存，就复用。COPY 的 cache key 基于源文件的 stat 信息（大小、修改时间）和内容 checksum（SHA256），不看文件名。一旦某层 cache miss，该层之后的所有层都重建——这就是 'cache bust propagation'。所以变化频繁的 COPY（如代码）应放在 Dockerfile 末尾。"
+      },
+      {
+        "text": "ENTRYPOINT 和 CMD 的组合关系是什么？为什么 ML 推理镜像通常用 ENTRYPOINT exec 形式？",
+        "answer": "ENTRYPOINT 定义容器的主可执行文件，CMD 作为默认参数追加。exec 形式（JSON 数组 [\"python\", \"serve.py\"]）直接 execve，PID 1 就是 python 进程，能正确接收 SIGTERM 做 graceful shutdown。shell 形式（ENTRYPOINT python serve.py）会通过 /bin/sh -c 启动，PID 1 是 sh，SIGTERM 发给 sh 而非 python——K8s 发 preStop 信号时推理服务无法优雅排空请求。"
+      },
+      {
+        "text": "ARG 和 ENV 的作用域有什么区别？在 multi-stage build 中 ARG 如何跨 stage 传递？",
+        "answer": "ARG 只在 build 阶段可用，不写入镜像 metadata；ENV 写入镜像，运行时也存在。ARG 的作用域限于声明它的 stage——跨 stage 无法直接访问前一个 stage 的 ARG。解决办法：在 FROM 之前声明全局 ARG，每个 stage 内再用 ARG 重新声明同名变量即可继承 --build-arg 的值。注意全局 ARG 不能有默认值依赖其他 ARG。"
+      }
+    ],
+    "multi-stage-ml": [
+      {
+        "text": "ML 镜像的三阶段构建（build → compile → runtime）每个阶段分别做什么？最终镜像为什么能比单阶段小 5-10 倍？",
+        "answer": "build 阶段：基于 devel 镜像，安装编译工具链（gcc、nvcc、cmake），编译 C++ extension 和 CUDA kernel。compile 阶段：pip install + wheel 打包，生成纯 .so/.whl。runtime 阶段：基于 runtime 镜像（不含编译器），只 COPY --from=compile 打好的 wheel 和模型文件。最终镜像不含 ~4GB 的 CUDA toolkit、编译器、头文件和中间产物，所以能大幅缩小。"
+      },
+      {
+        "text": ".dockerignore 对 ML 项目特别重要的原因是什么？应该排除哪些典型文件？",
+        "answer": "ML 项目根目录常有 GB 级的 checkpoints、datasets、.git 历史和 venv。Docker build 前会把 context 完整打包发送给 daemon——没有 .dockerignore 意味着每次 build 传输数 GB 数据。应排除：*.ckpt、*.pt、*.safetensors、data/、.git/、__pycache__/、.venv/、wandb/、*.egg-info。模型权重应在运行时从 model registry 拉取，不打入镜像。"
+      },
+      {
+        "text": "NVIDIA 的 devel 和 runtime 基础镜像有什么区别？为什么推理服务不应该用 devel 镜像？",
+        "answer": "devel 镜像包含完整 CUDA toolkit（nvcc 编译器、头文件、静态库），约 4-5GB；runtime 只包含运行 CUDA 应用的共享库（libcudart、libcublas 等），约 1-2GB。推理服务不需要编译 CUDA 代码，用 devel 镜像会 (1) 增大攻击面（含编译器）(2) 拉取和启动更慢 (3) 浪费磁盘和 page cache。用 runtime 甚至 base（只含 driver 兼容库）就够了。"
+      }
+    ],
+    "buildkit-parallel": [
+      {
+        "text": "BuildKit 为什么比传统 docker build 快？它的 DAG 执行模型具体做了什么优化？",
+        "answer": "传统 docker build 严格按 Dockerfile 行顺序串行执行。BuildKit 将 Dockerfile 解析为 LLB（Low-Level Build）DAG，无依赖关系的指令并行执行。例如两个独立的 COPY + RUN 阶段可以同时跑。加上更智能的缓存（content-addressable）、并发文件传输、lazy pulling（只拉需要的层），整体构建速度提升 2-5 倍。"
+      },
+      {
+        "text": "--mount=type=cache 和 --mount=type=secret 分别解决什么问题？在 ML 镜像构建中怎么用？",
+        "answer": "--mount=type=cache 将目录挂载为跨构建持久化的缓存卷，如 pip cache（/root/.cache/pip）——多次构建不重复下载 PyTorch 2GB 的 wheel。--mount=type=secret 在构建时临时挂载密钥文件（如 HuggingFace token），不写入镜像层。用法：RUN --mount=type=secret,id=hf_token HF_TOKEN=$(cat /run/secrets/hf_token) huggingface-cli download meta-llama/Llama-3。"
+      },
+      {
+        "text": "docker buildx bake 相比 docker compose build 有什么优势？什么场景下值得引入？",
+        "answer": "bake 通过 HCL/JSON 文件声明多 target 的构建矩阵，支持：(1) 多 target 并行构建（如同时构建 train 和 serve 镜像）；(2) target 间继承共享 args/cache-from 配置；(3) 变量插值和条件逻辑。适合 ML monorepo 中有多个服务镜像、需要矩阵构建（多 CUDA 版本 × 多 Python 版本）的场景，比 compose build 更灵活且原生并行。"
+      }
+    ],
+    "cuda-base-image": [
+      {
+        "text": "NVIDIA CUDA 容器镜像的 base、runtime、devel 三个 tier 分别包含什么？如何选择？",
+        "answer": "base 只含 CUDA runtime 的最小依赖（libcuda.so 兼容层），最小。runtime 在 base 上加了 CUDA runtime 库（libcudart、cuBLAS、cuDNN 等），适合运行预编译好的 CUDA 应用。devel 在 runtime 上加了完整 toolkit（nvcc、头文件、静态库），用于编译 CUDA 代码。选择原则：推理用 runtime，需要编译自定义 CUDA kernel 用 devel 做 builder stage，最终镜像基于 runtime。"
+      },
+      {
+        "text": "CUDA forward compatibility（前向兼容）是什么？什么条件下可以在旧驱动上运行新 CUDA toolkit 编译的应用？",
+        "answer": "Forward compat 允许新版 CUDA toolkit（如 12.4）编译的应用在旧版 driver（如 535 = CUDA 12.2）上运行，前提是安装 CUDA compat 包（cuda-compat-12-4）。它提供用户态的 libcuda.so 拦截层，将新 API 映射到旧 driver 能处理的调用。限制：仅限 datacenter GPU（Tesla/A100/H100），不支持 GeForce；且 driver 不能太旧——有最低 driver 版本要求。"
+      },
+      {
+        "text": "容器内的 CUDA 版本和宿主机 driver 版本之间的兼容关系是什么？nvidia-smi 显示的 CUDA 版本代表什么？",
+        "answer": "nvidia-smi 显示的是 driver 支持的最高 CUDA 版本（driver API 版本），不是实际安装的 CUDA runtime 版本。容器内的 CUDA runtime 版本必须 ≤ driver 支持的版本（向后兼容）。例如 driver 545 支持 CUDA ≤12.3，容器用 CUDA 12.2 runtime 没问题，用 12.4 则需要 forward compat 包或升级 driver。这是容器化 GPU 应用最常见的兼容问题。"
+      }
+    ],
+    "image-security-sbom": [
+      {
+        "text": "Trivy 和 Grype 做容器镜像 CVE 扫描的工作原理是什么？它们能发现哪些层面的漏洞？",
+        "answer": "两者都解析镜像的每一层，提取 OS 包管理器（apt/rpm）数据库和语言生态 lockfile（pip requirements、npm package-lock），然后与 CVE 数据库（NVD、GitHub Advisory、发行版 security tracker）匹配。能发现：OS 包漏洞、Python/Node/Java 依赖漏洞、已知恶意包。不能发现：自研代码漏洞、逻辑错误、0day。ML 镜像特别注意 PyTorch/TensorFlow 的 C++ 底层 CVE。"
+      },
+      {
+        "text": "SBOM（Software Bill of Materials）的 SPDX 和 CycloneDX 两种格式有什么区别？为什么 ML 镜像需要 SBOM？",
+        "answer": "SPDX 由 Linux 基金会维护，侧重 license compliance，是 ISO/IEC 5962 标准。CycloneDX 由 OWASP 维护，侧重安全和漏洞管理，支持 VEX（漏洞可利用性声明）。ML 镜像需要 SBOM 因为：(1) 供应链深——CUDA + cuDNN + PyTorch + 几十个 pip 包，需追踪每个组件版本；(2) 合规要求（如美国行政令 EO 14028）；(3) 复现性——记录精确的组件版本用于 model card。"
+      },
+      {
+        "text": "cosign 对镜像签名的流程是什么？Keyless signing 模式下谁充当 CA？",
+        "answer": "cosign sign 流程：对镜像 digest（sha256）生成签名，将签名作为 OCI artifact 推到同一 registry。Keyless 模式（cosign sign --yes）使用 Sigstore 的 Fulcio 作为 CA——开发者通过 OIDC（GitHub/Google 账号）认证身份，Fulcio 签发短期证书（10 分钟），签名记录写入 Rekor 透明日志。验证时不需要管理公钥，只需信任 Sigstore 的 root of trust。"
+      }
+    ],
+    "bridge-host-none": [
+      {
+        "text": "Docker 默认 bridge（docker0）和用户自定义 bridge 网络有什么关键区别？为什么推荐用自定义 bridge？",
+        "answer": "关键区别：(1) 自定义 bridge 有内建 DNS——容器间可用容器名互相解析，默认 bridge 只能用 --link（已废弃）或 IP；(2) 自定义 bridge 的容器自动互通且与其他网络隔离，默认 bridge 上所有容器互通无隔离；(3) 自定义 bridge 可热插拔（docker network connect/disconnect），默认 bridge 需要重启容器。生产环境必须用自定义 bridge。"
+      },
+      {
+        "text": "host 网络模式下容器的网络性能和普通进程相比如何？什么场景下适合用 host 网络？",
+        "answer": "host 模式容器直接使用宿主机网络栈，没有 veth pair、bridge、NAT 开销，网络性能与宿主进程完全相同。适合场景：(1) 高性能网络需求如 RDMA/GPUDirect RDMA（不能经过 NAT）；(2) 需要绑定大量端口的服务（如 NCCL 多卡训练用动态端口范围）；(3) 网络监控/抓包工具。代价是失去端口隔离——容器端口直接暴露在宿主机上。"
+      },
+      {
+        "text": "none 网络模式下容器只有 loopback 接口，这种模式有什么实际用途？",
+        "answer": "none 模式适合：(1) 纯计算任务不需要网络（如 GPU batch 推理，输入输出通过 volume 挂载）；(2) 安全敏感场景——彻底消除网络攻击面，如处理不受信任的用户代码；(3) 自定义网络栈——先用 none 模式启动，再手动创建 veth pair 和路由（CNI 插件的实现方式）。E2B 等代码沙箱可能用 none + virtio-vsock 替代 TCP 网络。"
+      }
+    ],
+    "iptables-port-mapping": [
+      {
+        "text": "docker run -p 8080:80 时，Docker 在 iptables 中创建了哪些规则？数据包的完整转发路径是什么？",
+        "answer": "Docker 在 nat 表 DOCKER 链中添加 DNAT 规则：-p tcp --dport 8080 -j DNAT --to-destination 172.17.0.2:80，将宿主机 8080 入站流量目标地址改写为容器 IP。同时在 filter 表 DOCKER 链添加 ACCEPT 规则放行该流量。完整路径：外部 → 宿主 eth0:8080 → PREROUTING/DNAT → 路由判断到 docker0 bridge → FORWARD/ACCEPT → 容器 veth → 容器 eth0:80。"
+      },
+      {
+        "text": "docker-proxy 进程的作用是什么？为什么 Docker 不完全依赖 iptables 做端口转发？",
+        "answer": "docker-proxy 是用户态 TCP/UDP 代理进程，监听宿主机端口并转发到容器。它存在是因为 iptables DNAT 无法处理宿主机本地进程（localhost）访问映射端口的场景——本地流量走 OUTPUT 链而非 PREROUTING，DNAT 规则匹配路径不同。docker-proxy 确保 curl localhost:8080 也能到达容器。可以通过 daemon.json 中 \"userland-proxy\": false 禁用，用 hairpin NAT 替代。"
+      },
+      {
+        "text": "什么是 hairpin NAT？它解决了容器网络中的什么问题？",
+        "answer": "Hairpin NAT（也叫 NAT reflection/loopback）解决的是：容器 A 通过宿主机的映射端口（如 host:8080）访问容器 B，数据包从 bridge 出去又从同一个 bridge 口回来（像发夹弯）。默认 Linux bridge 禁止同端口进出，需要开启 bridge 端口的 hairpin mode（echo 1 > /sys/class/net/vethXXX/brport/hairpin_mode）。Docker 在禁用 userland-proxy 时自动配置 hairpin mode。"
+      }
+    ],
+    "macvlan-ipvlan": [
+      {
+        "text": "macvlan 的 bridge 模式和 802.1q trunk 模式有什么区别？什么场景用哪个？",
+        "answer": "bridge 模式：所有 macvlan 子接口共享父接口的 VLAN，子接口间可直接二层通信。802.1q trunk 模式：父接口作为 trunk 口，每个子接口绑定不同 VLAN tag，子接口间需经路由或 VLAN 间路由通信。bridge 模式用于同网段容器互通（如同一 GPU 集群节点上的训练容器），trunk 模式用于多租户隔离（不同用户的容器在不同 VLAN）。"
+      },
+      {
+        "text": "ipvlan L2 和 L3 模式的区别是什么？为什么某些云环境强制用 ipvlan 而非 macvlan？",
+        "answer": "L2 模式：子接口和父接口在同一广播域，子接口有独立 IP 但共享父接口 MAC。L3 模式：子接口在独立子网，父接口充当路由器，无 ARP/广播。云环境（如 AWS）通常限制每个 ENI 的 MAC 地址数量或禁用混杂模式，macvlan（每个子接口独立 MAC）会被交换机/hypervisor 拒绝。ipvlan 共享 MAC 绕过了这一限制。"
+      },
+      {
+        "text": "SR-IOV 对 GPU 节点上的容器网络有什么意义？它和 macvlan/ipvlan 的本质区别是什么？",
+        "answer": "SR-IOV 将物理网卡切分为多个 VF（Virtual Function），每个 VF 是独立 PCIe 设备，直通到容器。区别：macvlan/ipvlan 在软件层（内核）做包转发，SR-IOV 在硬件层做——VF 有独立的 DMA 引擎和中断，绕过宿主内核网络栈。对 GPU 节点意义：配合 GPUDirect RDMA，VF 可与同 PCIe 拓扑的 GPU 直接 DMA 传输，消除 CPU 拷贝瓶颈，NCCL 多机训练带宽接近线速。"
+      }
+    ],
+    "container-dns": [
+      {
+        "text": "容器内 /etc/resolv.conf 中的 127.0.0.11 是什么？它的 DNS 解析流程是怎样的？",
+        "answer": "127.0.0.11 是 Docker 内嵌的 DNS 服务器（embedded DNS server），运行在每个自定义网络的 network namespace 中。解析流程：容器 DNS 查询 → 127.0.0.11 → 先查容器名/service alias/network alias 的内部记录 → 未命中则转发到 daemon.json 中配置的 upstream DNS（默认是宿主机的 /etc/resolv.conf）。注意默认 bridge（docker0）上的容器不经过 embedded DNS。"
+      },
+      {
+        "text": "ndots 选项对容器 DNS 解析性能有什么影响？K8s 默认 ndots:5 在 Docker 场景下意味着什么？",
+        "answer": "ndots:N 表示：如果查询名中的 '.' 数量 < N，则先追加 search 域再查询。K8s 默认 ndots:5 意味着查询 'api.example.com'（2 个点 < 5）会先尝试 api.example.com.default.svc.cluster.local、api.example.com.svc.cluster.local 等，全部失败后才查原始域名——一个外部域名查询变成 5-6 次 DNS 请求。解决方案：对已知 FQDN 末尾加 '.'（如 api.example.com.），或针对性设置 ndots:2。"
+      },
+      {
+        "text": "Docker Compose 中多个 service 之间如何通过 DNS 互相发现？自定义 network alias 有什么作用？",
+        "answer": "Compose 自动为项目创建 default 网络，每个 service 名注册为 DNS A 记录——service B 中可以直接 curl http://serviceA:8080。如果 serviceA 有多个副本（scale=3），DNS 返回多个 A 记录实现客户端负载均衡。network alias 允许一个 service 注册额外的 DNS 名（如 alias: db-primary），用于蓝绿部署——切换 alias 指向无需改调用方配置。"
+      }
+    ],
+    "containerd-oci": [
+      {
+        "text": "OCI 的 image-spec 和 runtime-spec 分别定义了什么？为什么将它们分开？",
+        "answer": "image-spec 定义镜像的打包格式：manifest（层列表 + config）、layer（tar+gzip 的 rootfs diff）、index（多架构索引）。runtime-spec 定义容器运行时的配置格式：config.json 描述 rootfs 路径、namespace、cgroup、mounts、hooks。分开的原因是关注点分离——镜像如何存储/分发和容器如何运行是两个独立问题。你可以用非 OCI 镜像格式但用 OCI runtime 执行，反之亦然。"
+      },
+      {
+        "text": "containerd 的 shim v2 架构相比 v1 有什么变化？为什么每个容器需要一个 shim 进程？",
+        "answer": "v1 每种运行时操作（create/start/delete）都 fork 一个 shim 进程处理，v2 将一个容器的整个生命周期由一个 shim 进程管理，通过 ttrpc（轻量 gRPC）与 containerd 通信。每个容器需要 shim 的原因：shim 是容器 init 进程的父进程（reaper），containerd 重启时 shim 继续存活保持容器运行。没有 shim，containerd 升级就会杀死所有容器。"
+      },
+      {
+        "text": "K8s 1.24 移除 dockershim 后，Docker 和 containerd 的关系变成了什么？用户是否还能用 Docker？",
+        "answer": "移除 dockershim 后 kubelet 不再直接与 Docker daemon 对话，而是通过 CRI gRPC 接口直连 containerd。Docker 本身是 containerd 的上层封装（docker → dockerd → containerd → runc）。用户仍可在节点上安装 Docker 做开发调试，但 K8s 不通过 Docker 管理容器。也可以用 cri-dockerd（社区维护的 CRI 适配器）让 K8s 继续对接 Docker daemon，但增加了一层开销，不推荐。"
+      }
+    ],
+    "nvidia-container-toolkit": [
+      {
+        "text": "CDI（Container Device Interface）spec 文件长什么样？nvidia-ctk 如何生成它？",
+        "answer": "CDI spec 是 JSON/YAML 文件（通常在 /etc/cdi/nvidia.yaml），定义 vendor（nvidia.com）下每个 device 的：deviceNodes（/dev/nvidia0 等）、mounts（driver 库路径）、env（环境变量）、hooks（prestart 钩子）。生成命令：nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml，它自动探测系统上的 GPU 设备、driver 版本、库路径并填充 spec。MIG 设备会生成如 nvidia.com/mig-1g.10gb=0:0 的命名条目。"
+      },
+      {
+        "text": "libnvidia-container 在容器 GPU 访问中扮演什么角色？它做了哪些关键操作？",
+        "answer": "libnvidia-container 是 NVIDIA Container Toolkit 的底层库，容器 runtime 通过 prestart hook 调用它。关键操作：(1) 在容器 mount namespace 中挂载 driver 用户态库（libcuda.so、libnvidia-ml.so）；(2) 创建并挂载 /dev/nvidiaX、/dev/nvidia-uvm 设备节点；(3) 注入 CUDA_VISIBLE_DEVICES 环境变量控制可见 GPU；(4) 处理 /proc/driver/nvidia 虚拟文件系统的挂载。本质是将宿主 GPU 驱动 '投影' 到容器内。"
+      },
+      {
+        "text": "MIG 设备在 CDI 和 Docker 中的命名规范是什么？如何指定使用特定 MIG 实例？",
+        "answer": "MIG 设备的 CDI 名称格式：nvidia.com/mig-<profile>=<gpu-index>:<gi-index>，如 nvidia.com/mig-1g.10gb=0:2 表示 GPU 0 上第 2 个 GI 的 1g.10gb 实例。Docker 中通过 --device nvidia.com/mig-1g.10gb=0:2（CDI 模式）或 NVIDIA_VISIBLE_DEVICES=MIG-<UUID>（传统模式）指定。也可以用 nvidia-smi mig -lgi 查看 GI ID，再通过 MIG-GPU-<gpu-uuid>/<gi-id>/<ci-id> 格式精确指定。"
+      }
+    ],
+    "security-sandbox": [
+      {
+        "text": "gVisor 的 Sentry 如何拦截容器的系统调用？和 seccomp 有什么本质区别？",
+        "answer": "Sentry 是 gVisor 的用户态内核——容器进程的 syscall 被 ptrace 或 KVM 拦截后转发给 Sentry，由 Sentry 用 Go 实现的内核逻辑处理，不直接到宿主内核。seccomp 只做过滤（allow/deny/errno），通过的 syscall 仍由宿主内核执行。gVisor 的安全边界更强：即使容器发现 Sentry 的漏洞，还有宿主内核的 seccomp 作为第二层防护。代价是 syscall 密集型工作负载性能下降 10-30%。"
+      },
+      {
+        "text": "Kata Containers 和 Firecracker 都基于 VM 隔离，它们的定位有什么不同？",
+        "answer": "Kata Containers 是 CRI 兼容的容器运行时（shimv2），面向 K8s 生态——Pod 级 VM 隔离，支持多种 VMM 后端（QEMU-lite、Cloud Hypervisor、Firecracker）和设备直通（VFIO GPU passthrough）。Firecracker 是纯 VMM（Virtual Machine Monitor），面向 serverless 场景（Lambda、E2B），极简设计不支持 PCI 设备直通。Kata 可以用 Firecracker 作为后端，但 Firecracker 自身不是容器运行时。"
+      },
+      {
+        "text": "为什么 gVisor 和 Firecracker 都不支持容器内直接使用 GPU？有什么替代方案？",
+        "answer": "gVisor 的 Sentry 没有实现 ioctl 的 NVIDIA driver 接口——GPU 通信依赖大量私有 ioctl 命令码，Go 实现不现实。Firecracker 没有 PCI/VFIO 设备模型，无法做 GPU passthrough。替代方案：(1) Kata + QEMU-lite（支持 VFIO passthrough）；(2) gVisor 的 nvproxy——新增的实验性 NVIDIA ioctl 拦截层，已在 GKE Sandbox 中用于 GPU workload；(3) GPU 远程化方案（如 rCUDA、NVIDIA CUDA on MIG），容器内只跑 CPU 代码。"
+      }
+    ],
+    "seccomp-apparmor-caps": [
+      {
+        "text": "Linux capabilities 的 41 种能力中，Docker 默认保留了哪些？为什么 GPU 容器有时需要 CAP_SYS_ADMIN？",
+        "answer": "Docker 默认保留约 14 种 capability：NET_BIND_SERVICE、CHOWN、DAC_OVERRIDE、FOWNER、KILL、SETGID、SETUID、SYS_CHROOT 等——足够大多数应用运行。GPU 容器需要 CAP_SYS_ADMIN 的场景：(1) 旧版 NVIDIA driver 的 /dev/nvidia-uvm 初始化需要 mmap + ioctl 组合；(2) perf_event_open 做 GPU profiling（nsys/ncu）需要此 capability。新版 CDI 模式和 toolkit 已大幅减少对 SYS_ADMIN 的依赖。"
+      },
+      {
+        "text": "Docker 默认的 seccomp profile 过滤了哪些关键 syscall？为什么不建议使用 --security-opt seccomp=unconfined？",
+        "answer": "默认 profile 禁止约 44 个 syscall，包括：(1) 内核模块操作（init_module、delete_module）——防止容器加载恶意驱动；(2) reboot、swapon——防止影响宿主机；(3) mount/umount——防止逃逸；(4) perf_event_open——防止侧信道攻击。unconfined 解除所有限制，容器进程可以调用全部 syscall——一个内核漏洞就可能被利用来逃逸。即使需要放行某些 syscall，也应该自定义 profile 只放行所需的。"
+      },
+      {
+        "text": "AppArmor 和 seccomp 在容器安全中的角色有什么不同？它们可以叠加使用吗？",
+        "answer": "seccomp 在 syscall 层面做 allow/deny（哪些系统调用可以执行），AppArmor 在 LSM（Linux Security Module）层面做 MAC（强制访问控制）——控制进程对文件路径、网络、capability 的访问。两者可以且应该叠加：seccomp 限制 syscall 种类，AppArmor 限制 syscall 的目标资源。Docker 默认同时启用两者。如果宿主机用 SELinux（如 RHEL），则用 SELinux 替代 AppArmor，效果类似但基于标签而非路径。"
+      }
+    ],
+    "rootless-userns": [
+      {
+        "text": "User namespace 的 UID 映射机制是什么？/etc/subuid 文件的格式和作用是什么？",
+        "answer": "/etc/subuid 格式：username:起始UID:数量，如 alice:100000:65536 表示 alice 用户可以映射容器内 UID 0-65535 到宿主机 UID 100000-165535。容器内 root(UID 0) 实际是宿主机 UID 100000——无特权。内核在 user namespace 创建时读取此映射，通过 /proc/pid/uid_map 文件配置。这是 rootless 容器的基础：容器内可以 apt install、chown 等需要 root 的操作，宿主机上完全安全。"
+      },
+      {
+        "text": "Podman rootless 模式和 Docker rootless 模式有什么架构区别？",
+        "answer": "Podman 天生无 daemon——每个 podman 命令直接 fork/exec 创建容器进程，用 slirp4netns 做用户态网络栈（或 pasta 替代）。Docker rootless 仍需要运行一个 rootless dockerd 守护进程（在用户 namespace 内），通过 context 连接。架构差异：Podman 每次命令启动开销更低但无长驻进程管理状态；Docker rootless 保持了和普通 Docker 相同的 API 兼容性和镜像缓存管理。两者底层都用 user namespace + slirp4netns/pasta。"
+      },
+      {
+        "text": "Rootless 容器能使用 GPU 吗？CDI 如何解决 rootless + GPU 的挑战？",
+        "answer": "传统方式不行——rootless 容器无法访问宿主机 /dev/nvidia*（root 权限设备节点），也无法运行 nvidia-container-cli 的 prestart hook（需要 setuid）。CDI 解决了这个问题：设备信息声明在 /etc/cdi/nvidia.yaml 中，容器 runtime（containerd/Podman）在创建容器时根据 CDI spec 直接挂载设备和库，不需要 prestart hook。前提是 /dev/nvidia* 设备节点的权限对 rootless 用户可读写（通常通过 udev rule 或 nvidia-persistenced 设置）。"
+      }
+    ]
+  }
+}
