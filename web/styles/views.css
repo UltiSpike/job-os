@@ -1629,6 +1629,109 @@ button.pl-stat:hover { background: rgba(196, 123, 42, 0.06); }
 .curr-concept strong { color: var(--amber); font-weight: 600; }
 .curr-concept code { font-family: var(--font-mono); font-size: 11px; padding: 1px 4px; background: var(--bg-2); border: 1px solid var(--line); }
 
+/* ─── sidebar section 子列表 ─── */
+.curr-seclist-wrap { list-style: none; padding: 0; margin: 0; }
+.curr-seclist { list-style: none; padding: 2px 0 4px 0; margin: 0; background: rgba(0,0,0,.15); }
+.curr-secitem { display: flex; align-items: center; gap: 6px; padding: 5px 10px 5px 28px; cursor: pointer; font-size: 11px; color: var(--char-soft); transition: color .12s, background .12s; }
+.curr-secitem:hover { color: var(--bone); background: rgba(196,123,42,.06); }
+.curr-secitem.active { color: var(--amber); background: rgba(196,123,42,.1); }
+.secitem-num { font-family: var(--font-mono); font-size: 9px; opacity: .5; flex-shrink: 0; width: 14px; }
+.secitem-title { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+/* ─── inline TOC (单页阅读 scroll 导航) ─── */
+.curr-toc { display: flex; flex-wrap: wrap; gap: 0; margin-bottom: 16px; border-bottom: 1px solid var(--line); padding-bottom: 8px; }
+.curr-toc-item { display: flex; align-items: baseline; gap: 4px; padding: 4px 10px; font-family: var(--font-mono); font-size: 10px; color: var(--char-soft); text-decoration: none; border-left: 1px solid var(--line); cursor: pointer; transition: color .15s; }
+.curr-toc-item:first-child { border-left: none; }
+.curr-toc-item:hover, .curr-toc-item.active { color: var(--amber); }
+.toc-num { opacity: .5; }
+
+/* ─── inline section blocks ─── */
+.curr-sections { margin-bottom: 22px; }
+.curr-section { margin-bottom: 18px; padding-bottom: 14px; border-bottom: 1px dashed var(--line); }
+.curr-section:last-of-type { border-bottom: none; }
+.curr-section-title { margin: 0 0 8px 0; font-family: var(--font-mono); font-size: 11px; color: var(--amber); text-transform: uppercase; letter-spacing: .1em; }
+.sect-num { display: inline-block; width: 20px; color: var(--char-soft); opacity: .5; }
+
+/* ─── sub-heading TOC (section 子页面内的二级导航) ─── */
+.curr-sub-toc { margin-bottom: 14px; }
+.curr-sub-anchor { scroll-margin-top: 8px; }
+
+/* ─── section detail (sidebar 点击进入的子页面) ─── */
+.curr-section-detail { }
+.curr-section-breadcrumb { display: flex; align-items: center; gap: 6px; padding: 6px 0 14px; font-family: var(--font-mono); font-size: 11px; color: var(--char-soft); cursor: pointer; transition: color .15s; }
+.curr-section-breadcrumb:hover { color: var(--amber); }
+.breadcrumb-arrow { font-size: 14px; }
+.curr-section-head { margin-bottom: 16px; }
+.section-head-num { font-family: var(--font-mono); font-size: 10px; color: var(--char-soft); opacity: .5; display: block; margin-bottom: 4px; }
+.curr-section-head h3 { margin: 0; font-size: 16px; color: var(--amber); }
+.curr-section-nav { display: flex; justify-content: space-between; margin-top: 24px; padding-top: 14px; border-top: 1px dashed var(--line); }
+.sect-prev, .sect-next, .sect-back-end { font-size: 11px; }
+.curr-section-content,
+.curr-section-body { font-size: 13px; line-height: 1.75; color: var(--bone); }
+.curr-section-content p,
+.curr-section-body p { margin: 0 0 12px 0; }
+.curr-section-content strong,
+.curr-section-body strong { color: var(--amber); font-weight: 600; }
+.curr-section-content code,
+.curr-section-body code { font-family: var(--font-mono); font-size: 11px; padding: 1px 4px; background: var(--bg-2); border: 1px solid var(--line); }
+.curr-section-content ul,
+.curr-section-body ul { margin: 0 0 12px 0; padding-left: 16px; list-style: none; }
+.curr-section-content li,
+.curr-section-body li { position: relative; padding-left: 12px; margin-bottom: 4px; }
+.curr-section-content li::before,
+.curr-section-body li::before { content: '·'; position: absolute; left: 0; color: var(--amber); }
+
+/* ─── mental model callout ─── */
+.curr-mental-model { display: flex; gap: 10px; padding: 12px 14px; margin: 16px 0 22px; background: rgba(196,123,42,.06); border: 1px solid rgba(196,123,42,.2); border-left: 3px solid var(--amber); }
+.mm-icon { font-family: var(--font-mono); font-size: 16px; color: var(--amber); flex-shrink: 0; line-height: 1.75; }
+.mm-text { font-size: 12px; line-height: 1.65; color: var(--bone); font-style: italic; }
+.mm-text p { margin: 0; }
+
+/* ─── table inside sections ─── */
+.curr-table-wrap { overflow-x: auto; margin: 8px 0 12px; }
+.curr-table-wrap table { width: 100%; border-collapse: collapse; font-size: 11px; font-family: var(--font-mono); }
+.curr-table-wrap th, .curr-table-wrap td { padding: 4px 8px; border: 1px solid var(--line); text-align: left; }
+.curr-table-wrap th { color: var(--amber); font-weight: 600; background: rgba(196,123,42,.04); }
+
+/* ─── fenced code block (```lang ... ```) ─── */
+.curr-concept pre.curr-code,
+.curr-section-content pre.curr-code,
+.curr-section-body pre.curr-code {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.65;
+  padding: 10px 12px;
+  margin: 10px 0 14px;
+  background: var(--bg-2);
+  border: 1px solid var(--line);
+  border-left: 2px solid var(--amber);
+  overflow-x: auto;
+  white-space: pre;
+  color: var(--bone);
+  tab-size: 2;
+}
+.curr-concept pre.curr-code code,
+.curr-section-content pre.curr-code code,
+.curr-section-body pre.curr-code code {
+  font-family: inherit;
+  font-size: inherit;
+  padding: 0;
+  background: none;
+  border: none;
+  color: inherit;
+  white-space: inherit;
+}
+.curr-code-lang {
+  display: block;
+  font-family: var(--font-mono);
+  font-size: 9px;
+  color: var(--char-soft);
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  margin-bottom: 6px;
+  opacity: 0.6;
+}
+
 /* drill list */
 .curr-drills-section { border-top: 1px dashed var(--line); padding-top: 14px; margin-bottom: 22px; }
 .curr-drills-section h4,
@@ -1729,43 +1832,7 @@ button.pl-stat:hover { background: rgba(196, 123, 42, 0.06); }
   font-family: var(--font-mono);
 }
 
-/* ─── persistent strip (top app strip showing today action) ─── */
-.persistent-strip {
-  display: flex;
-  align-items: center;
-  gap: 14px;
-  padding: 8px 22px;
-  background: linear-gradient(90deg, rgba(196, 123, 42, 0.10), rgba(196, 123, 42, 0.02) 60%, transparent);
-  border-top: 1px solid var(--line);
-  border-bottom: 1px solid var(--line);
-  font-family: var(--font-mono);
-  font-size: 11px;
-}
-.persistent-strip.hidden { display: none; }
-.persistent-strip .strip-label {
-  color: var(--bone);
-  font-weight: 600;
-  letter-spacing: 0.02em;
-}
-.persistent-strip .strip-cov {
-  color: var(--char-soft);
-  font-size: 10px;
-  padding: 2px 8px;
-  border: 1px solid var(--line);
-}
-.persistent-strip .strip-go {
-  margin-left: auto;
-  color: var(--amber);
-  text-decoration: none;
-  font-weight: 600;
-  padding: 4px 10px;
-  border: 1px solid var(--amber-soft);
-  transition: all 0.15s;
-}
-.persistent-strip .strip-go:hover {
-  background: var(--amber);
-  color: var(--bg-1, #0e0d0a);
-}
+/* persistent-strip 已被 cli-bar 内的 .cli-rec 取代，相关 CSS 已删 */
 
 /* ─── training lesson breadcrumb ─── */
 .q-lesson-bc {

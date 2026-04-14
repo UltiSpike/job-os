@@ -22,6 +22,7 @@ import { masteryDeltaToast } from '../components/rewardToast.js';
 // ─── 视图状态 ───
 let activeModuleSlug = null;     // 当前展开的 module
 let selectedLessonSlug = null;   // 右栏正在看的 lesson
+let selectedSectionKey = null;   // null = section 列表, 'why'/'core'/... = section 详情
 let drillCache = {};             // lessonSlug → [drill question rows]
 let capstoneCache = {};          // lessonSlug → capstone question row
 let capstoneAnalysisCache = {};  // lessonSlug → latest analysis (or null)
@@ -29,11 +30,12 @@ let capstoneAnalysisCache = {};  // lessonSlug → latest analysis (or null)
 // ─── URL hash 持久化 ───
 function readHashState() {
   const segs = location.hash.replace('#/', '').split('/');
-  // [view, track, module, lesson]
+  // [view, track, module, lesson, section]
   return {
     track: segs[1] || null,
     module: segs[2] || null,
     lesson: segs[3] || null,
+    section: segs[4] || null,
   };
 }
 
@@ -44,6 +46,7 @@ function writeHashState() {
   if (trackSlug) parts.push(trackSlug);
   if (activeModuleSlug) parts.push(activeModuleSlug);
   if (selectedLessonSlug) parts.push(selectedLessonSlug);
+  if (selectedSectionKey) parts.push(selectedSectionKey);
   const newHash = '#/' + parts.join('/');
   if (location.hash !== newHash) {
     history.replaceState({}, '', newHash);
@@ -175,20 +178,205 @@ function rerender() {
   import('../app.js').then(({ router }) => router.refresh());
 }
 
-// ─── 极简 markdown 渲染 ───
-function renderConcept(md) {
-  const paras = (md || '').split(/\n\n+/).map(p => {
-    let h = p
-      .replace(/&/g, '&amp;')
-      .replace(/</g, '&lt;')
-      .replace(/>/g, '&gt;')
-      .replace(/"/g, '&quot;')
-      .replace(/'/g, '&#39;');
-    h = h.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
-    h = h.replace(/`([^`]+)`/g, '<code>$1</code>');
-    return `<p>${h}</p>`;
-  }).join('');
-  return raw(paras);
+// ─── markdown 渲染 ───
+function escMd(t) {
+  return t.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+          .replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+}
+function inlineMd(t) {
+  return escMd(t).replace(/\*\*(.+?)\*\*/g,'<strong>$1</strong>')
+                 .replace(/`([^`]+)`/g,'<code>$1</code>');
+}
+function renderSimpleTable(text) {
+  const lines = text.split('\n').filter(l => l.trim().startsWith('|'));
+  if (lines.length < 2) return `<p>${inlineMd(text)}</p>`;
+  const parseRow = l => l.split('|').slice(1,-1).map(c => c.trim());
+  const hds = parseRow(lines[0]);
+  const rows = lines.slice(2); // skip separator
+  let t = '<table><thead><tr>' + hds.map(h => `<th>${inlineMd(h)}</th>`).join('') + '</tr></thead><tbody>';
+  rows.forEach(r => { t += '<tr>' + parseRow(r).map(c => `<td>${inlineMd(c)}</td>`).join('') + '</tr>'; });
+  return t + '</tbody></table>';
+}
+
+// 按 fenced code block 边界 + 空行切成顶层 block 列表。
+// 代码块保留为独立 block，里面的空行不会被二次拆分。
+function splitMdBlocks(md) {
+  if (!md) return [];
+  const lines = String(md).split('\n');
+  const blocks = [];
+  let buf = [];
+  let inFence = false;
+  let fenceLang = '';
+  let fenceLines = [];
+  const flushText = () => {
+    const text = buf.join('\n').replace(/^\n+|\n+$/g, '');
+    if (text) blocks.push({ type: 'text', content: text });
+    buf = [];
+  };
+  for (const line of lines) {
+    const fenceOpen = line.match(/^\s*```\s*([\w.+-]*)\s*$/);
+    if (fenceOpen) {
+      if (inFence) {
+        blocks.push({ type: 'code', lang: fenceLang, content: fenceLines.join('\n') });
+        fenceLines = [];
+        fenceLang = '';
+        inFence = false;
+      } else {
+        flushText();
+        inFence = true;
+        fenceLang = fenceOpen[1] || '';
+      }
+      continue;
+    }
+    if (inFence) {
+      fenceLines.push(line);
+    } else if (line.trim() === '') {
+      flushText();
+    } else {
+      buf.push(line);
+    }
+  }
+  if (inFence) {
+    // 未闭合 fence：保底当作代码块
+    blocks.push({ type: 'code', lang: fenceLang, content: fenceLines.join('\n') });
+  }
+  flushText();
+  return blocks;
+}
+
+function renderBlock(b) {
+  if (b.type === 'code') {
+    const label = b.lang ? `<span class="curr-code-lang">${escMd(b.lang)}</span>` : '';
+    return `<pre class="curr-code">${label}<code>${escMd(b.content)}</code></pre>`;
+  }
+  const trimmed = b.content.trim();
+  if (trimmed.startsWith('|')) return `<div class="curr-table-wrap">${renderSimpleTable(trimmed)}</div>`;
+  if (/^- /.test(trimmed)) {
+    const items = trimmed.split('\n').filter(l => l.trim().startsWith('- '))
+      .map(l => `<li>${inlineMd(l.replace(/^-\s*/,''))}</li>`).join('');
+    return `<ul>${items}</ul>`;
+  }
+  return `<p>${inlineMd(trimmed)}</p>`;
+}
+
+function renderMd(md) {
+  return splitMdBlocks(md).map(renderBlock).join('');
+}
+function renderConcept(md) { return raw(renderMd(md)); }
+
+// ─── section inline 渲染（lesson 主页，TOC scroll + 全部 sections 展示）───
+function renderSectionsInline(lesson) {
+  const sections = lesson.sections || [];
+  const mm = lesson.mental_model || '';
+  if (!sections.length) {
+    return html`<section class="curr-concept">${renderConcept(lesson.concept_md)}</section>`;
+  }
+  return html`
+    <nav class="curr-toc">
+      ${sections.map((s, i) => html`
+        <a class="curr-toc-item" data-scroll-sect="${s.key}">
+          <span class="toc-num">${String(i+1).padStart(2,'0')}</span>
+          ${s.title}
+        </a>
+      `)}
+    </nav>
+    <div class="curr-sections">
+      ${sections.map((s, i) => html`
+        <section class="curr-section" id="sect-${s.key}">
+          <h4 class="curr-section-title">
+            <span class="sect-num">${String(i+1).padStart(2,'0')}</span>
+            ${s.title}
+          </h4>
+          <div class="curr-section-body">${raw(renderMd(s.content_md))}</div>
+        </section>
+      `)}
+      ${mm ? html`
+        <aside class="curr-mental-model">
+          <span class="mm-icon">◈</span>
+          <div class="mm-text">${raw(renderMd(mm))}</div>
+        </aside>
+      ` : ''}
+    </div>
+  `;
+}
+
+// ─── 子标题解析（从 content_md 提取 **N. Title** 模式）───
+const SUB_HEADING_RE = /^\*\*(?:(\d+)\.\s*)?(.+?)\*\*$/;
+function parseSubHeadings(md) {
+  const blocks = splitMdBlocks(md);
+  const subs = []; // { id, title, num, blockIdx }
+  blocks.forEach((b, i) => {
+    if (b.type !== 'text') return;
+    const firstLine = b.content.trim().split('\n')[0];
+    const m = firstLine.match(SUB_HEADING_RE);
+    if (m) {
+      const num = m[1] || String(subs.length + 1);
+      const title = m[2].trim();
+      subs.push({ id: `sub-${num}`, title, num, blockIdx: i });
+    }
+  });
+  return subs;
+}
+
+// ─── section 详情（子页面，复用 inline TOC 设计）───
+function renderSectionDetail(lesson) {
+  const sections = lesson.sections || [];
+  const idx = sections.findIndex(s => s.key === selectedSectionKey);
+  if (idx < 0) return html`<div class="curr-detail-empty">未找到该 section</div>`;
+  const sect = sections[idx];
+  const prevSect = idx > 0 ? sections[idx - 1] : null;
+  const nextSect = idx < sections.length - 1 ? sections[idx + 1] : null;
+  const subs = parseSubHeadings(sect.content_md);
+  const hasSubs = subs.length >= 2;
+
+  // 渲染 content_md，给子标题段落加 id 锚点
+  function renderWithAnchors(md) {
+    const blocks = splitMdBlocks(md);
+    let subIdx = 0;
+    return blocks.map(b => {
+      if (b.type === 'text') {
+        const firstLine = b.content.trim().split('\n')[0];
+        const m = firstLine.match(SUB_HEADING_RE);
+        if (m && subIdx < subs.length) {
+          const sub = subs[subIdx++];
+          return `<div id="${sub.id}" class="curr-sub-anchor">${renderBlock(b)}</div>`;
+        }
+      }
+      return renderBlock(b);
+    }).join('');
+  }
+
+  return html`
+    <article class="curr-section-detail">
+      <nav class="curr-section-breadcrumb" data-section-back>
+        <span class="breadcrumb-arrow">←</span>
+        <span class="breadcrumb-lesson">${lesson.name}</span>
+      </nav>
+      <header class="curr-section-head">
+        <span class="section-head-num">${String(idx+1).padStart(2,'0')} / ${String(sections.length).padStart(2,'0')}</span>
+        <h3>${sect.title}</h3>
+      </header>
+      ${hasSubs ? html`
+        <nav class="curr-toc curr-sub-toc">
+          ${subs.map(s => html`
+            <a class="curr-toc-item" data-scroll-sub="${s.id}">
+              <span class="toc-num">${s.num}</span>
+              ${s.title}
+            </a>
+          `)}
+        </nav>
+      ` : ''}
+      <div class="curr-section-content">${raw(hasSubs ? renderWithAnchors(sect.content_md) : renderMd(sect.content_md))}</div>
+      <nav class="curr-section-nav">
+        ${prevSect
+          ? html`<button class="btn ghost sect-prev" data-section-go="${prevSect.key}">← ${prevSect.title}</button>`
+          : html`<span></span>`}
+        ${nextSect
+          ? html`<button class="btn ghost sect-next" data-section-go="${nextSect.key}">${nextSect.title} →</button>`
+          : html`<button class="btn ghost sect-back-end" data-section-back>回到概览</button>`}
+      </nav>
+    </article>
+  `;
 }
 
 // ─── 渲染：track header ───
@@ -243,7 +431,6 @@ function renderLessonList(tree) {
     <ul class="curr-lesslist">
       ${mod.lessons.map(l => {
         const ok = isPrereqSatisfied(l, progressMap);
-        // 优先用 mastery 状态，没数据 fallback 到 progress
         const m = getMasteryForLesson(l.slug);
         let g;
         if (m && m.status === 'mastered') g = { ch: '✓', cls: 'st-passed' };
@@ -251,15 +438,33 @@ function renderLessonList(tree) {
         else if (m && m.status === 'learning') g = { ch: '●', cls: 'st-progress' };
         else if (!ok) g = { ch: '╳', cls: 'st-locked' };
         else g = { ch: '○', cls: 'st-available' };
-        const sel = selectedLessonSlug === l.slug ? 'sel' : '';
+        const isSelected = selectedLessonSlug === l.slug;
+        const sel = isSelected ? 'sel' : '';
         const masteryPct = m ? Math.round((m.score || 0) * 100) : null;
+        const sections = (l.sections || []);
+        const expanded = isSelected && sections.length > 0;
         return html`
           <li class="curr-lessrow ${sel}" data-lesson="${l.slug}" style="--m:${masteryPct ?? 0}%">
-            <span class="lessrow-glyph ${g.cls}">${g.ch}</span>
+            <span class="lessrow-glyph ${g.cls}">${expanded ? '▾' : g.ch}</span>
             <span class="lessrow-num">${String(l.order_index).padStart(2, '0')}</span>
             <span class="lessrow-name">${l.name}</span>
             <span class="lessrow-est">${masteryPct != null ? masteryPct + '%' : l.est_minutes + 'm'}</span>
           </li>
+          ${expanded ? html`
+            <li class="curr-seclist-wrap">
+              <ul class="curr-seclist">
+                ${sections.map((s, i) => {
+                  const active = selectedSectionKey === s.key ? 'active' : '';
+                  return html`
+                    <li class="curr-secitem ${active}" data-section-go="${s.key}">
+                      <span class="secitem-num">${String(i+1).padStart(2,'0')}</span>
+                      <span class="secitem-title">${s.title}</span>
+                    </li>
+                  `;
+                })}
+              </ul>
+            </li>
+          ` : ''}
         `;
       })}
     </ul>
@@ -273,13 +478,19 @@ function renderLessonDetail() {
   }
   const lesson = findLesson(selectedLessonSlug);
   if (!lesson) return html`<div class="curr-detail-empty">未找到这节课</div>`;
+
+  // Section 详情模式
+  if (selectedSectionKey && (lesson.sections || []).length) {
+    return renderSectionDetail(lesson);
+  }
+
+  // Section 列表模式（lesson 概览页）
   const drills = drillCache[selectedLessonSlug];
   const cap = capstoneCache[selectedLessonSlug];
   const lastAn = capstoneAnalysisCache[selectedLessonSlug];
   const progress = lesson.progress;
   const mastery = getMasteryForLesson(selectedLessonSlug);
 
-  // 状态徽章 inline — 优先用 mastery 状态
   let statusLabel;
   if (mastery && mastery.status === 'mastered') statusLabel = '已掌握';
   else if (mastery && mastery.status === 'rusty') statusLabel = '需要复习';
@@ -299,7 +510,7 @@ function renderLessonDetail() {
         </div>
       </header>
 
-      <section class="curr-concept">${renderConcept(lesson.concept_md)}</section>
+      ${renderSectionsInline(lesson)}
 
       <section class="curr-drills-section">
         <h4>◇ 练手题（${drills ? drills.length : '…'}）</h4>
@@ -426,6 +637,7 @@ export const curriculumView = {
           break;
         }
         selectedLessonSlug = restoredLesson.slug;
+        selectedSectionKey = hashState.section || null;
       } else {
         // 没指定 lesson → 自动选当前 module 的第一节该学的
         const mod = findModule(activeModuleSlug, tree);
@@ -455,6 +667,7 @@ export const curriculumView = {
         // 切 track 时清掉所有局部缓存避免串话
         activeModuleSlug = null;
         selectedLessonSlug = null;
+        selectedSectionKey = null;
         drillCache = {};
         capstoneCache = {};
         capstoneAnalysisCache = {};
@@ -488,6 +701,7 @@ export const curriculumView = {
     root.querySelectorAll('[data-lesson]').forEach(el => {
       el.addEventListener('click', () => {
         selectedLessonSlug = el.dataset.lesson;
+        selectedSectionKey = null;
         loadLessonQuestions(selectedLessonSlug);
         writeHashState();
         rerender();
@@ -501,8 +715,54 @@ export const curriculumView = {
       });
     });
 
+    // sidebar section 子项：点击进入 section 子页面
+    root.querySelectorAll('[data-section-go]').forEach(el => {
+      el.addEventListener('click', (e) => {
+        e.stopPropagation();
+        selectedSectionKey = el.dataset.sectionGo;
+        writeHashState();
+        rerender();
+      });
+    });
+
+    // section 详情页返回
+    root.querySelectorAll('[data-section-back]').forEach(el => {
+      el.addEventListener('click', () => {
+        selectedSectionKey = null;
+        writeHashState();
+        rerender();
+      });
+    });
+
+    // section 子页面内的 sub-heading scroll
+    root.querySelectorAll('[data-scroll-sub]').forEach(el => {
+      el.addEventListener('click', (e) => {
+        e.preventDefault();
+        const target = root.querySelector(`#${el.dataset.scrollSub}`);
+        if (target) {
+          target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+          root.querySelectorAll('.curr-sub-toc .curr-toc-item').forEach(a => a.classList.remove('active'));
+          el.classList.add('active');
+        }
+      });
+    });
+
+    // inline TOC：scroll 到对应 section（纯阅读体验，不切子页面）
+    root.querySelectorAll('[data-scroll-sect]').forEach(el => {
+      el.addEventListener('click', (e) => {
+        e.preventDefault();
+        const target = root.querySelector(`#sect-${el.dataset.scrollSect}`);
+        if (target) {
+          target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+          root.querySelectorAll('.curr-toc-item').forEach(a => a.classList.remove('active'));
+          el.classList.add('active');
+        }
+      });
+    });
+
     root.querySelector('[data-scroll-concept]')?.addEventListener('click', () => {
-      root.querySelector('.curr-concept')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      const target = root.querySelector('.curr-sections') || root.querySelector('.curr-concept');
+      target?.scrollIntoView({ behavior: 'smooth', block: 'start' });
     });
   },
 };
