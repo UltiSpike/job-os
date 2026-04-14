@@ -193,6 +193,22 @@ input, textarea, select { font: inherit; color: inherit; }
   text-transform: uppercase;
   letter-spacing: 0.1em;
 }
+.cli-rec {
+  margin-left: 14px;
+  padding-left: 14px;
+  border-left: 1px solid var(--line);
+  color: var(--amber);
+  text-decoration: none;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  max-width: 50ch;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  transition: opacity 0.12s;
+}
+.cli-rec:hover { color: var(--amber-hi, #d49a4f); }
+.cli-rec.hidden { display: none; }
 
 /* ─── main ─────────────────────────────── */
 main {

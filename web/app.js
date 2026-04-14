@@ -12,7 +12,7 @@ import { decisionView } from './views/decision.js';
 import { meView } from './views/me.js';
 import { curriculumStore, loadCurriculum } from './store/curriculum.js';
 import { meStore, loadMe } from './store/me.js';
-import { installPersistentStrip } from './components/persistentStrip.js';
+import { installCliBarRec } from './components/cliBarRec.js';
 import { openSettingsModal } from './views/_settingsModal.js';
 import { fmtClock } from './components/dates.js';
 import { toast } from './components/toast.js';
@@ -91,7 +91,7 @@ async function boot() {
   curriculumStore.subscribe(rerender);
   meStore.subscribe(rerender);
 
-  installPersistentStrip();
+  installCliBarRec();
 
   router.refresh();
   setStatus('ready');
