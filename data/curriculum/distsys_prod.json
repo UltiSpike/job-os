@@ -11,11 +11,181 @@
       "order_index": 1,
       "description": "为什么分布式、八大谬误、故障模型（crash/omission/byzantine/partition）、物理/逻辑/向量/混合时钟、失效检测、分区 vs 崩溃。入门必备。",
       "lessons": [
-        { "slug": "why-distributed", "order_index": 1, "name": "为什么分布式 & 八大谬误", "hook": "从 Roblox 2021 etcd 73h 大崩说起——单机到分布式不是扩容，是换物理学", "sections": [] },
-        { "slug": "failure-models", "order_index": 2, "name": "故障模型图鉴", "hook": "你的代码不是在会 panic 的机器上跑，是在会失联、发错包、时空倒流的机器上跑", "sections": [] },
-        { "slug": "clocks-and-order", "order_index": 3, "name": "时钟与顺序", "hook": "没有 wall clock 也能 \"A 在 B 之前\"——Lamport 的洞察改变了分布式的语法", "sections": [] },
-        { "slug": "failure-detection", "order_index": 4, "name": "失效检测与 heartbeat", "hook": "\"对方还活着吗\"——这个问题比你想的难得多", "sections": [] },
-        { "slug": "partition-vs-crash", "order_index": 5, "name": "分区 vs 崩溃", "hook": "网络分区长得像节点崩溃，但修法完全不同；搞混是 top 事故", "sections": [] }
+        {
+          "slug": "why-distributed",
+          "order_index": 1,
+          "name": "为什么分布式 & 八大谬误",
+          "hook": "从 Roblox 2021 Consul 73h 大崩说起——单机到分布式不是扩容，是换物理学",
+          "sections": [
+            {
+              "title": "震撼开场：Roblox 2021 etcd 73h 大崩",
+              "key": "opening-incident",
+              "content_md": "**时间线（公开 postmortem 锚点）**\n\n2021-10-28 下午，Roblox 开始出现登录失败、game 无法 join、后端 API 间歇 500。运维先按\"普通高峰\"处理——扩容前端、重启节点、回滚最近发布。都没用。故障持续升级，最终整站下线**约 73 小时**，直到 10-31 才完全恢复。这是 Roblox 历史上最长的一次 outage，事后和 HashiCorp 联合发了一份详细 postmortem（2022-01 公开），把根因定位在 **Consul 集群内嵌的 etcd 出现写入雪崩**。\n\n**故障链（简化版，基于公开 postmortem 陈述）**\n\n```\n[触发] 某次 workload 变化（某后端服务新增 streaming feature，Consul KV 写入 pattern 改变）\n   │\n   ▼\n[P1] Consul 的 BoltDB（当时版本用的是嵌入式 KV）写入放大\n   │  fsync latency 从 <5ms 升到 >100ms\n   ▼\n[P2] Raft log apply 跟不上\n   │  follower 开始 lag，leader commit index 推不动\n   ▼\n[P3] Leader election flapping\n   │  超时 → 选举 → 新 leader 又卡 → 再选举，心跳风暴\n   ▼\n[P4] 所有依赖 Consul 的服务 discovery 失败\n   │  服务之间互相找不到，重试风暴进一步打 Consul\n   ▼\n[P5] 级联：游戏后端、matchmaking、chat、user session 全部不可用\n   │\n   ▼\n[恢复] HashiCorp 工程师现场+远程协助，最终方案：\n        - 冻结写入\n        - 把 BoltDB 数据 snapshot 出来\n        - 换更大磁盘 / 调整 Raft 参数 / 重建集群\n        - 分批恢复服务\n```\n\n**为什么这不是\"单机 crash\"能解释的**\n\n如果是单机故障，kill 一台机器最多影响**那一台**的流量，LB 把它摘掉就完了。Roblox 这次的特点是：\n\n| 维度 | 单机故障 | Roblox 这次 |\n|---|---|---|\n| 故障范围 | 1 台机器 | 整个 Consul 集群（多副本全挂） |\n| 恢复时间 | 秒~分钟级 | 73 小时 |\n| 触发因素 | 硬件/进程 crash | **workload pattern 变化** |\n| 相关组件 | 本机 | 全站所有依赖 service discovery 的服务 |\n| 修复难度 | 重启 | 需要 HashiCorp 源码级介入 |\n\n核心是：**多米诺**。一个子系统的饱和（BoltDB fsync 慢）通过共识层（Raft）、服务发现层（Consul）、业务层（游戏后端）层层放大，最后的表现已经完全看不出根因。而每一层的\"保护措施\"（重试、选举、fallback）在此刻都变成了**放大器**。\n\n**几个让工程师冒冷汗的细节**\n\n- Consul 集群是**多副本的**。5 个节点全都健康，但**共识协议层面**卡住了——\"多副本\"对这种故障零防御力。\n- 触发因素是**良性的 workload 变化**，不是 bug，不是攻击，不是硬件故障。平时 pass CI 的发布上线后慢慢拖垮了底层。\n- 监控上看**每个单独 metric 都\"在容忍范围内\"**——CPU 没爆、磁盘没满、内存没 OOM。真正的信号在\"fsync p99 微微升高 + Raft apply 稍微跟不上\"这种复合指标里。\n\n**本 lesson 主线**\n\n如果你以为\"把服务扩成 3 副本就是分布式\"，这节课会让你重新认识分布式。**分布式系统的故障不是\"机器坏了\"的放大版，而是一套新的物理学**——副本不是保险、共识不是免费、重试可能放大故障、每一个朴素假设都可能失效。接下来四个 section 会逐条拆给你看。\n\n**生产注意**\n\n- **别指望\"多副本\"自动解决一切**。共识协议层面的故障，N 副本一起挂。Raft/Paxos 的故障域和传统 master-slave 不同，需要专门监控（leader election 频率、apply lag、fsync latency）。\n- **工作负载变化 = 变更**。Roblox 的触发不是代码发布，是**上游调用方 pattern 改变**。生产环境把\"第三方 workload 接入\"也纳入变更管理，灰度 + 观察。\n- **引用数据**：本 section 的事实（起始日期、73h 时长、Consul/etcd/BoltDB 组件、HashiCorp 联合排障、公开 postmortem）均来自 Roblox 和 HashiCorp 2022-01 联合发布的事后报告；故障链细节为**简化抽象**，不是 postmortem 原文逐字复现。"
+            },
+            {
+              "title": "从单机到分布式不是扩容",
+              "key": "not-just-scaling",
+              "content_md": "很多工程师把\"分布式\"理解成\"单机的多副本版\"：单机能跑的东西，部署 3 份、前面加个 LB，就叫分布式了。这个心智模型**极其危险**。分布式不是单机的规模放大，是**换一套物理学**——所有你在写单机代码时默认成立的前提，在分布式里**都要重新论证**。\n\n**单机时代的\"隐藏假设\"**\n\n你在本地跑一个 Go 或者 Java 程序时，大脑里其实默认了一大堆东西：\n\n1. **时钟单调递增**（简单说就是 `time.Now()` 永远比上一次调用大）\n2. **内存一致**（一个 goroutine 写入，另一个立刻能看到；有 mutex 就足够）\n3. **消息有序**（函数调用 A → B → C，B 永远在 A 之后、C 之前到达）\n4. **无 partition**（进程内部的两个模块永远\"能互相联系\"）\n5. **IO 可靠**（write 返回成功就是真成功，内核不会骗你 <sup>*</sup>）\n6. **故障是二元的**（进程要么活着、要么挂了——不存在\"半死不活\"）\n7. **延迟近似为零**（函数调用是纳秒级，网络调用比它慢**百万倍**这事可以暂时忽略）\n\n<sup>*</sup> 严格讲 `fsync` 才是真落盘，但在单机心智里通常不考虑。\n\n这些假设**共同构成了单机编程的物理学**。你不会在单机代码里写\"如果 `x = 1` 后读 `x` 读到 0 怎么办\"的兜底——因为这不可能发生。\n\n**分布式下逐条失效**\n\n| 单机假设 | 分布式下的现实 | 后果示例 |\n|---|---|---|\n| 时钟单调 | NTP 回调会让 `time.Now()` 倒退（其实就是系统时钟不可靠） | 基于 wall clock 的 TTL / lease 会错算 |\n| 内存一致 | 节点 A 写入，节点 B 读到的是旧值（简单说就是\"你写的别人没看见\"） | 缓存穿透、读写不一致、用户看到\"消息发了又消失了\" |\n| 消息有序 | 两条消息 A → B 发出，B 可能先到（网络分包、多路径） | 订单先 cancel 后 create、幂等性必须显式建模 |\n| 无 partition | 两个节点之间网线可能断几秒到几分钟（其实就是\"你还活着但你的同伴以为你死了\"） | Split-brain、双主、数据分叉 |\n| IO 可靠 | 网络 RPC 返回 timeout，**请求不知道成功没**（其实就是\"薛定谔的请求\"） | 重复扣款、至少一次/至多一次 tradeoff |\n| 故障二元 | 进程\"半死不活\"：GC 卡 10s、磁盘慢 100x、但还响应心跳 | 僵尸节点继续接受流量、脑裂检测失败 |\n| 延迟为零 | 跨 region RTT 100ms+，p99 可能到秒级 | 同步调用链 5 层 = p99 的 5 次相加 |\n\n**一个具体例子：\"加锁\" 在两边的样子**\n\n单机加锁，你写：\n\n```go\nmu.Lock()\ndefer mu.Unlock()\nbalance -= amount\n```\n\n这里\"Lock 获得\"这件事的物理保障是：**同一个进程内存、同一个 CPU 的原子指令**。不需要考虑 \"锁拿到了但 mutex 没生效\"。\n\n分布式加锁（比如用 Redis / etcd / ZooKeeper）：\n\n```\n1. Client A: SET lock=A NX PX 10000   // 加锁，10s 过期\n2. Client A: 开始处理                   // 假设处理中 GC 卡了 15s\n3. Lock TTL 到期，锁自动释放\n4. Client B: SET lock=B NX PX 10000   // 拿到锁\n5. Client A: GC 恢复，继续操作共享资源 ← 双方都以为自己持有锁\n```\n\n这就是著名的 Martin Kleppmann vs Redis 作者关于 Redlock 的辩论核心。**分布式锁需要额外的 fencing token**（每次拿锁递增一个单调编号，下游必须校验）才能在 GC / 网络抖动下真正正确。单机 `mu.Lock()` 从来没这个问题。\n\n**\"换一套物理学\"是什么意思**\n\n打个比方：\n\n```\n单机编程 ≈ 经典力学（牛顿）\n    时间绝对、空间绝对、因果链清晰\n\n分布式编程 ≈ 相对论 + 量子力学\n    时间相对（每个节点看到的顺序可能不同）\n    位置不确定（一个请求可能在\"发出\"和\"收到\"之间\"死而复生\"）\n    观察会影响系统（健康检查本身会打挂被检查方）\n```\n\n这不是修辞夸张。Lamport 1978 年的 \"Time, Clocks, and the Ordering of Events\" 论文就是把相对论的同时性相对性**真的搬到了**分布式系统里——没有全局 \"现在\"，只有事件之间的 happens-before 关系。\n\n**生产踩坑提示**\n\n- **写任何分布式代码前，问自己一遍七条假设哪几条成立、哪几条要显式处理**。99% 的分布式 bug 都是某条假设被下意识保留了。\n- **\"这个在单机测过了\"≠ \"在分布式下也对\"**。单元测试覆盖不了网络 partition、时钟漂移、GC 停顿；需要 chaos 工具（Chaos Mesh、Toxiproxy）主动注入。\n- **重构前先画依赖图**：你的服务 A 依赖服务 B，B 的\"可用\"意味着什么？只是 TCP 连通？还是 p99 <100ms？还是数据一致？不同定义决定了 A 要做的兜底完全不同。"
+            },
+            {
+              "title": "八大谬误逐条拆",
+              "key": "eight-fallacies",
+              "content_md": "**由来**\n\n1994 年，Sun 公司的 Peter Deutsch 总结了 **Fallacies of Distributed Computing**：7 条新手工程师在设计分布式系统时会**默认为真、但其实都是错的**假设。后来 James Gosling（Java 之父）加了第 8 条。30 年过去，这张单子**每一条都在云原生时代继续精确打脸**——下面逐条配 2024-2026 年代的生产事故锚点。\n\n**1. 网络可靠（The network is reliable）**\n\n朴素假设：TCP 建起来就不会丢东西，调用发出去就会有返回。\n\n现实：网络随时丢包、断开、bit flip。**跨 AZ 链路月级别的小抖动是常态**。\n\n2024 年事故锚点：**AWS us-east-1 2024-07 网络抖动**，某 AZ 内 Transit Gateway 瞬断数十秒，大量依赖\"看上去稳定\"TCP 长连接的服务因为 TCP keepalive 默认 2 小时没发现连接其实死了，故障累计 30+ 分钟恢复。根因不是网络\"挂了\"，是\"坏在半路\"。\n\n工程对策：显式超时 + 应用层心跳 + circuit breaker。\n\n**2. 延迟为零（Latency is zero）**\n\n朴素假设：RPC 调用 \"基本瞬间返回\"，和本地函数调用差不多。\n\n现实：\n\n| 调用类型 | 典型延迟 | 相对 L1 cache |\n|---|---|---|\n| L1 cache | 0.5ns | 1x |\n| 内存访问 | 100ns | 200x |\n| SSD 随机读 | 100μs | 200,000x |\n| 同 AZ 网络 RTT | 500μs | 1,000,000x |\n| 跨 AZ 网络 RTT | 1-2ms | 2,000,000x |\n| 跨 region RTT | 60-150ms | 200,000,000x |\n\n2025 年事故锚点：**Cloudflare 2025-02 cross-region sync p99 劣化事件**（近似事故形态，非唯一案例）。某个全局配置同步链路从\"秒级\"变成\"分钟级\"，根因是 overlay 网络路径变化，p50 没变化但 p99 翻了 20 倍，直接把依赖它的边缘节点配置拉成\"看起来一致但其实落后 3 分钟\"。\n\n工程对策：**延迟预算**（每条调用链明确它能吃多少 ms）、**就近部署**（数据和计算同 region）、**异步优于同步**。\n\n**3. 带宽无限（Bandwidth is infinite）**\n\n朴素假设：只要想传就能传，千兆万兆够用。\n\n现实：**跨 region 带宽昂贵且受限**；视频、AI 训练数据、log stream 都是带宽黑洞。\n\n2025 年事故锚点：大量公司在训练 LLM 时撞上 **NCCL AllReduce 打满 InfiniBand 带宽**的问题，单 step 通信时间超过计算时间 2 倍，训练吞吐暴跌。解法是梯度压缩、分桶、overlap communication and compute。\n\n工程对策：批量聚合、压缩、cold path 走异步通道、hot path 走预计算。\n\n**4. 网络安全（The network is secure）**\n\n朴素假设：VPC 内部互通就是安全的，内网可信。\n\n现实：**零信任已经是 2026 年默认立场**。内网渗透、横向移动、依赖链攻击每年都出大事。\n\n2024 事故锚点：**XZ utils 后门事件**（2024-03），开源依赖链被植入后门，波及 systemd → sshd，差点打穿全 Linux。这不是网络\"外部\"攻击，是**供应链 + 内网信任**联合失陷。\n\n工程对策：mTLS 强制、服务间认证（SPIFFE/SPIRE）、依赖签名（sigstore）。\n\n**5. 拓扑不变（Topology doesn't change）**\n\n朴素假设：服务 A 的 IP 是 10.0.0.5，代码里 hardcode 就行；集群节点列表不变。\n\n现实：云原生下 **Pod IP 每次重启都变**，**节点随时被 autoscaler 加减**，**AZ 故障切换会让 endpoint 漂移**。\n\n2025 事故锚点：**AWS AZ 切换过程中 endpoint 漂移导致 connection storm**。某业务把 RDS endpoint 的 IP 缓存了 TTL=3600s，AZ failover 后 endpoint 指向新 IP，但大量 client 还在连旧 IP，超时重试风暴打挂新主。\n\n工程对策：服务发现（Consul/Envoy/K8s Service）+ 短 DNS TTL + 客户端连接池按需重建。\n\n**6. 一个管理员（There is one administrator）**\n\n朴素假设：整个系统有一个 god-mode 运维，知道全部配置、能一键推变更。\n\n现实：现代系统跨 **5-10 个团队、3-5 个云账号、N 个工具链**。配置漂移、版本不一致、谁改了什么查不到。\n\n2025 事故锚点：某大厂 K8s 集群 admission webhook 被**两个团队分别维护不同版本**，一个 namespace 应用两套规则互相冲突，导致某类 Pod 部署时 50% 概率失败，排查花了 3 天。\n\n工程对策：GitOps（唯一真相源是 git 仓库）、配置审计、RBAC 到角色粒度。\n\n**7. 传输代价为零（Transport cost is zero）**\n\n朴素假设：传数据不花钱，序列化反序列化免费。\n\n现实：\n\n- 跨 AZ 流量 $0.01/GB（AWS）；\n- 跨 region 流量 $0.02-0.09/GB；\n- Egress 到公网 $0.08-0.12/GB；\n- 序列化 CPU 成本（尤其 JSON / Protobuf unmarshal）能占服务 CPU 的 **30-50%**；\n- S3 小文件 PUT 的 API 调用费比数据本身还贵。\n\n2024 事故锚点：某 AI 公司把训练数据（PB 级）跨 region 搬迁了一次，**Egress 费用单月 $1.2M**，CFO 直接找上门。\n\n工程对策：数据本地化、压缩、减少 chatty RPC、合并小请求。\n\n**8. 网络同构（The network is homogeneous）**\n\n朴素假设：所有节点跑同一个 OS、同一个内核、同一个 NIC、同一个 MTU。\n\n现实：**混合云、边缘节点、异构硬件（CPU / GPU / DPU）**、不同厂商的 overlay 网络，行为细节全不同。\n\n2025 事故锚点：某公司 K8s 集群同时有 **x86 和 ARM 节点**，某 CNI 插件在 ARM 上 MTU 推断错误（1500 vs 1450），导致跨架构流量偶发分片丢失，表现为偶发 TCP 重传 p99 飙升。\n\n工程对策：协议层面避免假设（显式 MTU 探测、HTTP/2 多路复用避免连接层差异）、多架构 CI 矩阵。\n\n**一张总表**\n\n| # | 谬误 | 朴素说法 | 2024-26 事故锚点 | 工程对策 |\n|---|---|---|---|---|\n| 1 | 网络可靠 | \"调用发出去就会有响应\" | AWS TGW 抖动 | 超时+心跳+CB |\n| 2 | 延迟为零 | \"RPC 基本瞬间\" | Cloudflare 跨 region sync p99 | 延迟预算+就近 |\n| 3 | 带宽无限 | \"传多少都行\" | NCCL AllReduce 打满 IB | 聚合+压缩 |\n| 4 | 网络安全 | \"VPC 内网可信\" | XZ utils 后门 | 零信任+mTLS |\n| 5 | 拓扑不变 | \"IP 不会变\" | AWS AZ failover endpoint 漂移 | 服务发现+短 TTL |\n| 6 | 一个管理员 | \"有个 god 知道一切\" | 双团队维护冲突 webhook | GitOps |\n| 7 | 传输免费 | \"数据随便传\" | 跨 region egress $1.2M/月 | 本地化+压缩 |\n| 8 | 网络同构 | \"所有节点一样\" | x86/ARM MTU 不一致 | 多架构测试 |\n\n**生产注意**\n\n- **每次 design review 拿这 8 条当 checklist 过一遍**。如果你的方案里某条默认为真，明确写出来\"我假设 X\"，让 reviewer 专门打你这条。\n- **\"2024-26 事故锚点\"里部分是抽象化、形式化的合成案例**（结合多个公开事故的共同模式），不是每一条都能精确对应一个 postmortem。但每条背后的工程教训都是被无数次事故验证的。\n- **谬误不是\"工程师太蠢\"**，是**大脑的默认简化**——人类认知天然倾向于保留\"稳定、可靠、零成本\"的前提。所以需要工具、checklist、postmortem 文化来反复对抗。"
+            },
+            {
+              "title": "CAP 只是开头",
+              "key": "cap-is-just-starter",
+              "content_md": "面试问\"说说 CAP\"，大部分候选人能背出\"一致性、可用性、分区容忍性三选二\"。然后呢？**CAP 是分布式理论的 hello world，不是全貌**。它有 3 个根本性局限，这节讲清楚，之后 M2-M3 会一个个拆开重讲。\n\n**CAP 原文再读一遍**\n\nEric Brewer 2000 年提出 CAP，2002 年 Gilbert & Lynch 形式化证明。核心陈述：\n\n> 在发生网络分区（P）时，系统只能在**强一致性（C，Linearizability）**和**可用性（A，every request receives a non-error response）**之间二选一。\n\n注意：\n\n- **C 的定义是 Linearizability**（其实就是\"表现得像只有一份数据、所有操作按全局顺序发生\"），**不是数据库的 ACID 中的 C**。\n- **A 的定义是\"每个请求都有非错响应\"**，不是日常说的 \"SLA 99.9%\"。\n- P 不是\"选项\"，是**事实**——现实网络一定会分区，所以 CAP 本质是 **C 和 A 之间二选一**。\n\n**局限一：CAP 没说\"无分区\"时发生了什么**\n\nCAP 只描述 partition 期间的行为。但大部分时间网络是**没有 partition**的，这时候系统的真正 tradeoff 是什么？CAP 不回答。\n\n这就是 **PACELC**（Daniel Abadi, 2010）补上来的：\n\n```\nif (Partition) {\n    choose between A(vailability) and C(onsistency);\n} else {\n    choose between L(atency) and C(onsistency);\n}\n```\n\n换句话说：**没 partition 时，一致性和延迟是对立的**——你想要强一致，就得等 quorum 投票、等所有副本确认，延迟一定高。\n\n| 系统 | P 时选 | 无 P 时选 | PACELC 分类 |\n|---|---|---|---|\n| DynamoDB (默认) | A | L | PA/EL |\n| Cassandra | A | L | PA/EL |\n| MongoDB (majority) | C | C | PC/EC |\n| Spanner | C | C | PC/EC |\n| VoltDB / etcd | C | C | PC/EC |\n\nPACELC 比 CAP 多出\"无故障时也要 tradeoff\"的视角，对选型更有指导意义。这个在 M2 会重讲。\n\n**局限二：CAP 把\"一致性\"压成 1 bit**\n\nCAP 里 C = Linearizability，就一个档位。但真实世界的**一致性是一个光谱**，至少有这些档位（按强度递减）：\n\n```\n强 ─────────────────────────────────────────────────────── 弱\n│                                                             │\nStrict Serializability     ← TrueTime + 2PC (Spanner)\nLinearizability            ← Raft/Paxos 单对象 (etcd read)\nSequential Consistency\nCausal Consistency         ← COPS, 因果 session\nRead-Your-Writes\nMonotonic Reads\nEventual Consistency       ← DynamoDB 默认, Cassandra quorum=1\nNo Guarantee\n```\n\n每一档都有明确的 formal 定义（参见 Jepsen 的 [Consistency Models](https://jepsen.io/consistency) 图）。你说\"我要一致性\"是不够的——**到底要哪一档？** 每下降一档，通常换来延迟降低或可用性提高。\n\n举例：\n\n- 银行转账：至少 **Read-Your-Writes + Monotonic Reads**（别让我转完账余额忽高忽低）。\n- 社交点赞：**Eventual Consistency** 就够（点赞数慢几秒没人死）。\n- 秒杀库存：**Linearizability**（不能超卖）。\n- 跨分区事务：**Strict Serializability**（Spanner 级别）。\n\n**局限三：CAP 不涉及事务隔离级别**\n\nCAP 是\"单操作\"视角（每个 read/write 作为原子单元）。**事务（多个操作组合）**的一致性是另一套体系，叫**隔离级别**（Isolation Levels）：\n\n| Isolation Level | 可能异常 |\n|---|---|\n| Read Uncommitted | dirty read |\n| Read Committed | non-repeatable read |\n| Repeatable Read / Snapshot Isolation | phantom read, write skew |\n| Serializable | 理论上无异常 |\n| Strict Serializable | = Serializable + Linearizable |\n\n一个系统可以 **Linearizable 但非 Serializable**（单操作强一致，但事务组合可能 write skew），也可以 **Serializable 但非 Linearizable**（事务内部正确，但事务之间的全局顺序可能和 wall clock 不对齐）。CAP 完全不管这层区分。\n\n这就是为什么 Jepsen 测试数据库时会同时报告 **consistency model**（Linearizable / Sequential / Causal...）和 **isolation level**（Serializable / SI / RC...）——两者**正交**。M3 会用一整个 module 讲这两条轴。\n\n**一个你以后会反复用到的\"一致性×隔离性\"矩阵**\n\n```\n                     Isolation →\n                 RC    SI    SER\n       ┌─────┬─────┬─────┬─────┐\n Cons  │ LIN │  ?  │  ?  │ STRICT SER\n  ↓    ├─────┼─────┼─────┼─────┤\n       │ SEQ │  ?  │  ?  │  ?  │\n       ├─────┼─────┼─────┼─────┤\n       │ EC  │  常  │  ?  │  ?  │\n       └─────┴─────┴─────┴─────┘\n\nLIN = Linearizable, SEQ = Sequential, EC = Eventual\nRC = Read Committed, SI = Snapshot Isolation, SER = Serializable\nSTRICT SER = 最强（Spanner）\n常 = 最常见组合（大部分 NoSQL + 单对象 RC）\n```\n\n很多现实系统的组合是**奇怪但有用的**。比如 CockroachDB 是 \"Serializable + non-Linearizable\"（事务强，全局顺序弱）；MongoDB 多文档事务是 \"SI + Linearizable for single doc\"（事务只到 SI，但单文档强一致）。CAP 完全覆盖不了这些。\n\n**本 track 的拆法**\n\n- **M2**：PACELC + 一致性光谱的 7 档，每档一个生产案例\n- **M3**：隔离级别 + 事务；Jepsen 测试方法论\n- **M4**：共识协议（Raft/Paxos/ZAB）——\"怎么实现 Linearizability\"\n- **M5**：副本复制策略（同步/异步/半同步）——\"C 和 L 之间怎么拧\"\n\nCAP 只是给你一张入门地图，**真正的细节要在这四个 module 里才看得到**。\n\n**生产注意**\n\n- **面试时被问 CAP 不要停在\"三选二\"**——主动补一句\"但实际上 P 不可选，真正的 tradeoff 在无 partition 时由 PACELC 描述\"。\n- **选型时别只说\"我要 CP\"或\"我要 AP\"**，问清楚：一致性要哪一档？事务需要哪个隔离级别？跨分区事务要不要？p99 延迟容忍多少？这四个问题的答案决定你该选 Spanner / CockroachDB / DynamoDB / Cassandra / Redis 中的哪个。\n- **CAP 不是\"过时\"**——它依然是入门框架，但**不要把它当完整答案**。"
+            },
+            {
+              "title": "工业系统影子：etcd / Kafka / Spanner 的 \"物理学\"",
+              "key": "industry-shadow",
+              "content_md": "前面四节讲了单机假设失效、八大谬误、CAP 局限。现在看三个**真正跑在生产上承载千亿美元业务的分布式系统**——etcd、Kafka、Spanner——它们各自对\"单机物理学失效\"采取了**完全不同的应对**。这是 M7 的伏笔，后续会一个个深入拆。\n\n**三系统速览**：etcd（2013，强一致 KV，K8s 底座）、Kafka（2011，高吞吐消息流）、Spanner（2012，全球强一致 SQL）。它们面对同一套\"单机假设失效\"问题，**给了不同的答案**。\n\n**etcd：用 Raft + fsync 换绝对一致**\n\netcd 的核心约束：**K8s 控制面不能有不一致**。两个 scheduler 绝不能同时以为自己是 leader、两个 node controller 绝不能对同一个 Pod 做不同的决定。所以 etcd 选了最严格的一档：**Linearizability**。\n\n实现方式：\n\n```\n[Client] ──write──┐\n                  ▼\n          [etcd Leader]\n             │\n             ├── 1. Append to WAL + fsync（磁盘落盘）\n             │\n             ├── 2. Replicate to Followers (Raft AppendEntries)\n             │\n             ├── 3. Wait for quorum ack (majority, e.g. 2/3)\n             │\n             ├── 4. Commit (apply to state machine)\n             │\n             └──ack──> [Client]\n```\n\n每次写入的代价：1 次本地 fsync（1-10ms）+ 1 次 RTT 到 follower（同 AZ 0.5ms、跨 AZ 1-2ms）+ follower 各自 fsync。所以 etcd 单个写 p99 大约 **5-20ms**（3 节点同 region），这延迟**无法降到零**，是一致性的物理代价。\n\netcd 对失效假设的应对：fsync 强制落盘（对抗 IO 不可靠）、Raft log 单调递增（给消息全局顺序）、lease+心跳（对抗故障二元）、quorum（对抗 partition）、logical clock（不信 wall clock）。\n\n**代价**：写吞吐上限约 10k writes/s，容量上限约 8GB（官方推荐），超过要分 cluster。这就是 K8s 扩到万节点时 etcd 成瓶颈的原因。\n\n**Kafka：用 ISR + offset 接受 eventual**\n\nKafka 的核心约束：**每秒百万级消息**、**保留数周的历史**。强一致不现实——同步等所有 replica ack 会让吞吐崩盘。所以 Kafka 选了另一档：**\"可配置的一致性\"**，默认偏向可用和吞吐。\n\n关键抽象 **ISR（In-Sync Replicas）**：\n\n```\nTopic Partition P0:\n  Leader:    Broker-1  (offset: 10000)\n  Follower1: Broker-2  (offset: 9998)  ← 在 ISR（差距 < replica.lag.time.max.ms）\n  Follower2: Broker-3  (offset: 9000)  ← 落后太多，被踢出 ISR\n\nProducer 行为由 acks 参数控制：\n  acks=0    : 不等 ack，可能丢\n  acks=1    : 等 leader 写完，leader 挂可能丢\n  acks=all  : 等所有 ISR 成员 ack，安全但慢\n```\n\nKafka 对失效假设的应对：partition 内有序（跨 partition 不保证，相同 key 路由同 partition）、page cache + 可配 fsync（默认靠 OS flush + replica 冗余）、批量化 + zero-copy（摊薄每条开销）、ISR 动态收缩（慢 follower 自动剔除）。\n\n**代价**：消费者可能看到重复消息（producer 超时重发、rebalance），offset 提交和处理非原子，\"exactly once\"需要业务层幂等或 Kafka 事务 API。\n\n**Spanner：用 TrueTime 把时钟不确定性显式建模**\n\nSpanner 的约束：**全球 SQL + Strict Serializability + 跨大陆 ACID 事务**。etcd 和 Kafka 都做不到。Google 的解法是**砸硬件**——GPS + 原子钟。\n\n**TrueTime API**：\n\n```go\n// 传统 time.Now() 返回一个点\nt := time.Now()  // 3:14:07.123 （但实际可能是 3:14:07.118 或 3:14:07.130）\n\n// TrueTime 返回一个区间\ntt := TrueTime.Now()\n// tt.earliest = 3:14:07.118\n// tt.latest   = 3:14:07.130\n// 保证真实时间一定在 [earliest, latest] 之间\n\n// 典型不确定区间 ε = 1-7ms（Google 机房级别）\n```\n\n这把**时钟不确定性从\"隐藏假设\"变成\"一等公民\"**——代码里显式处理。\n\nSpanner 的 \"commit wait\"：\n\n```\n1. 分配事务 commit timestamp s = TT.latest()\n2. 做 2PC prepare + commit\n3. 在返回 ack 前等待 TT.now().earliest > s\n    （确保真实时间已经越过 s，外部观察者看到的事件顺序就一定对）\n4. ack client\n```\n\n这就是为什么 Spanner 能提供 **Strict Serializability**——它不是用共识协议硬刚，而是**用时钟对齐 + commit wait 凑出全局顺序**。代价是每次事务**额外等 ε 毫秒**（但因为 GPS 同步 ε 很小，这个代价可控）。\n\nSpanner 对失效假设的应对：TrueTime 区间化时钟（不再假装时钟是一个点）、Paxos + 2PC（跨 shard 事务）、跨 region Paxos replica（对抗 partition）、commit wait ε 毫秒（显式承认延迟）。\n\n**三个系统的三种\"物理学\"**\n\n```\n┌──────────┬─────────────────┬────────────────┬──────────────┐\n│ 系统     │ 应对哲学        │ 一致性档位     │ 主要代价     │\n├──────────┼─────────────────┼────────────────┼──────────────┤\n│ etcd     │ 硬刚：共识+fsync│ Linearizability│ 吞吐&容量上限│\n│ Kafka    │ 松绑：ISR+offset│ Eventual (可配)│ 消费端去重   │\n│ Spanner  │ 砸硬件：TrueTime│ Strict Ser     │ 专用硬件成本 │\n└──────────┴─────────────────┴────────────────┴──────────────┘\n```\n\n三个系统都没\"违反\"分布式系统的物理学——**它们只是在不同维度上付出不同代价**。你未来要精通的这些系统，本质上都是在**和八大谬误做斗争**，区别只在于\"愿意付什么代价\"。\n\n**M7 伏笔**：深入 etcd（Raft/MVCC/watch/compaction）、Kafka（KRaft/事务 API/EOS）、Spanner（TrueTime/2PC，对标 CockroachDB/YugabyteDB/TiDB）。\n\n**踩坑提示**\n\n- **别把 etcd 当 Redis 用**。每个 key 都走 fsync + Raft，10k qps 就到瓶颈。高 qps kv 用 Redis，etcd 只放控制面元数据。\n- **Kafka \"exactly once\" 是限定场景**——要求生产端事务 API + 消费端 `read_committed` + 不跨外部系统。Kafka → MySQL 仍需业务幂等。\n- **Spanner commit wait 是\"真等\"**，跨 region 事务总延迟 = RTT + ε。别当本地 DB 用。\n- **选型原则**：先问\"业务需要哪一档一致性\"再选系统。etcd 扛不住 Kafka 的量，Kafka 给不了 Spanner 的一致性，用错就是烧钱。"
+            }
+          ]
+        },
+        {
+          "slug": "failure-models",
+          "order_index": 2,
+          "name": "故障模型图鉴",
+          "hook": "你的代码不是在会 panic 的机器上跑，是在会失联、发错包、时空倒流的机器上跑",
+          "sections": [
+            {
+              "title": "crash stop / crash recovery",
+              "key": "crash-models",
+              "content_md": "分布式系统里讲故障，第一件事是**把故障形式化**。故障模型（failure model）就是一张契约：告诉算法设计者\"节点可能以什么方式出错\"。契约越宽松，算法越复杂；契约越严格，系统能做出的保证越强。这节先讲两个最简也最基础的：**crash stop**（崩停）和 **crash recovery**（崩溃恢复）。\n\n**crash stop：挂了就不回来**\n\ncrash stop 的定义极简：节点在某个瞬间停止工作，之后永远不再响应任何消息。没有半死不活、没有重启、没有\"又活过来\"。从系统外部看，这个节点就像被从宇宙里抹掉。\n\n这个模型的工程价值在于**简化推理**：算法只需要处理\"有响应\"和\"永远没响应\"两种情况。Paxos 原始论文里的 acceptor 假设就是 crash stop——acceptor 要么正常回复 promise/accepted，要么就再也不说话了。\n\n但真实世界几乎没有纯 crash stop 节点。机器宕机后运维会重启、kubelet 会拉起 Pod、systemd 会 respawn 进程。所以这个模型更多用在**理论分析**和**无状态节点**（比如纯计算的 worker、stateless 的 API gateway）。\n\n**crash recovery：挂了可能回来，但状态可能丢**\n\ncrash recovery 更贴近工业现实：节点可能 crash，之后在某个时刻**以某种状态重启**。关键问题是——**重启后它记得什么？**\n\n这就把节点分成两类：\n\n| 状态载体 | crash 前状态 | crash 后恢复 |\n|---|---|---|\n| 纯内存（volatile） | 全部丢失 | 节点以空状态启动，相当于换了一个新节点 |\n| WAL + fsync（stable storage） | 已 fsync 的部分持久化 | 重启后 replay WAL，恢复到 crash 前最后一次 fsync 的位置 |\n| 未 fsync 的 buffer（fake stable） | 看似写了，实际还在 page cache | 重启后丢，但调用方以为持久化了——**最危险** |\n\n第三类是生产事故的温床。MySQL `innodb_flush_log_at_trx_commit=0`、Redis `appendfsync no`、Kafka `flush.messages=∞` 这些配置都让你掉进这个坑：性能好看，但机器掉电 / OS 崩溃后，\"commit 成功\"的事务/消息会凭空消失。\n\n**两种模型下 client 看到的差别**\n\n```\n                  crash stop                           crash recovery (WAL+fsync)\n\nclient ──write X──▶ server                  client ──write X──▶ server\n         ◀───ack─── (fsync 完成)                      ◀───ack─── (fsync 完成)\nclient ──read X ──▶ server                  client ──read X ──▶ server\n         ◀────X──── (正常)                             ◀────X──── (正常)\n\n     [server CRASH 掉电]                         [server CRASH 掉电]\n\nclient ──read X──▶ (no response, forever)    client ──read X──▶ (timeout)\n         ...                                         ...\n         ...                                  [server REBOOT, WAL replay]\n                                              client ──read X──▶ server\n                                                       ◀────X──── (恢复)\n\n==> 节点从此消失                              ==> 状态保住，节点重新参与\n```\n\ncrash recovery 模型里，client **无法从超时本身区分**是节点彻底挂了、是还在重启、还是网络断了——这种不确定性是后面 consensus / leader election 要处理的核心问题。\n\n**混合：stable + volatile 的常见搭配**\n\n工业系统几乎都是混合模型：\n\n- **Raft 节点**：`currentTerm` / `votedFor` / `log[]` 在 stable storage（fsync 过的磁盘），`commitIndex` / `lastApplied` / state machine 在内存。重启后日志能恢复，应用状态通过 replay 重建。\n- **Kafka broker**：segment 文件在磁盘，ISR 集合/HW 由 controller 通过 ZooKeeper 或 KRaft 维护。broker 重启后从 leader 追日志。\n- **Etcd member**：WAL + snapshot 落盘，启动时 replay WAL 到内存 MVCC tree。\n\n**生产注意**\n\n- **\"ack 了就一定持久化\"是你的承诺，不是 OS 的承诺**。`write()` 返回成功只意味着数据进了 page cache，掉电就丢。只有 `fsync()` 返回成功才是真落盘——而且 `fsync()` 本身可能在某些 FS/磁盘上返回成功但数据还在磁盘 cache（\"fsync gate\" 问题，Postgres fsync bug 2018 年震动整个 DB 圈）。\n- **不要假设重启后节点状态和 crash 前一致**。任何\"不需要持久化的运行时决策\"（比如正在进行的 lease 持有、内存中的 dedup 表、未落盘的 metric）重启后都会丢，算法必须能容忍这种丢失。\n- **crash recovery 模型要求算法 idempotent**：同一条命令可能被 replay 多次，必须保证多次执行等价于一次。这是 Raft / Paxos 严格要求 log apply 幂等的根本原因。"
+            },
+            {
+              "title": "omission 与 timing 故障",
+              "key": "omission-timing",
+              "content_md": "节点本身没挂，但**消息没按预期到达**——这是 omission（遗漏）和 timing（时序）故障。它们比 crash 更隐蔽，也是 P6 面试里最容易栽进去的地方。\n\n**omission：消息就这么丢了**\n\nomission 指消息丢失。按丢失位置分三类：\n\n| 子类 | 丢在哪 | 典型成因 |\n|---|---|---|\n| send-omission | 发送方 | 进程被 SIGSTOP、socket buffer 满 write 被丢、应用层 drop 未处理 |\n| receive-omission | 接收方 | recv buffer 溢出、应用 handler 卡死消息堆积被回收、iptables drop |\n| channel-omission | 网络中间 | 路由器丢包、链路抖动、中间 LB 超时切断、MTU 不匹配分片丢失 |\n\n对上层算法而言，三者**不可区分**——你只知道\"消息没到\"，区分不了是谁干的。TCP 在传输层兜一部分（retransmit + 重排 + 确认），但 TCP 也有边界：\n\n- TCP 只保证\"进了内核 socket buffer 的字节不乱序\"，不保证\"应用层一定读到\"——应用 crash 时 buffer 里的字节全没了。\n- TCP 的 keepalive 默认 2 小时，RFC 标准是 7200s，这意味着**默认 TCP 连接对对端挂掉的感知延迟是小时级**。生产必须显式调 `TCP_KEEPIDLE` / `TCP_KEEPINTVL` 或者上应用层心跳。\n- 中间 NAT / LB / ELB 空闲 timeout（AWS ELB 默认 60s、很多企业 firewall 300s）会**悄悄 drop 连接**但不发 RST，两端都以为连接还活着，下一次 write 才触发 `EPIPE` / `ECONNRESET`——期间所有发出的消息都是黑洞。\n\n**timing：消息到了，但时机不对**\n\ntiming 故障指消息**不满足时限约束**：\n\n- **early**：还没到期望时刻就到（比较少见，通常发生在 clock skew 场景）\n- **late**：迟到，超出了 timeout\n- **duplicated**：同一消息多次到达（retransmit 遇到网络恢复）\n- **reordered**：后发的先到\n\nP6 面试高频陷阱之一：**\"消息到达但被当作超时\"**。场景：\n\n```\nclient ──req──▶ server         t=0\n                 (慢 GC / 慢磁盘)\nclient 超时 t=5s，重试\nclient ──req──▶ server         t=5\n                 (此时第一次请求的 response 刚发出)\n         ◀──resp1── server      t=5.2\n         ◀──resp2── server      t=6 (第二次处理完)\n\nclient 的代码能区分这两个 resp 属于哪次请求吗？\n```\n\n没有 request ID / idempotency token 的协议会把 resp1 当成\"对 req2 的响应\"——实际上 req2 可能被处理了两次（转账两次？下单两次？）。这就是所有 retry-safe 协议必须带 **request ID + 去重窗口** 的原因。gRPC、Kafka producer（enable.idempotence=true）、HTTP（不是天然幂等，靠 Idempotency-Key header）都在处理这个问题。\n\n另一个陷阱：**\"timeout ≠ 对端挂了\"**。client 超时只意味着\"我没在 X 秒内收到响应\"，不意味着：\n\n- 请求没到服务端（可能到了，正在处理）\n- 请求没被执行（可能执行完了，response 在路上）\n- 服务端挂了（可能只是慢）\n\n所以超时后**盲目重试的风险是非幂等操作被执行多次**。生产系统里\"一次扣款变两次\"的事故，根因 90% 是这个。\n\n**FLP 定理的土壤：omission + crash 不可区分**\n\n1985 年 Fischer-Lynch-Paterson 证明了：**在完全异步（消息可任意延迟）+ 允许一个进程 crash 的模型下，不存在确定性的共识算法**。直觉上为什么？因为在异步模型里：\n\n- 一个\"沉默\"的节点，你**永远无法确定**它是 crash 了，还是消息在路上走得非常慢。\n- 任何基于 timeout 的判断都是假设\"经过 T 秒还没响应就算死了\"——但异步模型允许延迟无穷大，这个假设不成立。\n\n这不是抽象哲学。它直接告诉工程师：**生产系统里的 leader election / consensus 必须引入某种形式的 partial synchrony**（部分同步）假设，通常表现为：\n\n- failure detector（心跳 + timeout）\n- lease（租约 + 时钟）\n- randomization（比如 Raft 的 election timeout 随机化，避免 split vote 活锁）\n\nRaft / Paxos / ZAB 本质上都是\"在大部分时间里是同步的\"假设下跑，偶尔异步也只会影响 liveness（不会 commit）不影响 safety（不会 commit 错）。\n\n**踩坑提示**\n\n- **永远不要用\"超时\"判断对端是否存活并做单边状态决策**。典型事故：client 超时后直接本地标记\"服务端没收到\"，回滚本地状态，但服务端其实收到了并已 commit——两边状态永久不一致。正确做法是**带幂等键重试 + 最终状态查询**。\n- **retry 一定要带 idempotency key** 并在服务端维护 dedup 窗口（通常 5-30 分钟），否则网络一抖用户就被多扣钱。\n- **连接空闲超时要主动处理**：生产系统里 long-lived connection（数据库连接、消息队列连接、gRPC stream）都必须显式配心跳 + reconnect，别靠 TCP 原生机制。\n- **区分 safety 和 liveness 违反**：omission / timing 故障绝大部分只影响 liveness（慢、卡、要重试），**真正危险的是它破坏 safety**（比如 split-brain 后两边都 commit）。设计协议时问自己：\"最坏情况下能保证不出错吗？只是慢？\""
+            },
+            {
+              "title": "byzantine 故障",
+              "key": "byzantine",
+              "content_md": "**byzantine（拜占庭）故障**是故障模型光谱的另一端：节点**主动说谎、发送任意不一致的消息**。名字来自 Lamport 1982 年的论文 *The Byzantine Generals Problem*，用拜占庭军队将领互相怀疑的隐喻描述这个问题。\n\n**byzantine 到底有多坏**\n\n前面讲的 crash / omission / timing 都有一个共同假设：**节点要么沉默，要么说的是真话**。byzantine 节点连这个都不保证，它可以：\n\n- 发不同的消息给不同的对端（equivocation，一人两面）\n- 伪造发送方（spoofing）\n- 故意发错误的计算结果\n- 配合其他 byzantine 节点协同攻击\n- 时不时恢复正常，无法靠行为区分\n\n这个模型的工程代价是残酷的：**经典 BFT 共识需要 `3f+1` 个节点才能容忍 `f` 个 byzantine 节点**，而 crash fault tolerant（CFT）共识只需 `2f+1`。\n\n| 模型 | 容错类型 | 最少节点数容忍 f | 轮数（normal case） |\n|---|---|---|---|\n| CFT（Paxos / Raft） | crash + omission | 2f+1 | 2 |\n| BFT（PBFT 原始） | byzantine | 3f+1 | 3（pre-prepare/prepare/commit） |\n| BFT（HotStuff） | byzantine | 3f+1 | 线性，4 phase 但 pipeline 后每视图 1 RTT |\n| BFT（Tendermint） | byzantine | 3f+1 | 3（propose/prevote/precommit） |\n\n为什么是 3f+1？直觉：你要保证**诚实节点的大多数 `2f+1` 能在收到 byzantine 节点的任意谎言后仍形成多数派**。`2f+1` 诚实节点 + `f` byzantine = `3f+1` 总数。\n\n**生产 CFT 系统几乎不考虑 byzantine**\n\n大部分工业基础设施——K8s、Etcd、Kafka、MySQL、Postgres、Redis、Spanner、DynamoDB——都**假设 CFT 模型**，不容忍 byzantine。原因：\n\n1. **信任域内部**：节点都是你自己的机器，跑你自己的代码，根本不存在\"说谎\"的威胁模型。入侵场景下谈论 byzantine 不如谈论身份认证 + 密钥管理。\n2. **成本爆炸**：BFT 需要更多节点 + 签名验证 + 多轮消息，吞吐和延迟都是 CFT 的数倍开销。\n3. **bug ≠ byzantine**：软件 bug 可能造成\"拜占庭般\"的行为（发错消息、状态不一致），但通常所有副本跑**同样的 buggy 代码**，它们会以同样方式错，BFT 帮不了你。\n4. **替代手段**：TLS（防伪造）、ACL / RBAC（防越权）、签名（防篡改）+ 审计日志——这些已经挡住了绝大部分\"敌对节点\"场景。\n\n**什么场景会认真考虑 byzantine**\n\nBFT 的真实主战场是**无信任或弱信任的分布式网络**：\n\n| 系统 | 场景 | 共识 |\n|---|---|---|\n| Bitcoin / Ethereum（PoW/PoS） | 公链，节点完全开放 | Nakamoto 共识（概率性 BFT） / Gasper |\n| Libra / Diem（已关停） | 联盟链，Meta 主导的金融基础设施 | LibraBFT（HotStuff 变种） |\n| Tendermint / Cosmos | 联盟链 / 公链，PoS | Tendermint BFT |\n| CBFT / Fabric / HyperLedger | 企业联盟链 | 各种 BFT 变种 |\n| Ripple XRPL | 跨境金融 | RPCA（非严格 BFT） |\n| Certificate Transparency | CA 日志透明化 | 带 Merkle proof 的弱 BFT |\n| 航天容错系统 | SpaceX Dragonflight、航空 fly-by-wire | 早期 BFT 应用，硬件级 lockstep |\n\n**BFT vs CFT 对比表**\n\n| 维度 | CFT（Raft/Paxos） | BFT（PBFT/Tendermint/HotStuff） |\n|---|---|---|\n| 容错对象 | crash、omission、timing | 上述 + byzantine（说谎、协同攻击） |\n| 最小节点 | 3 容忍 1 | 4 容忍 1（3f+1） |\n| 消息复杂度 | O(n) per decision | O(n²) 经典 PBFT，HotStuff 做到 O(n) |\n| 签名 | 不强制（内部信任） | 每条消息签名 + 验证 |\n| 吞吐量级 | 10k-100k ops/s 常见 | 1k-10k ops/s（HotStuff/Tendermint 优化后） |\n| 适用场景 | 同一信任域（同公司、同集群） | 跨组织、无信任、公链 |\n| 典型产品 | Etcd, Consul, ZooKeeper, TiKV | Tendermint, HotStuff, Libra, Hyperledger |\n\n**弱 byzantine：checksum 与防误写**\n\n一个折中点值得提：虽然完整 BFT 不用，但**轻量级 byzantine 防御**在 CFT 系统里广泛存在：\n\n- **checksum**（CRC32 / xxhash）：ZFS、Kafka segment、TCP 都带，防磁盘 bit rot 和网络位翻转——这本质是\"防止无声数据损坏\"（silent data corruption），算一种 byzantine 防御。\n- **TLS + mTLS**：Etcd/Kafka/K8s 内部通信默认启用 mTLS，防 MITM 和 spoofing。\n- **fencing token**：lease + 单调递增 token，让旧 leader 的延迟写被新 leader 拒绝，防止\"时间倒流\"式的脑裂。\n\n这些不能对抗主动协同攻击，但能挡住\"无意的拜占庭行为\"（bit flip、bug、慢节点旧消息）。\n\n**生产注意**\n\n- **如果你在内部系统上讨论 BFT，先问：威胁模型是什么？**如果是\"防 bug\"，BFT 帮不了；如果是\"防恶意运维\"，签名 + 审计 + 最小权限更有效；只有\"跨组织、节点真的会互相攻击\"时 BFT 才是对的选择。\n- **不要把 BFT 当 CFT 用**，反之亦然。用 Tendermint 跑公司内部 KV 存储是杀鸡用牛刀；用 Raft 跑跨组织清算网络是裸奔。\n- **\"拜占庭般的 bug\"常见于存储层**：磁盘静默损坏、ECC 失效、RAID firmware bug——这些表现像 byzantine 但不是协议层能解决的，要靠端到端 checksum + 多副本对比（参考 Google *End-to-End Data Integrity* 实践）。"
+            },
+            {
+              "title": "partition 是独立一类",
+              "key": "partition-fault",
+              "content_md": "**网络分区（partition）值得单独一节**，因为它在 P6 面试和生产事故里的出场率高得离谱，而且常常被错误地归类成\"节点挂了\"。partition 跟节点失效**本质不同**，这节把它讲清楚，也是下一模块 CAP 的基础。\n\n**partition ≠ 节点挂**\n\n从**远端**视角看，一个分区内的节点确实\"像挂了\"：\n\n- 发过去的消息没回应\n- 心跳超时\n- TCP 连接断开或卡死\n\n但**从本地**视角看：\n\n- 节点自己活得好好的\n- 自己的 CPU、磁盘、内存、进程都正常\n- 自己看 peer 也是\"好像都挂了\"\n\n这是对称的。**partition 的本质是\"两边都无法确认对方的真实状态\"**——不是一方死、一方活，是**两方都觉得对方死了**。谁也没错，但整体系统已经不一致。\n\n这个对称性是 split-brain 的根源：如果两边都决定\"对端挂了，我接管\"，就会出现两个 leader、两份写入、两份状态。CAP 定理本质上就是在问：面对 partition，你选择牺牲可用性（A）还是一致性（C）？\n\n**三种分区拓扑**\n\n生产上 partition 不只是\"一刀两断\"，形态多样：\n\n**full partition（完全分区）**\n\n```\n       AZ-1                       AZ-2\n   ┌──────────┐    [BROKEN]   ┌──────────┐\n   │  N1  N2  │  ╳═══╳═══╳══  │  N4  N5  │\n   │    N3    │               │    N6    │\n   └──────────┘               └──────────┘\n\n   两边完全断开，任意方向无消息通过\n```\n\n最\"干净\"的分区，也是理论分析最常假设的。AZ 间光缆被挖断、跨 region 专线故障就是这种。\n\n**partial partition（部分分区）**\n\n```\n           N1 ────── N2\n           │   ╳╳╳    │       N2 与 N3 之间断\n           │          │       其他链路正常\n           N3 ──────  │\n           │          │\n           └──────────┘\n\n   N1 和 N2 能通，N1 和 N3 能通，但 N2 和 N3 互相不通\n```\n\n这是**最恶心的一类**。N1 以为集群全活（它和两边都通），但 N2 和 N3 彼此看不见。如果 N2 和 N3 都想成为 leader（它们都看到其他节点\"挂了一半\"），或者基于 N1 做中继的消息走得通但直连的消息走不通——协议很容易出错。\n\n真实案例：交换机某个端口 bug，转发规则里漏了某组 MAC，表现就是\"某些 pair 通某些不通\"。Aphyr 的 Jepsen 测试里大量发现此类问题。\n\n**asymmetric partition（非对称分区）**\n\n```\n       N1 ───msg──▶ N2         N1 → N2 可达\n       N1 ◀ ╳╳╳ ─── N2         N2 → N1 不可达（防火墙单向规则 / 路由黑洞）\n\n   单向连通，另一方向被阻断\n```\n\nTCP 三次握手会直接挂（SYN 能过去，SYN-ACK 回不来），但如果是基于 UDP 或已经建立好的 TCP 在应用层的消息丢失，就会出现**一边以为在说话对面在听，另一边压根不知道**。security group 配错、iptables 单向规则、anycast 路由非对称都会造成这种。\n\n**\"像挂了\"的骗局**\n\nclient/peer 的代码里，通常无法区分这三种情况：\n\n```\n对端真的 crash 了（crash-stop）\n对端很慢（GC / 磁盘 / 中断）\n对端和我之间 partition 了（对端对别人正常）\n```\n\n仅凭超时 + 重试**在本地就是无法区分的**。靠什么区分？**全局视图**：\n\n- 如果多数节点能看到对端 → 对端没挂，是我这边 partition 了（少数派应该主动退出服务）\n- 如果多数节点也看不到对端 → 对端可能真挂了，但也可能对端和\"多数派\"同侧分区了\n\n这就是 **quorum / 多数派**在 partition 语义上的核心作用：**让分区两侧对\"谁该继续工作\"达成不对称的约定**——多数派继续，少数派禁言。Paxos / Raft / ZAB 都基于这个原则。\n\n**partition 和 clock 的联合作恶：fencing**\n\nleader lease 场景下，旧 leader 被 partition 隔离后**自己不知道自己掉线了**，还以为 lease 有效继续写。如果 partition 恢复或者 lease 基于本地时钟（而本地时钟慢了），旧 leader 的写会和新 leader 的写冲突——这就是著名的 **Chubby/ZooKeeper 类 lease 系统必须引入 fencing token** 的原因。Martin Kleppmann 2017 年那篇 *How to do distributed locking* 是这个话题的经典读物。\n\n**工业系统如何应对 partition**\n\n| 系统 | 策略 |\n|---|---|\n| Etcd / Raft | 少数派 partition 的节点停止 accept 写，只服务 stale read（或完全拒绝读） |\n| ZooKeeper | 少数派直接不 serve 任何请求 |\n| Cassandra | 按一致性级别动态降级（ONE / QUORUM / ALL），业务选择 A 还是 C |\n| Kafka | 少数派 broker 的 partition 变成 under-replicated；producer 根据 acks 配置决定等不等 |\n| DynamoDB | 多 AZ quorum，单 AZ partition 时仍可服务；极端 partition 触发 sloppy quorum + hinted handoff |\n| K8s（etcd 背后） | 少数派 apiserver 依然能读 cache 但写会超时；kubelet 断连会被 node controller 标记 NotReady |\n\n**踩坑提示**\n\n- **别用单条 TCP 判断 partition**。TCP 可能因为中间 NAT 超时、应用层阻塞而 \"看似断\" 但实际对端好着——要用多路径探测 + 应用层心跳 + 多 peer 视角综合判断。\n- **少数派必须主动退位**，不能等集群恢复。如果少数派继续接受写请求\"先存着等恢复再同步\"，几乎必然出现冲突（两边都写了同一个 key）。正确做法：少数派拒绝所有写，必要时甚至拒绝读（避免 stale read 影响业务决策）。\n- **partial partition 比 full partition 更危险**。测试环境很少能复现 partial partition，但生产上交换机 bug / 网卡 offload bug / BGP 异常会造成，排障极其困难——生产监控必须覆盖\"每对节点的 pairwise 连通性\"而不只是\"每个节点是否能被监控探针访问到\"。\n- **fencing token 是 partition + clock 场景下的最后防线**：任何涉及\"我是 leader，我要写存储\"的动作都要带 token，存储层拒绝 token 旧于已见过的请求。这让旧 leader 即使活过来也写不进去。"
+            },
+            {
+              "title": "工业系统影子：K8s Node Conditions 与故障模型的对齐",
+              "key": "industry-shadow",
+              "content_md": "理论讲完，落回每天 `kubectl describe node` 看到的那段 Conditions 输出。这节把 K8s 的 Node Conditions 逐条对齐到前面讲的故障模型——让你每次看节点状态时脑子里能自动浮现出\"这属于哪种 failure mode，对应什么协议处理\"。\n\n**Node Conditions 长什么样**\n\n```bash\n$ kubectl describe node worker-07\nConditions:\n  Type               Status  LastHeartbeatTime  Reason\n  MemoryPressure     False   Mon, 14:23:05      KubeletHasSufficientMemory\n  DiskPressure       False   Mon, 14:23:05      KubeletHasNoDiskPressure\n  PIDPressure        False   Mon, 14:23:05      KubeletHasSufficientPID\n  NetworkUnavailable False   Sun, 09:10:50      RouteCreated\n  Ready              True    Mon, 14:23:05      KubeletReady\n```\n\n`LastHeartbeatTime` 是 kubelet 最后一次 POST `NodeStatus` 到 apiserver 的时间（默认每 10s 一次，变化时立即上报）。\n\n**Condition 到故障模型的映射**\n\n| Condition | 触发条件 | 对应 failure model | kubelet 行为 | controller 反应 |\n|---|---|---|---|---|\n| **Ready=False** | kubelet 自判 runtime / 网络异常 | crash recovery（进程在但服务不可用）或 partition | 继续心跳，拒新 Pod | node-lifecycle-controller 加 `NoSchedule` taint；超 `pod-eviction-timeout`（默认 5min）加 `NoExecute` 驱逐 |\n| **Ready=Unknown** | apiserver 超 `node-monitor-grace-period`（默认 40s）没心跳 | **无法区分**：crash stop / crash recovery / partition 都可能 | kubelet 不知道自己被标 | 同上，但 controller 无法确认真挂还是 partition——**K8s 面对 FLP 不可知性的实际选择** |\n| **MemoryPressure=True** | 可用内存 < `eviction-hard.memory.available`（默认 100Mi） | 近似 omission：还响应，但开始驱逐 | 驱逐低优 Pod；自动加 `memory-pressure:NoSchedule` | scheduler 避让 |\n| **DiskPressure=True** | nodefs/imagefs 使用率超阈值（默认 85%） | omission（写会失败）+ 潜在 crash recovery | 驱逐 Pod、GC 镜像；加 `disk-pressure:NoSchedule` | scheduler 避让 |\n| **PIDPressure=True** | PID 使用率超阈值 | omission（fork 失败） | 驱逐 Pod；加 `pid-pressure:NoSchedule` | scheduler 避让 |\n| **NetworkUnavailable=True** | CNI / route controller 报告网络不通 | **partition**：节点活但和集群网络隔离 | 由 cloud-controller / CNI 设置 | 避让；可能触发 route 重建 |\n\n**关键观察：Unknown 的哲学意义**\n\nReady 的三态（True / False / Unknown）不是随便设计的，是在**承认 FLP 不可知性**：\n\n- `False`：kubelet 自己上报\"我不健康\"，诚实的 crash-like 状态。\n- `Unknown`：apiserver \"听不到这个 kubelet 了\"——**无法区分**是 kubelet crash、节点掉电、还是 partition。三种故障模型下 apiserver 的观察**完全一样**。\n\n怎么处理？K8s 的答案是**基于超时做保守决策 + 用 taint 而非立即删除**：\n\n1. 40s 没心跳 → Ready=Unknown → 加 `NoSchedule` taint\n2. 继续等 `pod-eviction-timeout`（5min）→ 加 `NoExecute` taint → 没 tolerate 的 Pod 被驱逐\n3. ReplicaSet / StatefulSet 在别节点重建\n\n为什么要 5 分钟？因为 **partition 误判代价 >> 多等几分钟的代价**：如果只是临时 partition，5min 内恢复 Pod 还在跑——立刻杀掉会造成不必要的中断。\n\n**StatefulSet 的特殊情况：NotReady 不自动删 Pod**\n\nReplicaSet 的 Pod 在 NoExecute taint 后会被删除重建，**但 StatefulSet 不会**。因为 StatefulSet 假设每个 Pod 身份唯一，节点只是 partition 时在别处重建同名 Pod 会造成\"两个 Pod 同时写同一份存储\"——split-brain。\n\n正确处理需要**人工介入**（或 operator）：确认节点真死 → `kubectl delete node` → StatefulSet controller 才会重建。这是 K8s 把 CAP 选择权交给运维的典型设计。\n\n**生产注意**\n\n- **别简单把 Node NotReady 等同于\"节点挂了\"**。它可能是 kubelet hang（crash recovery）、apiserver 看不到心跳（partition）、kubelet 在但子系统坏了。排障第一步是登节点看 kubelet log。\n- **给关键业务 Pod 加 tolerations**，否则一次 45 秒 apiserver 抖动就能让 Pod 被误驱逐：\n  ```yaml\n  tolerations:\n  - key: node.kubernetes.io/not-ready\n    operator: Exists\n    effect: NoExecute\n    tolerationSeconds: 600\n  - key: node.kubernetes.io/unreachable\n    operator: Exists\n    effect: NoExecute\n    tolerationSeconds: 600\n  ```\n- **StatefulSet + 云盘场景**，节点 partition 时不要手动强删 Pod/Node 除非**确认**节点已死（cloud provider API 显示 instance terminated）。强删后旧节点恢复，两 Pod 同挂一块云盘会导致 fs 损坏——真实事故。\n- **心跳周期和 grace-period 要一起调**。默认 10s + 40s 意味着丢 4 次心跳判 Unknown。万节点集群可考虑拉长到 50-60s + 200-300s，用短期误判率换 apiserver 压力缓解。这是典型的\"partition 灵敏度 vs 误报率\"权衡。"
+            }
+          ]
+        },
+        {
+          "slug": "clocks-and-order",
+          "order_index": 3,
+          "name": "时钟与顺序",
+          "hook": "没有 wall clock 也能 \"A 在 B 之前\"——Lamport 的洞察改变了分布式的语法",
+          "sections": [
+            {
+              "title": "物理时钟为什么靠不住",
+              "key": "physical-clock-pitfalls",
+              "content_md": "分布式系统第一个要打破的直觉：**wall clock（墙上时钟，也就是你平时 `time.Now()` 拿到的那个）不是一个可靠的全局顺序源**。同一个机房里两台机器的时间差几百毫秒太常见，跨机房甚至到秒级。这节把所有常见物理时钟源挨个过一遍，看清它们各自的脾气。\n\n**Linux 上四种常见时钟源**\n\n| 时钟 API | 含义 | 单调保证 | 典型精度 | 会不会跳 |\n|---|---|---|---|---|\n| `CLOCK_REALTIME` | wall clock，受 NTP/管理员调整 | 否 | 毫秒级 | 会向前 / 向后跳 |\n| `CLOCK_MONOTONIC` | 从某个未定义起点开始单调递增 | 是 | 毫秒 / 微秒级 | 不会跳，但会 slew |\n| `CLOCK_MONOTONIC_RAW` | 不受 NTP 频率调整影响的 monotonic | 是 | 微秒级 | 从不跳也从不 slew |\n| `CLOCK_BOOTTIME` | monotonic + 包含 suspend 时长 | 是 | 毫秒级 | 不跳 |\n\n对业务代码的第一原则：**衡量时间间隔永远用 monotonic，记录\"这条日志是什么时候发生的\"才用 realtime**。Go 里 `time.Since` 默认走 monotonic（`time.Time` 内部同时存两个值），这是少数语言做对了的。Python `time.time()` 是 realtime，`time.monotonic()` 才是你想要的。\n\n**NTP drift：两台机器差几百毫秒很正常**\n\nNTP（Network Time Protocol，通过网络对时的协议）的典型精度：\n\n- **公网 stratum 2 NTP server**：5–100ms 误差\n- **LAN 内同步**：1–10ms 误差\n- **PTP（Precision Time Protocol，硬件时间戳）**：亚微秒级，但需要网卡 + 交换机支持\n\n两台机器\"同步到 NTP\"不等于它们时钟一样。典型场景：你在一台机器写一条日志时间戳是 `10:00:00.100`，在另一台机器记录\"对它的回复\"时间戳是 `10:00:00.050`——看起来**回复先于请求**，纯粹是两台机器 NTP 偏差 150ms 造成的假象。这就是为什么**基于 wall clock 的因果分析是错的**。\n\n**leap second（闰秒）：时间可以向后跳一秒**\n\n地球自转不均匀，IERS（国际地球自转服务）偶尔会在 UTC 加一个闰秒。Linux 传统处理方式有三种：\n\n1. **step**：`23:59:60` 之后直接跳回 `23:59:59` —— wall clock **向后走**。2012 闰秒事件里 Cassandra / Java / MySQL 全线 CPU 飙到 100%，就是 futex 内部判断超时用了 realtime，发现时间倒退触发死循环\n2. **slew**：把这一秒分散到前后若干小时慢慢 smear 掉\n3. **leap smear（Google 方案）**：24 小时均匀抹掉 1 秒的偏差\n\n2035 年 IERS 决定**不再插入正闰秒**（因地球自转近年加速），但历史遗留系统可能还会遇到负闰秒。\n\n**生产注意**：关键路径**永远不要用 wall clock 做超时判断**。`select case <-time.After(5 * time.Second)` 在 Go 里是安全的（走 monotonic），但 `if time.Now().After(deadline)` 就危险，如果中途 NTP 把 wall clock 拨回去，你的 deadline 会变得遥不可及。\n\n**TSC 在虚拟化下的麻烦**\n\nTSC（Time Stamp Counter，CPU 里一个纳秒级计数器）是现代 Linux 上 `CLOCK_MONOTONIC` 的常用底层实现，本来非常准。但虚拟化环境里坑很多：\n\n- **跨 core 不同步**：老 CPU（Nehalem 之前）不同 socket 的 TSC 独立计数，线程在 core 之间迁移 TSC 读数会跳（现代 CPU 基本都支持 `constant_tsc` + `nonstop_tsc`，不用操心）\n- **VM 迁移**：Live migrate 后 TSC 起点变了，guest 看到时间跳\n- **VM 内查 clocksource**：`cat /sys/devices/system/clocksource/clocksource0/current_clocksource`，如果不是 `tsc` 而是 `kvm-clock` / `hpet` / `acpi_pm`，时间读取开销会从 ns 级跳到 µs 级，高频日志打点性能会塌\n- **CPU 频率动态调整**：老 CPU 上 TSC 跟频率挂钩（没有 `constant_tsc`），`cpufreq` 一调整时间就乱，现代 x86 基本解决了这个问题\n\n**容器里时钟共享主机**\n\n容器的时钟 **跟主机是同一份**（Linux namespace 里没有 time namespace，5.6 才加 `CLONE_NEWTIME` 但主流编排器都不用）。意味着：\n\n- 宿主机 NTP 乱 → 容器里时间也乱\n- 容器里用户态 hook `gettimeofday` 伪造时间（像 libfaketime）只影响自己进程\n- Windows 容器在 Hyper-V 下跟 Linux 容器时钟模型完全不一样，跨集群对时需要额外工具\n\n**k8s 生产观察点**：节点时钟漂移会让 etcd 的 lease、kubelet 的 NodeReady 心跳、cert 有效期判断全部出岔子。典型故障：某节点 wall clock 比其他节点快 30s，kubelet 上报心跳时间戳超前，apiserver 可能不信任；或者 etcd leader 发心跳，follower 本地时钟快了，判定 leader 失联触发选举。\n\n**踩坑提示**\n\n- **不要**在分布式系统里用 `time.Now()` 做顺序判断——任何需要 \"A 在 B 之前\" 的逻辑都应该走逻辑时钟\n- **不要**用 NTP 同步后的 wall clock 作为 distributed lock 的 TTL 基础——见 Redlock 争论\n- 监控 `node_timex_offset_seconds`（chrony / ntpd 提供），超过 100ms 应该告警\n- 机房里规划时钟同步架构时，**内部 PTP/chrony 链路永远优于公网 NTP**，至少起一个 stratum 1 作为集群源头"
+            },
+            {
+              "title": "Lamport 时钟与 happens-before",
+              "key": "lamport-clock",
+              "content_md": "Leslie Lamport 1978 年的论文 *Time, Clocks, and the Ordering of Events in a Distributed System* 是分布式系统的起点。它回答了一个哲学问题：**没有 wall clock 也能定义 \"A 在 B 之前\" 吗？** 答案是能——但定义的是**因果序**而不是时间序。\n\n**happens-before：→ 关系**\n\n定义三条规则（`a → b` 读作 \"a happens-before b\"）：\n\n1. **同一进程内先后发生**：进程 P 里 a 先于 b 执行，则 `a → b`\n2. **发送 / 接收**：a 是某条消息的 send，b 是同一条消息的 receive，则 `a → b`\n3. **传递性**：`a → b` 且 `b → c`，则 `a → c`\n\n如果 `a → b` 或 `b → a` 都不成立，称 a 和 b **concurrent**（记作 `a || b`），意思是\"无法确定谁先谁后\"——这不是 bug，而是分布式系统的本质属性。\n\n**关键洞察**：happens-before 是一个**偏序**（partial order），不是全序。wall clock 给你\"假的全序\"（两个毫无因果关系的 event 也被时间戳强行排序），而 → 只在真的有因果链时才排序，更诚实。\n\n**Lamport 逻辑时钟算法**\n\n给每个进程 P 维护一个整数 counter `C_P`，规则：\n\n```\n1. 本地 event 发生前：C_P = C_P + 1\n2. 发送消息 m：先自增 C_P += 1，把 C_P 塞到 m 里带走\n3. 接收消息 m（带有时间戳 T_m）：\n     C_P = max(C_P, T_m) + 1\n```\n\n给每个 event `e` 打上时间戳 `C(e)` = 它发生时 `C_P` 的值。定理：\n\n> **如果 `a → b`，则 `C(a) < C(b)`**\n\n这就是 Lamport 时钟的核心保证。反过来 `C(a) < C(b)` 并**不**蕴含 `a → b`（可能只是巧合）。\n\n**3 节点时序图**\n\n```\n  P1               P2               P3\n   |                |                |\n  [1]   a1          |                |\n   |                |                |\n   |---- m1(ts=2)-->[max(0,2)+1=3]   |\n   |                | b1             |\n   |                |                |\n  [2]   a2          |                |\n   |                |---- m2(ts=4)-->[max(0,4)+1=5]\n   |                |                | c1\n  [3]   a3          |                |\n   |<--- m3(ts=6)---|                |\n  [max(3,6)+1=7]    |                |\n   |                |                |\n```\n\n读一下这个图：\n\n- `a1` 时间戳 1，`b1` 时间戳 3，因为 m1 把 P1 的 counter 带到 P2，P2 `max(0,2)+1=3`\n- `a2` 时间戳 2，`c1` 时间戳 5\n- `a2 → b1` 吗？**不能断言**。`C(a2)=2 < C(b1)=3`，但这是因为 m1 被发到了 P2，而 a2 跟 m1 无关\n- `a1 → c1` 吗？**是的**：`a1 → m1.send → m1.recv → b1`，然后 `b1 → m2.send → m2.recv → c1`，链条打通\n\n**tie-break 成全序**\n\n两个不同进程可能拿到相同的 Lamport 时间戳。实现时通常 `(C, PID)` lexicographic 排序：`(3, P1) < (3, P2)`。这样就得到了**全序**——但代价是人为规定的，不再是真因果。很多系统（比如早期的 Cassandra timestamp、ZooKeeper zxid）用这种 `(counter, server_id)` 的组合。\n\n**Lamport 时钟的致命短板**\n\n> **能捕捉 causality，但不能检测 concurrent**\n\n举例：`a1` (ts=1) 和 `b1` (ts=3)，你只从时间戳看得出 `1 < 3`，无法判断是\"真有因果\"还是\"凑巧\"。两个 concurrent event 看起来跟 causal event 一模一样。\n\n这就是为什么 Dynamo 之类的 eventually-consistent 系统**不能**用 Lamport 时钟做冲突检测——它们需要明确回答\"这两个写入是并发的吗？\"。答案是**向量时钟**，下一节讲。\n\n**工业影子**\n\n- **Kafka producer idempotence** 用序列号本质是单节点版的 Lamport\n- **Cassandra write timestamp** 虽然用 wall clock，但 LWT（Lightweight Transaction）场景会退化成 Lamport 风格的 ballot number\n- **Raft 的 `term`** 是节点级 Lamport counter，follower 收到 RPC `max(localTerm, rpcTerm)+1` 是经典 Lamport 更新\n- **Redis CRDT 的 `logicalTimestamp`** 就是 Lamport clock 实现\n\n**踩坑提示**\n\n- Lamport counter 必须**持久化**——进程重启如果 counter 归零，新 event 时间戳可能小于历史 event，因果序就断了\n- 不要用 Lamport clock 做\"GC 历史事件\"的依据（比如 \"timestamp < T 的都可以删\"），因为 concurrent 的事件可能被误判\n- 多数生产系统会把 Lamport 跟物理时钟结合，得到 HLC（混合时钟，第 4 节详讲），既能做因果序又能跟 wall clock 对得上"
+            },
+            {
+              "title": "向量时钟：能告诉你 concurrent vs causal",
+              "key": "vector-clock",
+              "content_md": "Lamport clock 能告诉你\"有因果关系的 event 时间戳递增\"，但**无法区分真因果和巧合**。向量时钟（vector clock，其实就是每维记一个节点计数的数组）解决了这个问题——代价是空间复杂度 O(N)，N 是集群节点数。\n\n**算法：每节点维护一个数组**\n\n集群有 N 个节点 `{P1, P2, ..., Pn}`，每节点维护一个长度 N 的整数数组 `V_Pi[1..N]`，`V_Pi[j]` 表示\"P_i 已知 P_j 发生过的 event 数量\"。规则：\n\n```\n1. 本地 event 发生：V_Pi[i] += 1\n2. 发送消息 m：自增 V_Pi[i] += 1，把整个数组 V_Pi 塞进消息\n3. 接收消息 m（带数组 V_m）：\n     for k in 1..N:\n       V_Pi[k] = max(V_Pi[k], V_m[k])\n     V_Pi[i] += 1\n```\n\n**比较两个向量时钟**\n\n定义 `V_a ≤ V_b` 当且仅当**每一维**都有 `V_a[k] ≤ V_b[k]`。然后：\n\n| 关系 | 含义 |\n|---|---|\n| `V_a < V_b`（每维 ≤ 且至少一维 <） | `a → b`（a happens-before b） |\n| `V_a > V_b` | `b → a` |\n| `V_a == V_b` | 同一个 event |\n| 都不成立（某维 a 大某维 b 大） | **concurrent**（`a ‖ b`） |\n\n这个\"都不成立\"的情况 Lamport clock 给不了你——这是向量时钟的核心价值。\n\n**3 节点示例**\n\n```\n  P1 V=[0,0,0]     P2 V=[0,0,0]     P3 V=[0,0,0]\n     |                |                |\n    a1 V=[1,0,0]     |                |\n     |                |                |\n     |----m1([1,0,0])->                |\n     |                b1 V=[1,1,0]     |\n     |                |                |\n    a2 V=[2,0,0]     |                |\n     |                |---m2([1,2,0])->|\n     |                |                c1 V=[1,2,1]\n     |                |                |\n                \n     比较 a2=[2,0,0] 和 c1=[1,2,1]：\n       a2 的 P1 维是 2 > c1 的 1\n       c1 的 P2 维是 2 > a2 的 0\n     → 两向量互不可比 → **concurrent**\n     \n     比较 a1=[1,0,0] 和 c1=[1,2,1]：\n       每一维 a1 ≤ c1，且至少一维 <\n     → a1 → c1（因果）\n```\n\n清晰地分辨了 `a1 → c1`（真因果）和 `a2 || c1`（并发）——Lamport clock 做不到这个。\n\n**Dynamo 用 vector clock 做冲突检测**\n\nAmazon Dynamo（2007 paper）是 vector clock 在工业界最著名的应用。场景：用户购物车在多个 replica 并发被修改——\n\n1. 客户端从 replica A 读到 cart，附带 vector clock `V_A`\n2. 客户端改完 cart，写回 replica A，新 clock = `V_A + 自增`\n3. 同时另一个客户端从 replica B 读同一个 cart（因为 eventual consistency，V_B 可能跟 V_A 不同），也改完写回\n4. 后续有请求到达时，replica 收到两个版本，比较它们的 vector clock：\n   - 如果一个 dominate 另一个（严格 <），丢弃老版本\n   - 如果 concurrent，**两个都保留**，让客户端下次读时看到冲突，做 application-level merge（Dynamo 购物车场景是\"并集\"，永不丢 item）\n\n这个思路被后续的 Riak、Voldemort、早期 Cassandra 全部继承。\n\n**Riak 的改进：dotted version vector**\n\n朴素 vector clock 有个问题：**客户端每次读写都要带着 vector clock 往返**，服务端还得记录每个 key 的完整历史。Riak 用 **dotted version vector**（DVV）压缩了这个表示，只记录关键 dot 而不是完整历史，空间小很多。CRDT 社区的 research 继续优化，当前 SOTA 是 dotted version vector sets。\n\n**致命短板：O(N) 空间**\n\n向量时钟的维度 = 集群节点数。几个场景会爆：\n\n- **大集群**：Cassandra 早期 500+ 节点集群，每个 mutation 带一个 500-int 向量，协议开销显著\n- **弹性伸缩**：节点来来去去，\"节点\"到底指什么？节点 join/leave 时老的 vector 怎么 garbage-collect？\n- **客户端 driver**：Dynamo 让 client 也参与 vector clock，客户端成千上万时根本写不下\n\n缓解方案：\n\n- **限制参与者**：只给\"写入节点\"分配一维，读节点共享一维\n- **version vector pruning**：定期删掉最久没更新的维度（风险：可能错判 concurrent）\n- **interval tree clocks / bounded version vectors**：research 方向\n- **换成 HLC**：放弃严格 concurrency detection，用混合时钟替代（下一节详讲）\n\n**现代分布式数据库的选择**\n\n| 系统 | 时钟方案 | 原因 |\n|---|---|---|\n| Dynamo / Riak | vector clock | 需要显式 concurrent 检测做 merge |\n| Cassandra（新版本） | wall clock (LWT 时用 Paxos ballot) | 放弃 concurrent 检测，last-write-wins |\n| CockroachDB | HLC | 需要 causality + wall clock 近似 |\n| Spanner | TrueTime | 有 GPS + 原子钟硬件 |\n| CRDT 系统（Automerge, Yjs） | 变种 vector clock / Lamport | 需要精确因果合并 |\n\n**生产注意**\n\n- 如果你的系统\"只需要 last-write-wins\"，vector clock 是 overkill，用 HLC 或直接 wall clock\n- 如果你需要\"无冲突合并\"（购物车、协同编辑），vector clock 或 CRDT-friendly 变体才够用\n- vector clock 在**动态集群**里是个工程难题，没有银弹，各家实现都有 pruning 策略的 trade-off\n- **踩坑提示**：vector clock 跟\"节点 ID\"强绑定，节点 ID 一定要稳定。容器化场景 Pod 重启 ID 变化，如果把 Pod 当作 vector clock 维度，重启就等于新维度——集群内存爆炸"
+            },
+            {
+              "title": "混合时钟 HLC",
+              "key": "hybrid-logical-clock",
+              "content_md": "Hybrid Logical Clock（Kulkarni、Demirbas、Madappa 等 2014 年论文 *Logical Physical Clocks and Consistent Snapshots in Globally Distributed Databases*）是工业界当前最实用的分布式时钟方案。核心想法：**把物理时钟和逻辑时钟揉在一起**，既能和 wall clock 对齐方便调试和 TTL，又能保证 happens-before 的逻辑序。\n\n**HLC 结构**\n\n一个 HLC 时间戳由两部分组成：\n\n```\nHLC = (l, c)\n  l : 物理时间部分（ms / µs），跟 wall clock 接近但略超前\n  c : 逻辑计数器（int），用来 tie-break 同一 ms 内的多个 event\n```\n\n通常打包成一个 64-bit 整数：高 48 bit 放物理时间（ms 级到 2262 年都够），低 16 bit 放 counter。\n\n**HLC 更新算法**\n\n每节点维护一个本地 HLC `(l, c)`。令 `pt()` 为当前 wall clock。\n\n```python\n# 本地 event 发生\ndef local_event():\n    l_new = max(l, pt())\n    if l_new == l:\n        c = c + 1       # 物理时间没推进，只能靠 counter tie-break\n    else:\n        c = 0           # 物理时间前进了，counter 重置\n    l = l_new\n    return (l, c)\n\n# 接收到消息带有 HLC (l_m, c_m)\ndef on_receive(l_m, c_m):\n    l_new = max(l, l_m, pt())\n    if l_new == l and l_new == l_m:\n        c = max(c, c_m) + 1\n    elif l_new == l:\n        c = c + 1\n    elif l_new == l_m:\n        c = c_m + 1\n    else:\n        c = 0\n    l = l_new\n    return (l, c)\n```\n\n**比较**：`(l1, c1) < (l2, c2)` 当且仅当 `l1 < l2` 或（`l1 == l2` 且 `c1 < c2`）——lexicographic 顺序。\n\n**HLC 的三个关键性质**\n\n1. **happens-before 蕴含 <**：如果 `a → b`，则 `HLC(a) < HLC(b)`（和 Lamport 一样）\n2. **l 跟 wall clock 的偏差有上界**：如果所有节点 wall clock 偏差不超过 ε，HLC 的 l 偏差也不超过 ε（不会无限发散）\n3. **64 bit 够用**：不像 vector clock 那样 O(N)\n\n第 2 点非常重要：Lamport clock 一旦接收到一个 \"未来\" 时间戳，自己的 counter 就被拉高永远下不来。HLC 的 l 受 `max(l, pt())` 约束，只要 wall clock 在继续往前走，HLC 的 l 最多比 wall clock 快一点点（偏差不超过\"收到过的最远未来时间戳跟本地 wall clock 的差\"）。\n\n**HLC 为什么是 CockroachDB 的选择**\n\nCockroachDB 是 HLC 最有代表性的工业部署。它面临的问题：\n\n- 需要 **SQL 级 serializable isolation**（可串行化隔离），要求全局事务顺序\n- 不想要 Spanner 那种 **GPS + 原子钟硬件**依赖（贵、部署复杂、Google 以外基本没人能搞）\n- 接受 **wall clock 有几十 ms 偏差**（通过 NTP 对时）\n\n解法：\n\n1. **所有事务时间戳用 HLC**，包括 read timestamp、commit timestamp\n2. **节点间 clock skew 配置上界**（默认 500ms），每次 RPC 夹带对方 HLC，检测到超过上界就 **panic 自杀**（宁可挂掉也不写错数据）\n3. **读写冲突检测**：读事务的 HLC vs 写事务的 HLC，严格用 HLC 序判断\n4. **Uncertainty interval**：读事务会 sleep 一个 max_offset 窗口等可能的并发写 flush 过来，保证 linearizability-ish 语义\n\n这套方案的精髓：**用 HLC 代替 TrueTime 的 [earliest, latest] 区间**，用 \"max_offset 配置 + skew 检测 + uncertainty wait\" 来补偿没有硬件时钟源的不足。\n\n**CockroachDB 跟 Spanner 的对比**\n\n| 维度 | Spanner (TrueTime) | CockroachDB (HLC) |\n|---|---|---|\n| 时钟硬件 | GPS + 原子钟，每数据中心几台 | 普通 NTP |\n| 时钟 API | 区间 `[earliest, latest]`，ε ≈ 1-7ms | 单点 `(l, c)` |\n| 写延迟 | commit-wait（等 ε 保证 external consistency） | 无 commit-wait，读侧 uncertainty wait |\n| 可移植性 | 只能 Google 机房 | 任何机房，自己搭 NTP 即可 |\n| external consistency | 真 linearizable | 依赖 max_offset 不被违反 |\n| Failure mode | 时钟硬件故障回退到高 ε | skew 超阈值 panic 节点 |\n\n**其他用 HLC 的系统**\n\n- **MongoDB 4.0+ causal consistency sessions**：客户端携带 `afterClusterTime` 本质是 HLC\n- **YugabyteDB**：明确声明 fork 自 CockroachDB 路线，HLC 核心\n- **TiDB（TSO 单点）vs TiKV 内部**：TSO 是 centralized Lamport，但 TiKV 内部传播用 HLC 思路\n- **NATS JetStream**：消息 timestamp 用类 HLC 保证顺序\n\n**HLC 的陷阱**\n\n1. **wall clock 倒退会爆炸**：如果 NTP 把 wall clock 回拨，pt() 变小，但 HLC 的 l 不会变小（因为 `max(l, pt())`），结果 HLC 全部维持在倒退前的 l 上靠 counter 累加——counter 16 bit 写满就溢出。生产上必须用 **slew 而不是 step** 的 NTP 策略\n2. **max_offset 配小了会频繁 panic**：节点时钟偶尔抖动 500ms 在公有云 VM 上很常见，max_offset 配 250ms 可能导致节点抽风地自杀\n3. **counter 溢出**：16 bit = 65535，如果一个 ms 内有超过 6.5 万个 event（高 QPS 单节点），counter 打满，只能 sleep 到下一 ms。生产上常扩到 20-32 bit\n\n**踩坑提示**\n\n- HLC 假设 **物理时钟偏差有界**，NTP 不在线或失效时 HLC 退化为单纯 Lamport 但没有 wall clock 对齐保证——监控节点 NTP drift 必不可少\n- HLC 64-bit 编码时，**物理时间部分的单位（ms vs µs vs ns）要全集群一致**，不然就是 silent corruption\n- 不要期望 HLC 替代 TrueTime 提供 external consistency；HLC 只是 \"best-effort causality + wall-clock proximity\"，强一致场景还是要看整体协议设计"
+            },
+            {
+              "title": "[deep dive] Spanner TrueTime 与原子钟硬件",
+              "key": "truetime-deep",
+              "content_md": "Google Spanner（2012 OSDI 论文）把分布式时钟推到工业界最奢侈的那一端：**给每个数据中心部署 GPS 天线 + 原子钟**，然后把\"时间有不确定性\"这个事实**显式暴露在 API 里**。这节讲清楚 TrueTime 是什么、为什么只有 Google 级别的基础设施能玩这一套。本节是 deep dive，标题带 `[deep dive]` 前缀，赶进度可跳。\n\n**TrueTime API：返回区间而不是点**\n\n```go\n// 三个核心调用\nTT.now() -> TTinterval{earliest, latest}  // 保证真实时间落在这个区间\nTT.after(t) -> bool                         // 真实时间一定晚于 t\nTT.before(t) -> bool                        // 真实时间一定早于 t\n```\n\n关键：`TT.now()` 不返回一个时间点，而是一个 **[earliest, latest]** 区间。保证\"无论哪台机器在哪一瞬间调用，真实的 absolute time 一定在这个区间内\"。区间宽度 `ε = (latest - earliest) / 2`，典型值：\n\n| 条件 | ε |\n|---|---|\n| 正常运行 | 1–7 ms |\n| Time master 刚 ping 过（masterslave 刚同步） | 接近 0 |\n| Time master 失联，ε 线性增长 | 每秒 +200 µs |\n\nε 会随\"距离上次跟 time master 同步过了多久\"**线性增长**——这是 TrueTime 的安全设计：时钟源故障时**不会返回错误时间**，而是返回**更大的区间**，让上层协议自动退化到更保守的行为。\n\n**Time master 架构**\n\n每个数据中心部署一批 **time master** 机器：\n\n- **GPS master**：天线收 GPS 卫星的原子钟信号，有效半径全球\n- **Armageddon master**：本地原子钟（铷原子钟 / 铯原子钟），抗 GPS 欺骗和大范围失效（\"末日场景\"）\n\n两种 master 互相交叉验证，拒绝掉拜占庭（lying）的 master。每台业务机器跑一个 **timeslave daemon**，定期 poll time master（多个数据中心跨询），用马歇尔投票算法拒绝 outlier，剩下的取交集得到本地 ε。\n\n硬件成本：GPS 天线 + 授时卡（几千到几万美元每台），原子钟硬件（万美元级），每数据中心几十台，再乘以 Google 全球几十个 region——**这不是一般公司能摊销的成本**。\n\n**commit-wait：外部一致性的代价**\n\nTrueTime 最关键的一步是 **commit-wait**。假设事务 T1 commit 时分配了 timestamp `s = TT.now().latest`，Spanner 必须保证：\n\n> **任何在 T1 commit 之后（wall-clock 意义上）才开始的事务 T2，看到 T1 的写入**\n\n为了做到这一点，Spanner 在 T1 commit 之后**显式等 ε 时间才释放锁**。理由：\n\n```\nT1 commit at s = TT.now().latest\n    |\n    v\n    ε 时间之后，TT.after(s) = true 对所有观察者成立\n                 （即所有机器都确认 \"真实时间 > s\"）\n    |\n    v\nT1 释放锁，T2 可以开始\n    T2 分配 timestamp s' = TT.now().latest\n    保证 s' > s，因为 T2 start 的真实时间已经 > s\n```\n\n这个 \"commit-wait ε\" 是 TrueTime 跟其他时钟方案的**核心区别**。CockroachDB 的 HLC 没有这步，但会在读侧做 uncertainty wait——代价体现在读延迟。Spanner 把成本放到写侧，是因为读远多于写的场景。\n\n**ε = 7ms 意味着**每个事务 commit 多等 7ms。对于跨数据中心的 Paxos 写（本身就几十 ms），7ms 不算啥；对于 memtable 小事务（本来 < 1ms），7ms 是很大的 overhead——所以 Spanner 的事务 API **不适合**做极低延迟 OLTP，适合\"跨数据中心一致性\"场景。\n\n**external consistency（外部一致性）**\n\nSpanner 宣称的最强保证叫 **external consistency**（也叫 strict serializability、linearizable transactions）：\n\n> 如果事务 T1 的 commit（wall clock）早于事务 T2 的 start（wall clock），则 T1 的 commit timestamp < T2 的 commit timestamp\n\n这是**连观察者视角都线性化**的一致性，比普通 serializable 更强。举例差别：\n\n- **Serializable**：数据库内部看起来事务是串行的，但可能跟真实世界顺序不符。用户 A 下单（T1 commit）→ 打电话告诉用户 B → 用户 B 查询（T2），可能看不到 A 的订单（序列化把 T2 放在 T1 前）\n- **External consistent**：T2 开始于 T1 commit 之后（真实时间），T2 一定看到 T1 的结果\n\n非 Google 系统实现 external consistency 的代价非常高，因为没有 TrueTime 级别的时钟。CockroachDB 只宣称\"强一致\"而不是 external consistency，就是这个区别。\n\n**为什么只有 Google 能玩这套**\n\n1. **硬件投资**：GPS 天线 + 原子钟 + 专用授时卡 + 冗余时间网络，全球级部署数据中心级都得复制\n2. **软件栈整合**：TrueTime API 深嵌在 Google 内核 / 用户态 lib，监控、告警、回归测试全配套。开源社区没有对等产品\n3. **运维文化**：时钟异常不只是 metric 告警，而是触发 Spanner 主动降级（ε 增大 → commit-wait 变长 → 吞吐下降但不出错）\n4. **规模摊销**：Spanner 支撑 Google Ads / Photos / Play 全部核心业务，时钟硬件成本摊到每 query 上几乎是 0\n\n**AWS / Azure 的应对**\n\n- **AWS Time Sync Service（2017）** + **ClockBound SDK（2021）**：AWS 给 EC2 实例本地同步源，ClockBound 返回类似 TrueTime 的 `(earliest, latest)` 区间，ε 通常 < 1ms。但不做 commit-wait，需要应用自己用\n- **Azure Nitro 提供 PHC 硬件时钟**：接近但也不是 TrueTime 级别\n- **PTP（IEEE 1588）** 在现代云上逐渐普及，硬件时间戳亚微秒级\n\n趋势是\"TrueTime 级别的硬件时钟正在云化\"，但业务层能不能写成跟 Spanner 一样直接用区间 API，还是个尚未普及的工程习惯。\n\n**生产注意（如果你真的要用 Spanner）**\n\n- Spanner 事务吞吐跟 ε 直接挂钩，**监控 `spanner.clock_uncertainty`**，ε 异常上升（time master 失联）会吞吐塌陷\n- 跨 region 事务永远比同 region 慢（Paxos 跨地域 round-trip + commit-wait），schema 设计时要按访问地域做 sharding\n- Spanner 提供的 `stale read`（读 N 秒前的快照）跳过 uncertainty，适合报表类场景，生产优化手段\n\n**踩坑提示**：不要看到 TrueTime 就觉得 \"我们也上 PTP + GPS 就能搞一个\"——**关键不是时钟硬件，是整个 API + 协议 + 运维**围绕\"时间是区间\"这个抽象重写。大部分团队实际需要的是 HLC + NTP，而不是 TrueTime"
+            },
+            {
+              "title": "工业系统影子：etcd compact / Cassandra LWT / Kafka log offset 的时钟依赖",
+              "key": "industry-shadow",
+              "content_md": "前面 5 节讲理论，这节把镜头拉回**你每天接触的中间件**，看三个主流系统各自选了什么时钟方案、对时钟漂移的敏感度、失败时表现如何。同样是\"顺序\"问题，etcd / Cassandra / Kafka 给出了截然不同的答案。\n\n**对比一览**\n\n| 维度 | etcd | Cassandra LWT | Kafka log offset |\n|---|---|---|---|\n| 时钟类型 | 逻辑时钟（revision） | wall clock + Paxos ballot | 纯逻辑序号（per-partition int64） |\n| 单调保证 | 全局严格递增 | 不严格（取决于 wall clock） | per-partition 严格递增 |\n| 跨节点对比 | 直接可比（同一 raft log） | 可比但含 wall clock 成分 | 跨 partition 不可比 |\n| 时钟漂移影响 | 几乎无 | **严重**（可能误判旧写入） | 无 |\n| 使用场景 | 强一致 KV / lease | quorum CAS 操作 | 日志 / 事件流 |\n\n**etcd：纯逻辑时钟 revision**\n\netcd 给每个 key 的每次写入分配一个全局单调递增的整数叫 **revision**，实现上就是 raft log index。特性：\n\n- **全集群 shared counter**：每个 mutation（put / delete / txn）一个新 revision\n- **由 leader 单点分配**：follower 不自己发 revision，保证全局序\n- **持久化到 raft log**：leader 切换时新 leader 继承 last applied index，revision 不回退\n\nrevision 用在哪：\n\n1. **watch**：`watch(key, startRev=N)` 从任意历史 revision 订阅，不漏事件\n2. **compact**：`--auto-compaction-retention` 控制旧 revision GC\n3. **CAS**：`txn if mod_revision == X then put` 精确基于 revision 的比较\n4. **lease**：过期是 `revokedAtRevision` 标记，不直接用 wall clock\n\n**为什么 etcd 不 care wall clock**：raft heartbeat 用 monotonic time；mvcc compact/snapshot 按 revision；lease TTL 是\"多少秒内心跳\"走 monotonic 计数。唯一的 wall-clock 依赖是证书过期和一些粗粒度 interval 默认值。集群节点时钟漂移几分钟也基本不影响正确性。**etcd 是时钟无感设计的典范**。\n\n**Cassandra LWT：wall clock + Paxos 的糟糕结合**\n\nLWT（Lightweight Transaction）通过 Paxos 提供 quorum CAS：\n\n```sql\nINSERT INTO users (id, email) VALUES (1, 'a@b.com') IF NOT EXISTS;\nUPDATE users SET email = 'new@b.com' WHERE id = 1 IF email = 'old@b.com';\n```\n\nPaxos 本身不依赖 wall clock，但 Cassandra 的 **底层 mutation timestamp 用 wall clock**。LWT 的 ballot 是 `(timestamp_ms, coordinator_uuid)`，timestamp 来自 wall clock。\n\n**问题场景**：两个 coordinator NTP 偏差 500ms，C1=10:00:00.000 发 ballot，C2=9:59:59.500 发 ballot。C2 真实时间更晚，但 ballot 看起来更旧，replica 拒绝 C2。更严重的是**非 LWT 的普通 mutation**用 \"wall clock 大的赢\" 做 conflict resolution——节点 A 时钟快 1 分钟，它发的 delete 可能覆盖节点 B 后发的 insert，即使 B 真实时间更晚。**\"写入无声丢失\"** 是 Cassandra 经典坑。\n\n缓解：严格 NTP（偏差 < 1ms）、client 侧 `USING TIMESTAMP` 显式传入、监控 LWT timeout metric。ScyllaDB 引入 generation number 减少 wall clock 依赖。**LWT 是\"时钟误用\"的反面教材**：功能能用，但对 NTP 要求极高，一旦失控 silent data loss。\n\n**Kafka log offset：时钟完全不参与顺序**\n\nKafka 是\"时钟无关设计\"的教科书：\n\n- 每个 partition 维护 **per-partition monotonic int64 offset**\n- Producer 发消息 → leader broker 给消息分配下一个 offset（纯内存计数器自增）\n- Follower 严格按 offset 顺序复制，consumer 按 offset 顺序读\n\n**关键点**：offset 不是时间，**只是 per-partition 单调递增的整数**。全集群没有共享 counter，跨 partition 的两条消息 offset 不可比较。优势：\n\n1. **不需要时钟同步**。broker 之间 NTP 偏差几小时也无所谓\n2. **replication 简单**：follower 只验证 offset 连续即可\n3. **consumer rebalance 无感**：commit offset 到 `__consumer_offsets` topic\n\n代价：**放弃了跨 partition 顺序**。跨 partition 事务（Kafka Transactions / KSQL）需 Transaction Coordinator 额外机制。\n\nKafka 确实记录了 `timestamp`（CreateTime / LogAppendTime），但只是次要信息：用于按时间保留（retention）、`offsetsForTimes` 二分查找、KStream event-time 开窗。**消息顺序永远按 offset 决定**，跟 timestamp 无关。时钟回拨不影响数据层正确性。\n\n**三个系统的启示**\n\n| 系统 | 核心选择 | 好处 | 代价 |\n|---|---|---|---|\n| etcd | 集中式 raft index | 全局严格序、时钟无关 | 单 leader 瓶颈 |\n| Cassandra LWT | wall clock + Paxos | eventually consistent + 可选 CAS | 对 NTP 极敏感 |\n| Kafka | per-partition offset | 高吞吐、时钟无关 | 跨 partition 无序 |\n\n**挑选时钟方案就是挑选系统 trade-off**：\n\n- 需要**全局强序** → 集中式（etcd / TSO）或硬件 TrueTime（Spanner）\n- 需要**高吞吐 + 局部序** → per-partition counter（Kafka）\n- 需要**eventually consistent + 冲突检测** → vector clock / HLC（Dynamo / CockroachDB）\n- 不确定？→ 从 **\"系统能不能退化成不依赖 wall clock\"** 这个角度审视设计\n\n**踩坑提示**\n\n- 生产踩到 Cassandra LWT silent loss 的概率**远高于**你想象——即使配了 chrony，VM live migrate 瞬间时钟可能跳，恰好撞上 LWT 就丢写入。重要业务避免在 Cassandra 上用 LWT，选 CockroachDB / etcd 这种设计上就不依赖 wall clock 的\n- 如果你用 Kafka 但大量代码 `if message.timestamp > X: ...` 来做业务决策，恭喜你已经把时钟依赖重新引入了 Kafka 的 happy path——最好改用 offset 或者 event-time + watermark 机制\n- etcd compact revision 是**调优重点**：`--auto-compaction-mode=revision --auto-compaction-retention=1000000` 或按周期 compact，不然 mvcc 存储会膨胀到 GB 级别，影响 apply 速度和 snapshot 大小\n- 下一课我们进入 **quorum & majority**，会看到时钟在这些一致性协议里其实退居二线——真正做决定的是\"多数派\"而不是\"最新\""
+            }
+          ]
+        },
+        {
+          "slug": "failure-detection",
+          "order_index": 4,
+          "name": "失效检测与 heartbeat",
+          "hook": "\"对方还活着吗\"——这个问题比你想的难得多",
+          "sections": [
+            {
+              "title": "心跳的\"活\"与\"挂\"",
+              "content_md": "分布式系统第一性问题：**对方还活着吗**。单机进程挂了 OS 会给你 SIGCHLD，socket 断了有 RST；但跨机器、跨网络，你手上只有一件武器——**心跳**（heartbeat，周期性发一条\"我还在\"的消息，对端超时没收到就判定挂了）。\n\n**基础模型**\n\n```\nNode A（observer）           Node B（target）\n    │                            │\n    │  ← heartbeat_interval →    │\n    │ ←──── HB seq=1 ────────── │  t=0s\n    │ ←──── HB seq=2 ────────── │  t=5s\n    │ ←──── HB seq=3 ────────── │  t=10s\n    │       (miss)               X  t=15s  B crashed\n    │       (miss)               │  t=20s\n    │       (miss)               │  t=25s\n    │  超过 timeout=15s → SUSPECT │\n    ▼\n  mark B as DOWN\n```\n\n**最简算法伪代码**（observer 侧，单个 target）：\n\n```python\nlast_seen = now()\nTIMEOUT = 15.0   # seconds\n\ndef on_heartbeat_received(msg):\n    global last_seen\n    last_seen = now()\n\ndef check_loop():\n    while True:\n        if now() - last_seen > TIMEOUT:\n            mark_down(target)\n        sleep(1.0)\n```\n\n**两个核心参数的 tension**\n\n| 参数 | 调小的代价 | 调大的代价 |\n|---|---|---|\n| `heartbeat_interval` | 网络 / CPU 开销（N² 心跳矩阵） | 发现滞后，最坏 = interval + timeout |\n| `timeout` | **误判**（flapping，网络抖动即翻转状态） | 故障响应慢，业务拿到 stale 流量 |\n\n一个经验公式：**timeout ≈ 3 × interval**，给网络抖动留 2-3 个心跳周期的容错。5s interval + 15s timeout 是工业界常见起点（etcd 用 100ms / 1s，K8s node 用 10s / 40s，尺度差两个数量级，是因为受控对象不同）。\n\n**固定阈值的三个根本缺陷**\n\n1. **阈值与网络现实脱节**：跨 AZ 的 RTT 跟同机架差一个数量级，一刀切的 timeout 要么在同机架过松、要么在跨 AZ 过紧。\n2. **flapping 把集群拖垮**：节点状态 UP/DOWN 反复翻转，会触发 leader 重选、shard 重平衡、service endpoint 抽换——每次翻转都是一次 control plane 风暴。\n3. **二元判断丢信息**：\"最近 10 个心跳有 3 个晚到了 2-3 秒\"这种**渐进劣化**信号，被 binary up/down 完全抹掉。上游无法提前规避、无法优先级降级。\n\n这三个缺陷分别由后续三节解：phi accrual 处理阈值自适应、SWIM 处理 flapping 的误判放大、Chandra-Toueg 告诉你**理论上根本做不到完美**。\n\n**生产注意**\n\n- **心跳 vs 业务流量复用**：gRPC 的 keepalive ping、TCP keepalive 可以搭便车，但粒度粗（TCP keepalive 默认 2 小时）。生产系统几乎都自建 application-level heartbeat。\n- **别用同一条 TCP 连接**：如果 heartbeat 和业务数据共用同一条 TCP，**TCP 队头阻塞**会让 heartbeat 排在一个大 RPC 后面超时——明明对端好好的，你判它死了。至少要分开 stream（HTTP/2）或独立 UDP 通道。\n\n**踩坑提示**\n\nGC pause / STW（stop-the-world，JVM 或 Go 在整理堆时暂停整个进程）是 heartbeat 误判的最大元凶。一个 2 秒的 full GC 直接吃掉 2 个心跳周期。监控心跳误判时务必同时看目标节点的 GC 日志，不要第一反应去查网络。",
+              "key": "heartbeat-basics"
+            },
+            {
+              "title": "φ accrual failure detector",
+              "content_md": "固定阈值心跳的问题是**阈值**本身——它是拍脑袋定的。Hayashibara、Défago、Yared、Katayama 在 2004 年的论文《The φ Accrual Failure Detector》提出一个范式转换：**不要输出 UP/DOWN，输出一个连续的\"怀疑度\" φ**，让上游自己决定在什么 φ 值上采取什么动作。\n\n**核心思想：基于心跳历史的统计**\n\n维护每个 target 最近 N 次心跳到达的**到达间隔历史**（sliding window，通常 N=1000）。这些到达间隔构成一个分布（经验上近似正态分布，或更精确的指数分布），你可以拟合出 `mean μ` 和 `standard deviation σ`。\n\n当前时刻 `t`，距离上次收到心跳已经过去 `Δ = t - last_arrival`。**问题**：在\"节点活着\"的假设下，观察到\"间隔 ≥ Δ\"的概率是多少？如果这个概率极低（比如 10⁻⁶），那继续相信节点活着就很蠢。\n\nφ 就是这个概率取对数的负值：\n\n```\nφ(t) = -log₁₀( P_later(t - last_arrival) )\n```\n\n其中 `P_later(x)` 是在历史到达间隔分布下，观察到间隔 > x 的概率。\n\n**直觉**\n\n| φ 值 | 对应概率 | 解释 |\n|---|---|---|\n| 1 | 10⁻¹ = 10% | 这个延迟算正常，节点大概率活着 |\n| 2 | 10⁻² = 1% | 有点晚，值得怀疑 |\n| 3 | 10⁻³ = 0.1% | 相当异常 |\n| 8 | 10⁻⁸ | 在\"活着\"假设下几乎不可能，判死 |\n\n**网络好的环境**（抖动小 → σ 小）：同样 10 秒的延迟会让 φ 暴涨，快速判死。**网络差的环境**（σ 大）：同样 10 秒的延迟 φ 还在 1-2 之间，给更多容忍——**阈值随环境自适应**，这是 φ 的关键价值。\n\n**工程实现要点**\n\n```\n每收到一次 HB：\n    interval = now - last_arrival\n    window.append(interval)       # 滑动窗口，丢掉最老的\n    last_arrival = now\n    (μ, σ) = compute_stats(window)\n\n每次查询 φ：\n    Δ = now - last_arrival\n    φ = -log10( P_later(Δ | μ, σ) )\n```\n\n上游消费者：\n\n```python\nif phi(node) > 8.0:\n    mark_down(node)\nelif phi(node) > 3.0:\n    stop_sending_new_requests(node)   # 降级但不下线\n```\n\n**Cassandra 实战**\n\nCassandra 用 φ accrual（见 `FailureDetector.java`）判定 gossip 节点状态。关键配置 `phi_convict_threshold`（默认 8）。社区踩坑最多的：**跨 AZ/region 部署时默认 8 过于敏感**，常年 flap，官方推荐跨 region 提到 10-12。\n\nAkka Cluster 也用了 φ，配置项 `akka.cluster.failure-detector.threshold` 默认 8。\n\n**与固定超时的对比**\n\n| 维度 | 固定 timeout | φ accrual |\n|---|---|---|\n| 输出 | binary UP/DOWN | 连续 [0, ∞) |\n| 阈值 | 静态 | 从历史分布推出，隐式自适应 |\n| 渐进劣化感知 | 无 | φ 平滑爬升，可做降级 |\n| 实现复杂度 | 几十行 | 需要在线统计（均值/方差增量算法） |\n| 网络抖动敏感度 | 高 | σ 吸收抖动 |\n\n**生产注意**\n\n- **冷启动问题**：窗口数据不足时（刚连上没几个心跳样本），μ/σ 估计不稳定，φ 剧烈跳变。常见做法是前 N 个心跳期间用固定 timeout 兜底，之后切 φ。\n- **φ 不等于概率**：φ=8 不等于\"99.999999% 已死\"，它是在\"分布假设 + 历史窗口\"下的似然。分布假设（正态/指数）偏离现实时 φ 就不准，尤其是 bimodal（双峰，比如平时 5ms、偶尔 GC 500ms）分布拟合正态会很烂。\n\n**踩坑提示**\n\nφ 只是**怀疑度**，不是**动作**。很多团队把 `phi > threshold` 直接接到\"下线 + 剔除\"动作上，然后遇到 AZ 级网络抖动全集群 flap。正确姿势：`phi > T1` 触发 soft action（停新流量、告警），`phi > T2`（远高于 T1）才触发 hard action（下线、触发 failover），并叠加**多数派确认**（见下一节 SWIM）——单点怀疑不做决策。",
+              "key": "phi-accrual"
+            },
+            {
+              "title": "SWIM 协议",
+              "content_md": "前两节讨论的是**点对点**失效检测：A 盯 B。但分布式集群有 N 个节点，两两心跳是 O(N²)，千节点集群就是百万级心跳开销。而且**单点怀疑**容易误判——A 觉得 B 挂了，可能只是 A→B 这条链路抖动。\n\nSWIM（Das, Gupta, Motivala 2002，《SWIM: Scalable Weakly-consistent Infection-style Process Group Membership Protocol》）是工业界解这两个问题的主导协议。HashiCorp 的 **Serf / Consul / memberlist** 库、Uber 的 **Ringpop**、Cassandra 的 gossip（部分借鉴）都是 SWIM 家族。\n\n**两大机制**\n\n1. **随机 probe + 间接 probe**：不两两心跳，每个节点每个周期只随机挑一个目标 probe；直接 probe 超时后不立即判死，而是让 k 个\"第三方\"代为 probe——只有**大家都说联系不上**才算真的挂。这一步是误判率的关键降低点。\n2. **Infection-style gossip**：member state 变更（alive / suspect / dead）通过 gossip 扩散，**搭便车**在常规 probe 消息上，不需要独立广播。收敛时间 O(log N)。\n\n**一轮 probe 的完整流程**\n\n```\n每 protocol_period（典型 1s）：\n节点 A 做一件事——\n\n  A ───── PING ─────→ B           (1) 随机挑一个 B\n    ←──── ACK ────── B             (2a) 成功 → 标 B alive\n\n                      [若 T_direct 内没 ACK]\n\n  A ───── PING-REQ(B) ──→ C₁       (3) 随机挑 k 个间接节点（k=3 典型）\n  A ───── PING-REQ(B) ──→ C₂\n  A ───── PING-REQ(B) ──→ C₃\n                 │\n                 │  C₁ ───── PING ─────→ B\n                 │     ←──── ACK ──────\n                 │  C₁ ───── ACK ─────→ A       (4a) 有一个 C 能联系上 → alive\n                 │\n                 │  [若 T_total 内全无 ACK]\n                 ▼\n           (4b) 标 B 为 SUSPECT (不是 DEAD！)\n                 │\n                 │  gossip \"B is suspect\" 扩散给集群\n                 │\n                 │  B 收到后可以反驳：广播 \"I am alive, incarnation++\"\n                 │\n                 ▼\n           [suspect_timeout 过后 B 仍未反驳]\n                 │\n                 ▼\n                DEAD → 全集群 gossip \"B is dead, incarnation=N\"\n```\n\n**几个设计精髓**\n\n| 机制 | 解决什么问题 |\n|---|---|\n| 随机 probe | 负载从 O(N²) 降到每节点 O(1)/period，**总 probe 量全集群 O(N)** |\n| 间接 probe | 区分\"我连不上\"和\"它真的挂了\"，屏蔽单链路故障 |\n| Suspect 中间态 | 给被误判节点**反驳**的机会，incarnation 递增压制陈旧怀疑 |\n| Piggyback gossip | 不独立发广播包，状态变更搭在 PING/ACK 上扩散 |\n| Incarnation number | 节点每次反驳时 ++incarnation，旧的 suspect/dead 被自动覆盖 |\n\n**实际实现 memberlist**\n\nHashiCorp memberlist（Consul/Nomad/Serf 底层）关键参数：\n\n| 参数 | 默认（LAN） | 默认（WAN） | 含义 |\n|---|---|---|---|\n| `ProbeInterval` | 1s | 5s | 直接 probe 周期 |\n| `ProbeTimeout` | 500ms | 3s | 直接 probe 超时 |\n| `IndirectChecks` | 3 | 3 | 间接 probe 节点数 k |\n| `SuspicionMult` | 4 | 6 | suspect_timeout = Mult × log(N) × Interval |\n| `GossipNodes` | 3 | 4 | 每轮 piggyback 发给几个随机节点 |\n\n**SWIM 给我们的真正启示**\n\n不是协议本身，而是**设计哲学**：\n\n1. **不要追求完美检测**——接受误判存在，把误判代价降到最低（suspect 中间态 + 反驳机制）。\n2. **检测要用集群的集体视角**——k 个间接 probe 是\"多数派\"的最简形式。\n3. **状态扩散用 gossip 而不是广播**——收敛慢一点但扛得住节点增长。\n\n这三条对任何自建集群 membership 系统都适用，即使你不实现完整 SWIM。\n\n**生产注意**\n\n- **大集群 gossip fan-out 调参**：默认 GossipNodes=3 在小集群 OK，千节点以上要提到 5-6，否则收敛慢到分钟级。\n- **WAN 模式不是简单调大超时**：跨 region 的 SWIM 建议用 **WAN pool**（Consul 就这么设计的）——region 内部 LAN 参数正常跑，region 间走独立 WAN gossip，两层分离。\n\n**踩坑提示**\n\nSWIM 对**网络分区**（split-brain，集群被切成两半互相看不见）**不保证收敛到一致视图**——两边各自都会把对方标成 dead。协议本身不解分区问题（那是 consensus 层的事）。落地时务必清楚：SWIM 给你**weakly-consistent** membership（名字里就写着），想要**强一致**的 membership（比如 etcd 这种）必须走 Raft 之类的共识协议，别指望 SWIM。",
+              "key": "swim-protocol"
+            },
+            {
+              "title": "失效检测的不可靠性",
+              "content_md": "前三节都在讲\"怎么检测\"。这一节要讲一个反直觉但重要的事实：**纯异步模型下，完美的失效检测器在理论上就不存在**。所有你能实现的，都是近似的、带误判的。这不是工程问题，是理论下限。\n\n**Chandra-Toueg 分类（1996）**\n\nChandra 和 Toueg 的经典论文《Unreliable Failure Detectors for Reliable Distributed Systems》把失效检测器按**两个维度**分级：\n\n- **完全性**（Completeness）：**真挂的节点最终会被怀疑**\n  - Strong：每个挂节点被**所有**存活节点永久怀疑\n  - Weak：每个挂节点被**至少一个**存活节点永久怀疑\n- **准确性**（Accuracy）：**活着的节点不被误判**\n  - Strong：存活节点**从不**被怀疑\n  - Weak：至少存在一个存活节点从不被怀疑\n  - Eventually Strong（◇S）：最终不再有存活节点被怀疑\n  - Eventually Weak（◇W）：最终至少有一个存活节点不再被怀疑\n\n组合出 8 个级别，核心的 6 个：\n\n| 级别 | Completeness | Accuracy |\n|---|---|---|\n| **P**（Perfect） | Strong | Strong |\n| **S**（Strong） | Strong | Weak |\n| **◇P**（Eventually Perfect） | Strong | Eventually Strong |\n| **◇S**（Eventually Strong） | Strong | Eventually Weak |\n| **W**（Weak） | Weak | Weak |\n| **◇W**（Eventually Weak） | Weak | Eventually Weak |\n\n强度从上到下递减，**P** 是理想化的完美，**◇W** 是最弱的非平凡级别。\n\n**FLP 定理的诅咒**\n\nFischer-Lynch-Paterson 1985 定理：**纯异步系统中（消息延迟无上界、进程速度无下界），只要允许一个进程 crash，就不存在确定性算法能在有限时间内达成共识**。\n\n失效检测是共识问题的\"前哨站\"——要在不知道对方死活的异步系统里决定\"谁活着\"，本质就是共识。FLP 的推论：**纯异步模型下连 ◇W 都构造不出完美实现**。你永远没法区分\"节点死了\"和\"节点还活着但消息延迟了 10 分钟\"——后者的延迟没有上界。\n\n这不是工程能解的——这是物理定律级别的约束。\n\n**那生产系统为什么能跑？**\n\n答案是：**生产从来不是纯异步的**。现实中：\n\n- 网络延迟有**实际上界**（跨洋约 300ms，同 region 约 1ms）——虽然理论上可能更高\n- 进程速度有**实际下界**——现代 CPU 不会突然慢 1000 倍\n- 我们接受**误判**作为代价\n\n这叫**部分同步模型**（partial synchrony，Dwork-Lynch-Stockmeyer 1988）——假设存在一个未知的 GST（Global Stabilization Time），之后系统行为像同步的。Raft、Paxos、ZAB 都在这个模型上证明正确性。\n\n**实操意义：所有 FD 都是 ◇P 近似**\n\n生产系统的失效检测器都能提供**最终完全性**（真挂的最终会被标 dead），但**准确性只能做到\"大多数时候不误判\"**——这就是 ◇P 的本质。\n\n**日常场景 1：K8s node NotReady 但实际还活着**\n\n你肯定见过这个事故：\n\n```\nkubectl get nodes\nNAME          STATUS     AGE\nworker-07     NotReady   2m\n```\n\nssh 上去看——节点好好的，kubelet 进程在跑，业务容器也在跑。为什么 K8s 标它 NotReady？\n\n根因链路：\n\n1. kubelet 每 10s 向 apiserver PATCH `Node.Status.Conditions`（`--node-status-update-frequency`）\n2. 网络抖动 / apiserver 过载 / kubelet 自己 GC pause → PATCH 失败或延迟\n3. kube-controller-manager 的 node lifecycle controller 看 `LastHeartbeatTime` 超过 `--node-monitor-grace-period`（默认 40s）→ 标 NotReady\n4. 再过 `--default-unreachable-toleration-seconds`（默认 300s）→ 驱逐 Pod\n\n**节点活着但被标死**——这就是 Chandra-Toueg 说的 \"Accuracy 只能做到 Eventually\"。apiserver 压力过大时这是家常便饭。\n\n**日常场景 2：Cassandra 跨 region gossip flap**\n\n默认 `phi_convict_threshold=8` 在跨 region 部署下过于敏感，下午 3 点的网络拥塞可能让 φ 瞬间爆 8，节点集体 flap，triggering schema disagreement、hint pile-up。工程师把阈值调到 12 就\"解决\"了——本质是**容忍更多真故障延迟，换更低误判率**，Chandra-Toueg 的两个维度在这里对撞。\n\n**日常场景 3：Kafka controller 误下线 broker**\n\nKafka controller 通过 ZK（老）/ KRaft（新）的 session timeout 判定 broker 死活。broker 在 GC pause 超过 session timeout（默认 18s）时被标死，partition leader 切换，客户端重连风暴。问题是**broker 其实活着**，GC 结束后它以为自己还是 leader，**脑裂**——直到通过 epoch 机制强制它退位。这是 ◇P 里 \"Accuracy 不保证\" 的典型灾难现场。\n\n**工程思维转换**\n\n接受这个理论下限之后，失效检测的工程目标就变了：\n\n| 天真目标 | 工程真实目标 |\n|---|---|\n| 不误判活节点 | 把误判代价降到最低（SWIM suspect 中间态、hinted handoff） |\n| 快速发现故障 | 在**误判率**和**发现时间**之间显式权衡 |\n| 全集群一致视图 | **weakly-consistent** 够用，**强一致** membership 走共识 |\n\n**生产注意**\n\n- **调参不是消灭误判，是移动误判/漏判的平衡点**。把 timeout 调大减少误判，但故障响应变慢；调小反之。没有\"正确值\"，只有\"匹配当前业务 SLO 的值\"。\n- **区分 FD 和动作**：检测到\"怀疑死亡\"和真的执行\"failover/数据迁移\"必须解耦。推荐做法：怀疑触发告警、暂停新流量（低代价动作），确认触发切主、迁移（高代价动作）。\n\n**踩坑提示**\n\n别信任何声称\"零误判\"的 FD 方案——它要么在同步网络假设（内部专线、单机架）下成立，要么偷偷把\"误判\"改名叫\"暂时不可用\"。理论已经告诉你这是不可能的，文档里绝口不提 FLP 的厂商值得警惕。",
+              "key": "unreliable-fd"
+            },
+            {
+              "title": "工业系统影子：K8s --node-monitor-grace-period / etcd heartbeat-interval",
+              "content_md": "前四节建立了理论框架，这一节把理论落到**你每天在生产里会调的参数**。K8s 和 etcd 是两端——K8s 尺度宽松（秒级、分钟级），etcd 尺度严苛（毫秒级）。对比它们的配置和 trade-off，能让你对\"失效检测参数怎么调\"形成肌肉记忆。\n\n**K8s 节点失效检测链路**\n\n```\nkubelet (worker-07)\n   │ 每 10s (node-status-update-frequency)\n   │ PATCH Node.Status.Conditions.LastHeartbeatTime\n   ▼\napiserver → etcd\n   ▲\n   │ 每 5s watch + reconcile (node-monitor-period)\n   │\nkube-controller-manager (node lifecycle controller)\n   │\n   │ if now - LastHeartbeatTime > 40s (node-monitor-grace-period)\n   │     → Node.Status = NotReady\n   │\n   │ if NotReady 持续 → apply taint node.kubernetes.io/unreachable\n   │\n   │ after 300s (default-unreachable-toleration-seconds)\n   │     → evict Pods (由 taint manager 做)\n   ▼\nReplicaSet controller 在别的节点重建 Pod\n```\n\n**K8s 关键参数表**\n\n| 参数 | 组件 | 默认 | 调整 trade-off | 生产经验 |\n|---|---|---|---|---|\n| `--node-status-update-frequency` | kubelet | 10s | 调小 → 更灵敏，但 apiserver QPS 线性上升 | 5000 节点以上集群**不要调小**，apiserver 会被心跳流量打爆 |\n| `--node-monitor-period` | kcm | 5s | controller 扫描周期，调小 CPU 开销大 | 默认足够 |\n| `--node-monitor-grace-period` | kcm | 40s | 必须是 `node-status-update-frequency` 的**整数倍 ≥ 4×**；调小容易被 GC pause / 网络抖动误判 | GC 密集型 workload（JVM）所在集群调到 60s；大规模集群 apiserver 抖动多，调到 60-90s |\n| `--default-not-ready-toleration-seconds` | apiserver（默认 admission） | 300 | 从 NotReady 到驱逐 Pod 的宽限期 | 有状态服务调到 600-1800，避免短暂抖动就迁数据 |\n| `--default-unreachable-toleration-seconds` | apiserver | 300 | 同上，针对 Unreachable taint | 同上 |\n| `--large-cluster-size-threshold` | kcm | 50 | 超过此节点数启用 \"secondary rate\" 驱逐（更保守） | 大集群保持默认 |\n| `--unhealthy-zone-threshold` | kcm | 0.55 | zone 内 unhealthy 节点占比超过此值，暂停驱逐 | 默认即可，防止 zone 故障时雪崩驱逐 |\n\n**K8s 这套设计的哲学**：**宽松、容错、降级友好**。40s 的 grace period 对纯异步的网络足够——允许 4 次心跳丢失；300s 的 toleration 给运维一个介入窗口。代价是**故障发现慢**——节点真挂了到 Pod 重建要 5-6 分钟。这是**权衡**，不是 bug。\n\n**etcd 心跳与选举**\n\netcd 是 Raft 实现，心跳尺度完全不同——它是**强一致共识**的基础，容不得宽松。\n\n```\nleader ──── AppendEntries (heartbeat) ────→ followers\n   ▲              every 100ms                      │\n   │                                                │\n   └──── if follower 没在 election_timeout 收到 ────┘\n                 → start new election\n```\n\n**etcd 关键参数表**\n\n| 参数 | 默认 | 调整 trade-off | 生产经验 |\n|---|---|---|---|\n| `--heartbeat-interval` | 100ms | 调小 → leader CPU / 网络开销上升；调大 → 选举更慢 | 跨 AZ 部署调到 250-500ms，同机架保持默认 |\n| `--election-timeout` | 1000ms | 必须 **≥ 10 × heartbeat-interval**；调小易误选举导致频繁切主 | 跨 region 部署调到 2500-5000ms；磁盘慢（fsync > 100ms）时一定要调大 |\n| `--snapshot-count` | 10000 | 影响 WAL compaction 频率，间接影响磁盘压力 | 写入密集场景调到 50000-100000 |\n\n**为什么 etcd 敢用 100ms 心跳？**\n\n三个前提：\n\n1. **集群规模小**（3 或 5 节点，很少 7+），N² 心跳开销可控\n2. **通常同 AZ 低延迟部署**（RTT < 5ms）\n3. **强一致需求要求快速故障切换**（leader 挂了集群不可写，必须秒级恢复）\n\n把 etcd 参数照搬到 K8s 级尺度的失效检测是灾难——5000 节点互发 100ms 心跳是 2500 万 QPS 的心跳流量。\n\n**一张对照表：同一个概念在两套系统的差异**\n\n| 概念 | K8s（worker 节点） | etcd（Raft peer） |\n|---|---|---|\n| 心跳间隔 | 10s | 100ms |\n| 超时判死 | 40s | 1s |\n| 一致性模型 | weakly-consistent（最终看到节点 NotReady） | strongly-consistent（Raft 日志复制） |\n| 规模 | 100-5000 节点 | 3-5 节点 |\n| 误判代价 | 节点被误标 NotReady，300s 后才驱逐 Pod | 误选举，leader 切换 + 业务几百 ms 不可写 |\n| 真故障代价 | Pod 在别处重建，分钟级 | 数据不可写，需立即 failover |\n\n**调参心法**\n\n回到前几节的理论：\n\n- **心跳周期 ∝ 规模上限**：集群越大心跳要越稀疏（K8s 走这条路）\n- **超时阈值 ∝ 心跳周期**（3-4×）+ **∝ 网络抖动**（σ）\n- **toleration（驱逐宽限）∝ 业务恢复成本**：无状态 → 短；有状态 → 长\n- **强一致系统必须快速判死**（etcd、ZK、Consul server pool）\n- **最终一致系统可以慢判死**（K8s node、Cassandra gossip、Serf）\n\n**生产注意**\n\n- **永远成对调整 heartbeat 和 timeout**。只调 timeout 不调 heartbeat，容错窗口的心跳数变了，误判行为不可预测。etcd 强制要求 `election-timeout ≥ 10 × heartbeat-interval`，K8s 建议 `grace-period ≥ 4 × update-frequency`。\n- **监控必须覆盖失效检测的三条曲线**：实际心跳到达分布（看 σ 是否膨胀）、误判率（历史 NotReady/真挂的比例）、发现时延（故障到告警/驱逐的 p99）。只看\"是否误判\"一个维度不够。\n\n**踩坑提示**\n\n最常见的生产事故：**运维工程师把 `--node-monitor-grace-period` 从 40s 调到 10s\"为了更快发现故障\"**。结果下一次 apiserver 压力一抖动，半个集群节点集体闪断 NotReady → Pod 被驱逐 → 重建压力打爆新节点 → 雪崩。**失效检测参数只能变宽，不能激进收紧**，尤其在你没有完整 GC / 网络抖动 / apiserver 延迟基线画像的情况下。先收集 30 天的 `LastHeartbeatTime` 间隔分布直方图，看 p999 在哪，再决定 grace period 的调整方向。\n\n理论、协议、工业参数——三层东西在这一个参数上汇合。",
+              "key": "industry-shadow"
+            }
+          ]
+        },
+        {
+          "slug": "partition-vs-crash",
+          "order_index": 5,
+          "name": "分区 vs 崩溃",
+          "hook": "网络分区长得像节点崩溃，但修法完全不同；搞混是 top 事故",
+          "sections": [
+            {
+              "title": "表象相同但根因不同",
+              "key": "same-symptom-different-cause",
+              "content_md": "分布式系统里最棘手的一类事故，起点都是同一句话：**\"我收不到对方心跳了。\"** 但这句话背后可能对应两种完全不同的世界状态——对方真的挂了（crash），或者对方还活着、只是和你之间的网络断了（partition，网络分区）。**从观察者的视角，这两种状态无法通过本地信号区分**，这是整个 lesson 的核心前提。\n\n**观察者视角下的对称性**\n\n假设 A 节点在 3 秒内没收到 B 节点的心跳。A 能推断什么？\n\n```\n  A ──X── B                          A ─────── B\n                                              (宕机)\n  A 看到：心跳超时                   A 看到：心跳超时\n  实际：B 还活着，只是链路断          实际：B 真挂了\n  ──────────────────────────────────────────────────────\n  A 的本地信号完全一致，无法区分\n```\n\nA 的 TCP 读超时、keepalive 失败、应用层 heartbeat 过期——**没有任何一个本地信号能告诉 A：B 现在还在不在**。这是分布式系统里有名的 \"failure detector is fundamentally imperfect\"（故障检测器天然不完美，Chandra-Toueg 1996）。在**异步网络模型**下（没有消息延迟上限），本地超时根本不能蕴含 remote crash。\n\n**但两种状态的正确响应完全相反**\n\n| 真实状态 | 正确响应 | 错误响应的后果 |\n|---|---|---|\n| **B 真 crash** | 把 B 原来的工作（leader 角色、primary shard、lock holder）转给别人 | 如果不转移：业务停摆；保守等 B，客户流量死在前台 |\n| **B 与 A partition，B 还活着** | **不要转移**工作；让少数派（没拿到 quorum 的一边）自己降级 | 如果错误转移：B 那边还以为自己是 primary，两边同时写 → **split brain**（脑裂），数据双写、冲突、丢失 |\n\n**关键矛盾**：crash 要求快速故障转移以保可用性，partition 要求保守不动以保一致性。**你不知道是哪种，只能选一个默认动作**——这就是 CAP 里 P 存在时 C/A 必须二选一的实操意义（下一 module 会展开）。\n\n**为什么这是 top 事故源**\n\n业内几次著名的 split brain 事故都来自 \"以为是 crash、其实是 partition\"：\n\n- **GitHub 2018-10-21 incident**：跨 AZ 网络分区触发 MySQL Orchestrator failover，两个 AZ 都晋升了自己的 primary，24h 数据不一致，手工对账修复。公开 postmortem。\n- **Cloudflare 2020-07 control plane outage**：一个边缘分区让 etcd 集群少数派仍在对外响应（设计上不该响应，但一个缺陷导致未及时降级）。\n- **GitLab 2017-01-31**：partition + 误操作叠加，DBA 在错误的 replica 上 `rm -rf`，8h 数据丢失。虽然主因是人为，但触发点是分区后节点角色混乱。\n\n这些事故的共同结构：**本地超时 → 触发故障转移 → 没有安全护栏（quorum / fencing / lease）→ split brain → 数据层损坏**。本 lesson 后面几节依次回答：分区有几种形态、护栏原语有哪些、fencing token 为何是最后一道底线。\n\n**生产注意**\n\n- **\"对方失联\" 不等于 \"对方挂了\"** 这一条应该刻在每一个 failover 实现的代码注释里。任何基于超时就直接晋升角色的代码都是潜在事故源。\n- **不要用应用层 ping 判断节点死活**——它只能告诉你 \"我到它的路径是否通\"，不能告诉你 \"它是否活着\"。真正可信的死亡判定要么来自 quorum 一致投票（Raft/Paxos lease 到期），要么来自带外信号（BMC 断电、K8s node controller 综合多源）。\n- **排查时的第一问**：区分 crash vs partition 的最快方式是**从第三方视角观察**——从另一台不在争议链路上的机器去 ping B；看 B 的监控上报是否还在持续；查 B 的 kubelet/agent 日志是不是还在写。不要只信 A 的视角。"
+            },
+            {
+              "title": "分区的三种拓扑",
+              "key": "partition-topologies",
+              "content_md": "\"网络分区\" 在教科书里常被画成两组节点中间一刀劈开，但生产里的分区**形状远比这复杂**。三种典型拓扑——full、partial、asymmetric——对系统的破坏方式和可探测性差异巨大，partial 和 asymmetric 比 full 更致命，因为**心跳的一边看起来还正常**，故障检测器会说谎。\n\n**拓扑 1：full partition（完全分区）**\n\n集群被切成两组，两组之间**双向**完全断开；组内正常通信。\n\n```\n  ┌────────────┐     X X X     ┌────────────┐\n  │  A  B  C   │ ───X X X X─── │     D  E   │\n  │ (多数派 3) │ ───X X X X─── │ (少数派 2) │\n  └────────────┘     X X X     └────────────┘\n        ^                             ^\n        │                             │\n     保持 quorum                 失去 quorum\n     继续对外服务                  自我降级\n```\n\n- **可探测性**：好。两边都看到对面心跳超时，且**对面无法回我的任何包**（包括 TCP RST 也到不了）。\n- **破坏方式**：只要多数派正确识别自己是多数派、少数派正确降级，**数据层通常安全**。这是 Raft/Paxos 理论上覆盖的标准场景。\n- **典型诱因**：跨 AZ 光缆中断、核心交换机故障、BGP 误操作大面积 drop。\n\n**拓扑 2：partial partition（部分分区）**\n\n只有**某一对节点之间**断了，其他节点对彼此都正常。\n\n```\n     A ───────── B\n     │    X X    │\n     │   X   X   │        A-B 之间断了\n     │            │        A-C、B-C、A-D、B-D 都通\n     │            │\n     C ───────── D\n```\n\n- **可探测性**：差。从集群级别看，C 和 D 都说 A/B 都活着，只有 A 会说 \"B 挂了\"，只有 B 会说 \"A 挂了\"。**没有共识**。\n- **破坏方式**：如果 A 是 leader 监控 B 的 follower 状态，A 会报告 B 失效；但 C 上的监控说 B 正常。运维收到矛盾告警。如果决策逻辑基于 A 的视角 failover B，C/D 还在照常和 B 通信，B 的状态从没变——**两个系统视图并存**。\n- **典型诱因**：TOR（架顶交换机）某个端口 flapping、某对节点间的 VPC peering 故障、某条 overlay 隧道 MTU 异常导致大包全丢。\n\n**拓扑 3：asymmetric partition（非对称分区 / 单向分区）**\n\n**A 的包能到 B，但 B 的包到不了 A**（或反之）。这是 partial 的进一步变种。\n\n```\n     A ──────────→ B       A 可以发给 B（B 看得到）\n     A ←──X X X──  B       B 回给 A 的包丢失\n```\n\n- **可探测性**：最差。**B 看到 A 的心跳一直正常**，以为 A 活着；**A 看到 B 从不回心跳**，以为 B 挂了。两个节点的死活判断直接反着来。如果再加一个见证节点 C，C 能和双方都正常通信，**C 会支持哪一方？取决于实现细节**——多数实现只根据\"能不能连上\"来判，这时 C 说两个都活着。\n- **破坏方式**：最阴险。A 把 B 标记死，启动对 B 工作的重分配；B 还以为自己在正常工作，继续写 B 自己的状态；几分钟后 B 到 A 的链路恢复，A 发现 B 还活着但状态已经被改了一半——**双主、数据分叉**。\n- **典型诱因**：单向防火墙规则配错（一方向 iptables DROP 了回包）、NAT 表溢出导致回包找不到五元组、BGP 单边路由撤销、IPSec SA 不对称。\n\n**三种拓扑对比**\n\n| 拓扑 | 心跳对称性 | 探测难度 | 共识算法能否自保 | 运维典型告警 |\n|---|---|---|---|---|\n| **full** | 对称（都超时） | 低 | 能（多数派继续） | 一批节点同时 NotReady |\n| **partial** | 非对称（部分节点矛盾） | 中 | 多数情况下能，但少数派误判风险 | 告警互相打架 |\n| **asymmetric** | 严重非对称（一边正常一边超时） | 高 | **常常失效**，因为单边超时会触发错误 failover | 单边告警，另一边若无其事 |\n\n**关键洞察**：常见的健康检查协议（单向 ping、TCP connect probe）**只测一个方向**。只有**双向 heartbeat**（两边都发、两边都确认）+ **多观察者** 才能把非对称分区暴露出来。这也是 etcd/ZooKeeper 的心跳协议是双向 quorum-heartbeat 而不是单向 ping 的原因。\n\n**踩坑提示**\n\n- 在云环境里 asymmetric partition **比你以为的常见**：安全组 ingress/egress 规则不对称、VPC flow log 被单向 drop、某个 NLB 目标组只看到 SYN 不看到 SYN-ACK——这些都会制造单向失联。\n- 排查时别只看 \"A ping B\"，必须同时看 \"B ping A\"、\"C ping A\"、\"C ping B\"，**构建一张对称性矩阵**。`mtr --report-cycles 100` + 两端同时抓 tcpdump 是黄金组合。\n- 不要相信 heartbeat 日志显示 \"对端正常\" 就等于网络没问题——那只是 **in-bound** 心跳到了，反方向可能早就断了。"
+            },
+            {
+              "title": "处理策略：fence / quorum / lease",
+              "key": "handling-strategies",
+              "content_md": "面对 \"无法区分 crash 和 partition\" 这个根本问题，工业界沉淀出三种互斥保护原语：**fence**（栅栏）、**quorum**（法定人数）、**lease**（租约）。它们不是互相替代，而是**叠加使用**——好的系统通常三者都有，分别覆盖不同层次的风险。\n\n**原语 1：fence（栅栏 / I/O fencing / STONITH）**\n\n定义：**物理上阻止旧的、被认为已失效的节点再访问共享资源**。不是 \"告诉它你死了\"，而是 \"让它即使没死也动不了\"。\n\n典型实现：\n\n- **STONITH**（Shoot The Other Node In The Head，Linux HA 传统术语）：通过 IPMI / BMC / 电源分配单元（PDU）直接断电对方。最暴力最可靠。\n- **SCSI fencing / SCSI Persistent Reservations**：共享存储层把旧节点的 reservation 清掉，旧节点的磁盘写立刻失败。Oracle RAC、VMware vSphere HA 用这套。\n- **网络 fencing**：把旧节点的交换机端口 shut down、从 SDN 里把它踢出 VLAN。\n- **云环境的 fencing**：调 IaaS API 把实例 stop 掉，或者 detach 挂载的 EBS/PD 卷。\n\n特点：**强但重**。需要带外控制通道（BMC 网络、云 API），有实现成本；被 fence 的节点会真实重启或数据丢失，不能轻易触发。\n\n**原语 2：quorum（法定人数）**\n\n定义：**只有拿到集群多数（N/2+1）投票的节点才能执行敏感操作**。少数派自然失去权力。\n\n典型实现：\n\n- Raft/Paxos 系：etcd、Consul、ZooKeeper、CockroachDB、TiKV——leader 必须持续维持 quorum，否则自动 step down。\n- **Witness quorum**：奇数节点用于打破平票（2 DC + 1 witness 在 3rd DC）。\n- **epoch/term + quorum**：每次选举带新 term，旧 leader 的写入因为 term 过期被拒。\n\n特点：**逻辑优雅、无需带外通道**，但**至少需要 3 节点**（2 节点永远达不到 2/3+1=2 的 quorum 区分——实际上 2 节点集群根本无法防脑裂）。且要求多数派之间**链路可达**，跨 AZ 部署时对网络质量敏感。\n\n**原语 3：lease（租约）**\n\n定义：**带 TTL 的独占权**。授予方把某种权力（leader 角色、锁、资源占用）租给接收方一段时间 T；T 到期自动失效，接收方如果想续必须在 T 到期前主动续约。\n\n典型实现：\n\n- K8s leader election（`coordination.k8s.io/Lease` 对象，controller-manager / scheduler HA）。\n- Chubby / ZooKeeper ephemeral node。\n- Redis Redlock（有争议，见下一 section）。\n- etcd lease-based leader election（`clientv3/concurrency`）。\n\n特点：**实现简单**，不需要 fencing 硬件也不需要 quorum 投票（虽然常常和 quorum 叠加）。但**依赖时钟同步**：如果持有方的本地时钟慢、或者授予方和持有方的时钟漂移太大，租约的 TTL 在两边不一致，可能出现 \"授予方认为已到期、持有方认为还没到期\" 的危险窗口。\n\n**三者对比**\n\n| 维度 | fence | quorum | lease |\n|---|---|---|---|\n| **防护层级** | 物理/资源层 | 逻辑/协议层 | 逻辑/时间层 |\n| **依赖** | 带外控制（BMC/云 API） | 多数节点可达 | 时钟同步（NTP/PTP） |\n| **最小节点数** | 2（被 fence 对象 + 执行者） | 3 | 2（lease 授予方 + 持有方） |\n| **时延成本** | 高（秒级，重启/断电） | 中（一次 RTT 到多数节点） | 低（本地判断） |\n| **可用性代价** | 误 fence = 误停机 | 少数派不可写 | 时钟漂移时有风险 |\n| **实现复杂度** | 高（硬件/API 集成） | 中（需实现共识） | 低 |\n| **典型故障模式** | BMC 自己挂了 fence 不起作用 | 跨 AZ 分区导致 quorum 丢失 | GC pause / 时钟跳变 |\n| **对 asymmetric partition** | 有效（带外通道独立） | 多数情况有效 | 可能失效（见下节 fencing token） |\n\n**叠加使用的典型例子**\n\n生产级系统通常三者叠加：\n\n- **etcd**：quorum（Raft 多数派）+ lease（leader 的 term 内持续 heartbeat 构成隐式 lease）。\n- **K8s HA control plane**：quorum（etcd）+ lease（controller-manager/scheduler leader election）+ 对 Node 做 taint-based eviction 近似 fence。\n- **Oracle RAC**：quorum（voting disk）+ fence（I/O fencing 切断共享存储访问）+ lease（global resource directory 的 master）。\n\n**生产注意**\n\n- **2 节点集群永远无法防脑裂**——只有 quorum、fence、lease 其一不够，且 2 节点没有多数派概念。任何自称\"2 节点高可用\"的产品都在骗你，真相是\"用了 witness / lease owner / 外部仲裁\"，那就不是 2 节点。\n- **NTP 不准会让 lease 变陷阱**。生产级 lease 系统要监控节点间时钟漂移（`chronyc tracking` 或 PTP），偏差超过 lease TTL 的 10% 就告警。云原生场景建议 TTL 不小于 10s，给时钟漂移留空间。\n- **fence 的最大风险是 fence storm**：BMC 网络抖动导致互相 fence 对方，集群全挂。生产配置里 fence 逻辑必须带 cooldown 和 quorum 前置条件（只有多数派决定要 fence 某节点才执行）。"
+            },
+            {
+              "title": "split-brain 与 fencing token",
+              "key": "fencing-tokens",
+              "content_md": "这一节解释一个经典问题：**即使用了分布式锁/lease，仍然可能出现 split brain**。这是 Martin Kleppmann 2016 年博文 *How to do distributed locking* 的核心论点，至今仍是分布式锁设计的教学起点。解决方案叫 **fencing token**，是 lease 机制的最后一道护栏。\n\n**经典场景：GC pause 引发的 split brain**\n\n设想一个共享资源（比如存储系统的某个文件、或者一个单 writer 的业务队列），用分布式锁保护。Client A 拿到锁，锁带 30s TTL。\n\n```\n T=0s    Client A ──► Lock Service：拿锁，TTL=30s，返回成功\n T=0s    Client A ──► Storage：开始写（持锁中，合法）\n T=5s    Client A 进入 full GC / stop-the-world pause（比如 JVM 大堆、Go 未优化的 STW）\n         ────────────────────────────────────────────────────────\n         ...(A 的进程卡住了 50 秒，完全没有 CPU)...\n         ────────────────────────────────────────────────────────\n T=30s   Lock Service 认为 A 已到期（TTL 过了），锁自动释放\n T=31s   Client B ──► Lock Service：拿锁，成功（B 以为自己是唯一持锁人）\n T=32s   Client B ──► Storage：开始写（持锁中，合法）\n T=55s   Client A 从 GC pause 恢复\n         ↓ A 并不知道自己的锁已经过期\n         ↓ A 以为自己还合法持锁\n T=55s   Client A ──► Storage：继续写（非法，但 Storage 不知情）\n         ──── SPLIT BRAIN：A 和 B 同时写同一份资源 ────\n```\n\n**为什么会这样**：lease 机制的正确性依赖\"持锁方在 TTL 内一定能感知自己的进程还活着\"。但**进程不知道自己被 pause 了**——GC pause、CPU throttling、虚拟机 live migration、内核 SIGSTOP、容器 cgroup freeze，这些情况下进程内壁钟是暂停的，但**物理世界的时钟照常走**。A 以为自己才过了 0.1s，实际外面过了 50s。\n\n这不是 Redis / ZooKeeper / etcd 某个具体产品的 bug，**是 lease 抽象本身的固有风险**。Kleppmann 博文里专门拿这个例子驳斥了 Redis Redlock：Redlock 也无法解决这个问题。\n\n**解决方案：fencing token（单调递增令牌）**\n\n核心思想：**锁服务每次发出锁时附带一个单调递增的 token（整数），存储层必须校验每个写请求带的 token 不低于它见过的最高 token**。带低 token 的写被拒绝。\n\n修复后的时序：\n\n```\n T=0s    Client A ──► Lock Service：拿锁，返回 (lock, token=33)\n T=0s    Client A ──► Storage：写数据，附 token=33 → Storage 接受，记录 max_token=33\n T=5s    Client A 进入 GC pause\n T=30s   Lock Service 认为 A 到期，释放锁\n T=31s   Client B ──► Lock Service：拿锁，返回 (lock, token=34)   ← token 单调 +1\n T=32s   Client B ──► Storage：写数据，附 token=34 → Storage 接受，记录 max_token=34\n T=55s   Client A 恢复\n T=55s   Client A ──► Storage：写数据，附 token=33\n                     ↑\n           Storage 检查：33 < max_token(34) ──► 拒绝（返回 StaleTokenError）\n                        A 的写入被安全地阻止 ✓\n```\n\n**三个关键点**：\n\n1. **token 必须由锁服务**发放，且**单调递增、全局有序**（不能是客户端本地时间）。通常用 lock service 的 epoch/term/version。\n2. **存储层必须参与校验**——光有 token 没用，还需要 downstream 的共享资源能理解并拒绝旧 token 的写入。\n3. **max_token 的持久化本身也要防回退**——存储层自己也不能因为重启/failover 丢掉这个值，否则 token 校验形同虚设。\n\n**工程实现形态**\n\n| 实现 | 形式 |\n|---|---|\n| **ZooKeeper** | `czxid`（创建事务 id）天然单调递增，可作 token |\n| **etcd** | `ModRevision` 或 lease 的 `ID` 单调递增 |\n| **HDFS** | NameNode 的 `epoch` 字段作为 fencing token，旧 NN 带旧 epoch 被 DataNode 拒 |\n| **Google Chubby** | master epoch number，client 持锁时拿到 epoch，RPC 到后端服务时附带 |\n| **K8s API Server** | `resourceVersion` 近似（乐观并发控制），配合 `kube-scheduler` 的 Lease epoch 使用 |\n\n**为什么 Redlock 解不了**\n\nRedlock 返回的是 \"拿到锁了/没拿到\"，**不返回 token**。即使你自己加个递增计数器，Redis 的故障转移过程（异步复制 + 未确认写丢失）可能让 token 回退。Kleppmann 的建议：**如果你需要保护共享资源的正确性，用 ZooKeeper/etcd（带单调 epoch）；如果只是优化（避免重复工作且容忍少量重复），Redlock 够用**。\n\n**踩坑提示**\n\n- **存储层没参与校验 = fencing token 白加**。很多团队实现到 \"锁服务返回 token\" 就停了，downstream 服务完全忽略 token 字段，回到 Kleppmann 描述的原场景。\n- **token 持久化要强一致**：如果存储是分片的，max_token 必须在每个分片独立持久化，且分片本身要防回退（RocksDB WAL fsync、etcd Raft log）。\n- **观察性**：生产系统要监控 \"因 stale token 被拒的写请求数\"，这个 metric **大于 0 就说明真的发生过准 split brain**，应当作为重大事件告警，而不是默默丢弃。\n- **GC pause 本身也值得独立治理**：堆外内存、分代 GC 调优、K8s memory request 和 live migration 的配合——别把所有安全都押在 fencing token 这最后一道防线上，前置的 pause 控制同样重要。"
+            },
+            {
+              "title": "工业系统影子：Kubernetes taint-based eviction / etcd learner 保护",
+              "key": "industry-shadow",
+              "content_md": "前四节是理论与原语。这一节把视角切回工业界实际系统：**K8s 和 etcd 这两个我们每天都在用的组件，其内部机制里到处是本 lesson 理论的影子**。看懂了它们，就能反过来加深对 partition-vs-crash 的理解。\n\n**影子 1：K8s taint-based eviction — 分区容忍窗口**\n\n当一个 Node 的 kubelet 停止和 API Server 通信，node controller（在 kube-controller-manager 里）会给它打 taint：\n\n- `node.kubernetes.io/unreachable:NoExecute`（当 `Ready` 条件变为 `Unknown`）\n- `node.kubernetes.io/not-ready:NoExecute`（当 `Ready` 条件变为 `False`）\n\n但 Pod **不会立刻**被驱逐——有个关键配置：\n\n```yaml\napiVersion: v1\nkind: Pod\nspec:\n  tolerations:\n  - key: node.kubernetes.io/unreachable\n    operator: Exists\n    effect: NoExecute\n    tolerationSeconds: 300   # 默认 5 分钟（由 DefaultTolerationSeconds 准入控制器注入）\n```\n\n**这个 300 秒就是 K8s 对本 lesson 问题的回答**：\n\n> \"kubelet 不上报心跳\" 无法区分是 **kubelet 进程挂了、node 真挂了、还是 node 到 API Server 的网络分区**。保险起见，先观察 5 分钟——大部分瞬时网络抖动、kubelet 重启会在这个窗口内恢复，不需要驱逐 Pod（驱逐意味着在其他节点重建，代价是 Pod restart、ReadinessProbe 重来、可能的业务抖动）。5 分钟后仍未恢复，才认为这是真故障，开始驱逐。\n\n这**本质上就是 \"partition 容忍窗口 + 超时后的乐观决策\"**：\n\n| 阶段 | 时长 | 行为 | 对应理论 |\n|---|---|---|---|\n| T=0～40s | `node-monitor-grace-period`（默认 40s） | Node Ready 条件还显示 True，继续视为活 | 不敢因一次心跳丢就判死 |\n| T=40s～340s | Node 条件 Unknown，打 unreachable taint | Pod 继续运行，开始倒计时驱逐 | partition 容忍窗口 |\n| T>340s | `tolerationSeconds` 到期 | Pod 驱逐，ReplicaSet 在别的 Node 重建 | 从保守转为乐观：假设真 crash |\n\n**不解决 split brain，只是权衡**：即使 5 分钟后驱逐，如果是 asymmetric partition（Node 还活着、只是 API Server 联系不到它），**原 Node 上的 Pod 还在跑**，新 Node 上的 Pod 又起来了——这就是 K8s 下经典的 \"two replicas of the same Pod\" 现象。对无状态服务影响小，对 StatefulSet（比如数据库）可能出事，所以 StatefulSet 默认 Pod 会有 `podManagementPolicy: OrderedReady` 和 headless service identity，但**真正的保障靠应用层** fencing token（PostgreSQL 的 timeline ID、MySQL 的 GTID、Elasticsearch 的 cluster state version）。\n\n**影子 2：etcd learner — 避免新节点错误获得投票权**\n\netcd 3.4 引入 **learner**（只读成员）机制，乍看是个小特性，内核是防一类 split brain。\n\n**不用 learner 的经典问题**：\n\n假设已有 3 节点 etcd 集群 `{A, B, C}`，都正常，quorum=2。现在运维扩容到 5 节点：加入 D、E。\n\n```\n T=0     A B C 集群正常（quorum=2）\n T=1     添加 D，D 立刻成为 voting member，quorum 变成 3\n T=1     D 刚启动，还在从 leader 同步几 GB 的历史数据，暂时不能投票\n         ────────────────────────────────────────────\n         这时候如果 A 和 B 之间网络分区：\n         A + D（未同步完）    vs    B + C\n         左侧：D 投不了票，只有 A 的 1 票，不够 quorum=3\n         右侧：B + C 的 2 票，不够 quorum=3\n         ──── 整个集群卡死，谁都写不了 ────\n```\n\n**核心问题**：D 被算入 quorum 计算，但它不能真的投票（还在 catch up），等于**扩容过程中 quorum 静默抬高，实际可用投票者反而减少**，集群 **可用性暂时退化**。更糟的情况：如果 D 在 catch up 过程中被错误标记为可投票，它的状态可能是旧的，在选主时投出错误的票，导致 split brain。\n\n**learner 机制的修复**：\n\n```\n T=0     A B C 集群正常（voting=3, quorum=2）\n T=1     添加 D 为 learner，learner 不计入 quorum，不投票\n         quorum 仍然是 2，A B C 正常工作\n T=1~5m  D 从 leader 同步历史 raft log，追上\n T=5m    运维确认 D 已 catch up，执行 Promote(D)\n T=5m    D 转为 voting member，quorum 升到 3（平滑过渡）\n T=6m    添加 E 为 learner，重复\n```\n\n这个设计精神：**在节点状态还不确定的时候，不让它影响关键决策**。learner 可以接收复制、可以被读，但**不参与共识**——本质是延迟赋权，等到有证据它是\"健康的投票者\"再赋权。\n\n类比本 lesson：**新加入节点在观察期内的状态不明，等同于一个无法区分 \"已就绪 / 未就绪\" 的 partition-like 情形**。etcd 的选择是 \"不确定时保守\"，和 K8s tolerationSeconds 是一个哲学。\n\n**其他同类影子**\n\n| 系统 | 机制 | 本 lesson 影子 |\n|---|---|---|\n| **PostgreSQL sync replication** | `synchronous_commit=on` 等至少一个 replica 确认才算提交 | quorum 写 |\n| **Kafka ISR** | 只有 in-sync replica 被算入 quorum，落后的踢出 | 新节点不赋权（类 learner） |\n| **Consul autopilot** | `min_quorum` 配置 + 僵尸节点清理 | 防止扩容过程中 quorum 退化 |\n| **CockroachDB leaseholder epoch** | lease 绑定 epoch，旧 leaseholder 失效后新 epoch | fencing token |\n| **K8s controller-manager `--leader-elect-lease-duration`** | 默认 15s lease，超时 step down | lease |\n\n**生产注意**\n\n- **不要随便调 `tolerationSeconds`**。调小（比如 30s）会让 kubelet 短暂抖动就触发大批驱逐；调大（比如 30 分钟）会让真故障的 Node 上的 Pod 长期不可用。默认 300s 是大量实践得出的平衡点，除非你有极端场景（有状态数据库 Pod 可能想调大到 1800s 给运维介入空间）否则别动。\n- **etcd 扩容永远走 learner → promote 两步**，哪怕你急。直接 add member 已在 etcd 3.5+ 被标记为 anti-pattern，社区文档明说易触发上面的问题。\n- **监控 `etcd_cluster_version_match`、`kube_node_status_condition`**——partition 窗口期内这些指标会给你早期信号，不要等到驱逐发生才发现。"
+            },
+            {
+              "title": "在 AI Infra 中的影子：训练任务的时钟偏差、worker 心跳与 gang scheduling",
+              "key": "ai-infra-shadow",
+              "content_md": "M1 讲了 5 课：时钟、消息、故障模型、因果顺序、分区 vs 崩溃。这些话题在传统分布式系统语境里已经很成熟，但进入 AI Infra 场景后，它们都披上了新的壳——**大模型训练 / 推理服务，本质上是一种对故障模型极度敏感的分布式系统**，只是很多从业者还没把它当分布式系统的眼光来看。本节把 M1 的核心概念一个个映射到 AI Infra 里。\n\n**影子 1：训练任务的时钟偏差 — lesson 1 的回音**\n\n多机多卡训练（PyTorch DDP / DeepSpeed / Megatron-LM）每一步都依赖 **集合通信**（AllReduce、AllGather、Broadcast）。集合通信的语义是 \"所有 worker 必须都参与，少一个就挂起\"，所以框架内部有 **barrier + timeout** 机制：\n\n```python\n# PyTorch 伪代码\nwith torch.distributed.barrier(timeout=timedelta(seconds=1800)):\n    # 所有 rank 同步\n    pass\n```\n\n默认 NCCL_TIMEOUT / gloo timeout 是 1800 秒。这个 timeout 的判定**依赖每个 worker 的本地单调时钟**。如果 worker 之间时钟偏差大：\n\n- 慢 worker（时钟走得慢）可能在真正超时前就被快 worker 判定为挂了\n- 快 worker 看似正常完成，实际可能错过真正的同步点\n\n更阴险的是 **GPU side 的时钟**。NCCL 底层有自己的 proxy thread 和 CUDA stream 计时，不同 host 的 CUDA 事件时间戳不直接可比。如果用这些时间戳做 straggler detection（识别落后者），时钟漂移会让好 worker 被冤杀、坏 worker 被放过。\n\n**→ lesson 1 的 \"物理时钟不可信\" 在这里变成 \"用单调时钟 + 多源交叉验证才能信任 straggler 判定\"**。实践上，生产 AI 集群会在 HostAgent 里同时上报 monotonic、wall、NCCL kernel duration 三个信号，平台侧做一致性判断。\n\n**影子 2：worker 心跳与假阳性 crash 判定 — 本 lesson 的回音**\n\n训练作业通常有 controller（Job Manager / KubeFlow PyTorchJob controller / MPI operator）监控每个 worker 的心跳。如果心跳丢失：\n\n- **判定为 crash**：触发 checkpoint restore，整个作业从上一个 checkpoint 重启（对 70B 参数模型，一次 checkpoint restore 可能 3~10 分钟，加上重算 N 步的算力浪费）\n- **判定为 partition**：等一等，可能心跳会回来\n\n**假阳性的代价极高**：假设一个 4096 卡的训练作业，checkpoint 间隔 30 分钟，任一 worker 的心跳抖动被误判为 crash 就让 4096 × 30 = 12 万 GPU-分钟算力丢失。业内一个大作业单次 restart 成本常常在数万美元量级。\n\n所以 AI 平台对这个问题的应对**比传统 K8s 更激进地保守**：\n\n| 传统 K8s | AI Infra |\n|---|---|\n| `tolerationSeconds=300s` 默认 | 训练 Pod 常设 600~1800s 甚至更大 |\n| 心跳基于 kubelet 到 apiserver | 训练作业自建 worker-to-controller heartbeat，带双向确认 |\n| 失败直接 recreate Pod | 先尝试 in-place restart、worker-level retry，最后才全作业 restart |\n| 单指标（Ready 条件） | 多指标融合：心跳 + GPU util + NCCL 连通性 + agent log |\n\n这就是本 lesson \"不要轻易判死\" 原则在百万美元/小时训练场景下的放大版。\n\n**影子 3：gang scheduling — 统一故障视图**\n\n训练作业的一个残酷属性是 **all-or-nothing**：要么 N 个 worker 全起来开始训，要么一个都别起。起 N-1 个是最差情况——资源被占住但任务无法推进，等第 N 个 worker 的资源，资源被这 N-1 个占着，死锁。\n\n K8s 的 default scheduler 是 Pod-by-Pod 调度，不理解 \"一组 Pod 要么全调度成功要么全不调度\"。所以 AI 调度器（Volcano / Kueue / KAI Scheduler / Koordinator）都实现了 **gang scheduling**：\n\n```yaml\napiVersion: scheduling.volcano.sh/v1beta1\nkind: PodGroup\nmetadata:\n  name: train-job-1\nspec:\n  minMember: 32     # 32 个 worker 要么全起要么全不起\n  minResources:\n    nvidia.com/gpu: 256\n```\n\n**gang scheduling 的本质是对故障模型问题的抽象上移**：把 \"N 个 worker 的联合状态\" 作为一等公民，而不是各 worker 独立判死活。\n\n结合本 lesson：\n- 某个 worker 的 Pod 被 partition 疑似失效 → gang scheduler 知道 \"这一组都要一起决定\"，不会单独驱逐\n- 故障恢复时要么整个 PodGroup 一起重调度，要么整个等在队列里\n- 对 **straggler / partition / crash 的判定统一在 group 层**，避免\"单 pod 视角\"的局部错误决策\n\n这是把分布式故障模型问题从 \"基础设施层\" 推到 \"调度层\" 的工业实践。KAI Scheduler（NVIDIA 2025-04 开源）、Volcano（CNCF incubating）、Kueue（k8s-sigs）都在这个方向上。\n\n**M1 到此总结**\n\nM1 的 5 课：\n\n| Lesson | 核心问题 | AI Infra 回音 |\n|---|---|---|\n| 1 物理时钟不可信 | 时钟漂移、闰秒、NTP | straggler detection、NCCL timeout |\n| 2 消息传递的不确定性 | 至多一次/至少一次/恰好一次 | checkpoint 写入、gradient 传播 |\n| 3 故障模型 | crash / omission / Byzantine | GPU ECC 错误、hang vs crash |\n| 4 因果顺序 | happens-before、logical clock | 梯度 update 顺序、MoE 路由 |\n| 5 partition vs crash | 本课 | 训练心跳、gang scheduling |\n\n学完 M1，你拿到的是**分布式故障的语法**：知道每一种故障可能是什么形态、能不能被观察、观察了能不能确定、确定了应该怎么反应。但你**还不知道多个节点如何就一个值达成一致**——那是下一个模块 M2 一致性模型 要解决的问题。从 M2 开始，我们从 \"承认有故障\" 进入 \"在故障下仍然达成共识\"，线性一致性、因果一致性、最终一致性、CAP、Raft/Paxos 次第登场。\n\n**一句话带走**：M1 教你**看懂分布式故障**，M2 教你**在故障下做正确的事**。\n\n**生产注意**\n\n- 训练作业的超时参数不要照搬 K8s 默认。大模型训练里 `activeDeadlineSeconds`、`backoffLimit`、gang scheduler 的 `minAvailable` 都要基于作业规模和 checkpoint 间隔计算。\n- AI 平台的故障检测**必须多源**：单看心跳、单看 GPU metric、单看 NCCL log 都会有盲区。生产系统会把 HostAgent、Scheduler、Framework 三个信号做融合判定。\n- gang scheduling 不是银弹。它防止 partial deployment，但对 \"已经 running 的作业中一个 worker 挂了\" 场景仍然需要 elastic training（DeepSpeed Elastic / torchelastic）配合 —— 这是 M3/M5 的话题。"
+            }
+          ]
+        }
       ]
     },
     {
@@ -24,11 +194,41 @@
       "order_index": 2,
       "description": "一致性谱系、linearizable/sequential/causal、SI/SSI/RR/serializable、CAP/PACELC、读写 anomaly 图鉴。",
       "lessons": [
-        { "slug": "consistency-spectrum", "order_index": 1, "name": "一致性谱系", "hook": "\"强一致\" 和 \"最终一致\" 中间还有 5 层，搞不清你永远在吵错架", "sections": [] },
-        { "slug": "linearizable-vs-causal", "order_index": 2, "name": "linearizable / sequential / causal", "hook": "这三个词被滥用到失义，这节还它们精确定义", "sections": [] },
-        { "slug": "isolation-levels", "order_index": 3, "name": "SI / SSI / RR / serializable", "hook": "以为写了 BEGIN/COMMIT 就安全？SI 下的 write skew 静悄悄撕碎业务不变式", "sections": [] },
-        { "slug": "cap-pacelc", "order_index": 4, "name": "CAP 与 PACELC", "hook": "CAP 三选二是误导；PACELC 画出真实选择", "sections": [] },
-        { "slug": "rw-anomalies", "order_index": 5, "name": "读写 anomaly 图鉴", "hook": "phantom / lost update / write skew / stale read——跨场景分辨", "sections": [] }
+        {
+          "slug": "consistency-spectrum",
+          "order_index": 1,
+          "name": "一致性谱系",
+          "hook": "\"强一致\" 和 \"最终一致\" 中间还有 5 层，搞不清你永远在吵错架",
+          "sections": []
+        },
+        {
+          "slug": "linearizable-vs-causal",
+          "order_index": 2,
+          "name": "linearizable / sequential / causal",
+          "hook": "这三个词被滥用到失义，这节还它们精确定义",
+          "sections": []
+        },
+        {
+          "slug": "isolation-levels",
+          "order_index": 3,
+          "name": "SI / SSI / RR / serializable",
+          "hook": "以为写了 BEGIN/COMMIT 就安全？SI 下的 write skew 静悄悄撕碎业务不变式",
+          "sections": []
+        },
+        {
+          "slug": "cap-pacelc",
+          "order_index": 4,
+          "name": "CAP 与 PACELC",
+          "hook": "CAP 三选二是误导；PACELC 画出真实选择",
+          "sections": []
+        },
+        {
+          "slug": "rw-anomalies",
+          "order_index": 5,
+          "name": "读写 anomaly 图鉴",
+          "hook": "phantom / lost update / write skew / stale read——跨场景分辨",
+          "sections": []
+        }
       ]
     },
     {
@@ -37,12 +237,48 @@
       "order_index": 3,
       "description": "为什么需要共识、Raft 三件事、成员变更与 learner、Paxos 思路 / Zab 对比、慢节点 & 灰故障、链式复制。",
       "lessons": [
-        { "slug": "why-consensus", "order_index": 1, "name": "为什么需要共识", "hook": "2PC 不是共识、leader election 不是共识——它们都会卡，共识是\"保证不卡\"那层", "sections": [] },
-        { "slug": "raft-essentials", "order_index": 2, "name": "Raft 三件事：election / log / safety", "hook": "150 行伪代码讲透 Raft——你只需要三个不变式", "sections": [] },
-        { "slug": "raft-membership", "order_index": 3, "name": "成员变更 & learner 的坑", "hook": "配错让 etcd 集群永久挂——真实事故复盘", "sections": [] },
-        { "slug": "paxos-and-zab", "order_index": 4, "name": "Paxos 思路 & Zab 对比", "hook": "Raft 不是唯一答案，各自解决不同问题", "sections": [] },
-        { "slug": "slow-nodes", "order_index": 5, "name": "慢节点 & 灰故障", "hook": "节点没死但很慢，比 crash 可怕 10 倍——运维 top 1 事故", "sections": [] },
-        { "slug": "chain-replication", "order_index": 6, "name": "链式复制 & quorum 写", "hook": "不只 Raft——chain replication 在特定场景吞吐高 3 倍", "sections": [] }
+        {
+          "slug": "why-consensus",
+          "order_index": 1,
+          "name": "为什么需要共识",
+          "hook": "2PC 不是共识、leader election 不是共识——它们都会卡，共识是\"保证不卡\"那层",
+          "sections": []
+        },
+        {
+          "slug": "raft-essentials",
+          "order_index": 2,
+          "name": "Raft 三件事：election / log / safety",
+          "hook": "150 行伪代码讲透 Raft——你只需要三个不变式",
+          "sections": []
+        },
+        {
+          "slug": "raft-membership",
+          "order_index": 3,
+          "name": "成员变更 & learner 的坑",
+          "hook": "配错让 etcd 集群永久挂——真实事故复盘",
+          "sections": []
+        },
+        {
+          "slug": "paxos-and-zab",
+          "order_index": 4,
+          "name": "Paxos 思路 & Zab 对比",
+          "hook": "Raft 不是唯一答案，各自解决不同问题",
+          "sections": []
+        },
+        {
+          "slug": "slow-nodes",
+          "order_index": 5,
+          "name": "慢节点 & 灰故障",
+          "hook": "节点没死但很慢，比 crash 可怕 10 倍——运维 top 1 事故",
+          "sections": []
+        },
+        {
+          "slug": "chain-replication",
+          "order_index": 6,
+          "name": "链式复制 & quorum 写",
+          "hook": "不只 Raft——chain replication 在特定场景吞吐高 3 倍",
+          "sections": []
+        }
       ]
     },
     {
@@ -51,11 +287,41 @@
       "order_index": 4,
       "description": "StatefulSet 语义、Headless svc、Lease 选主、PDB 分布式语义、Operator 模式。K8s 作为分布式载体层。",
       "lessons": [
-        { "slug": "statefulset-semantics", "order_index": 1, "name": "StatefulSet 的 identity 与 ordering", "hook": "不是\"有状态版 Deployment\"——pod name / PV 绑定是一等公民", "sections": [] },
-        { "slug": "headless-and-discovery", "order_index": 2, "name": "Headless svc 与服务发现", "hook": "为什么中间件必须 headless——DNS 直接暴露 pod name 的深意", "sections": [] },
-        { "slug": "lease-election", "order_index": 3, "name": "K8s 原生 leader election（Lease）", "hook": "不用 ZK 也能选主——Lease + optimistic lock 是 K8s 的共识原语", "sections": [] },
-        { "slug": "pdb-semantics", "order_index": 4, "name": "PDB & 滚动更新的分布式语义", "hook": "PDB 不是\"别一起挂\"，是\"别违反 quorum\"——用分布式语法读它", "sections": [] },
-        { "slug": "operator-pattern", "order_index": 5, "name": "Operator 模式的责任边界", "hook": "Operator 不是 StatefulSet pro——接管了分布式系统的运维 runbook", "sections": [] }
+        {
+          "slug": "statefulset-semantics",
+          "order_index": 1,
+          "name": "StatefulSet 的 identity 与 ordering",
+          "hook": "不是\"有状态版 Deployment\"——pod name / PV 绑定是一等公民",
+          "sections": []
+        },
+        {
+          "slug": "headless-and-discovery",
+          "order_index": 2,
+          "name": "Headless svc 与服务发现",
+          "hook": "为什么中间件必须 headless——DNS 直接暴露 pod name 的深意",
+          "sections": []
+        },
+        {
+          "slug": "lease-election",
+          "order_index": 3,
+          "name": "K8s 原生 leader election（Lease）",
+          "hook": "不用 ZK 也能选主——Lease + optimistic lock 是 K8s 的共识原语",
+          "sections": []
+        },
+        {
+          "slug": "pdb-semantics",
+          "order_index": 4,
+          "name": "PDB & 滚动更新的分布式语义",
+          "hook": "PDB 不是\"别一起挂\"，是\"别违反 quorum\"——用分布式语法读它",
+          "sections": []
+        },
+        {
+          "slug": "operator-pattern",
+          "order_index": 5,
+          "name": "Operator 模式的责任边界",
+          "hook": "Operator 不是 StatefulSet pro——接管了分布式系统的运维 runbook",
+          "sections": []
+        }
       ]
     },
     {
@@ -64,10 +330,34 @@
       "order_index": 5,
       "description": "分片策略、路由层、rebalance 的痛、跨分片查询与事务。",
       "lessons": [
-        { "slug": "sharding-strategies", "order_index": 1, "name": "hash / range / 一致性哈希 / vnode", "hook": "四种分片的生死线，选错一年都在救火", "sections": [] },
-        { "slug": "routing-layers", "order_index": 2, "name": "路由：client-side / proxy / gateway", "hook": "三种路由故障半径完全不同——MongoDB / Redis / TiDB 为什么选法不同", "sections": [] },
-        { "slug": "rebalance-pain", "order_index": 3, "name": "rebalance 的七宗罪", "hook": "扩容 p99 飙 10 倍、磁盘被打挂——分布式存储最痛的操作", "sections": [] },
-        { "slug": "cross-shard", "order_index": 4, "name": "跨分片查询与事务", "hook": "\"在 shard 里\"和\"跨 shard\"是两个世界——跨 shard SQL 为什么慢 100 倍", "sections": [] }
+        {
+          "slug": "sharding-strategies",
+          "order_index": 1,
+          "name": "hash / range / 一致性哈希 / vnode",
+          "hook": "四种分片的生死线，选错一年都在救火",
+          "sections": []
+        },
+        {
+          "slug": "routing-layers",
+          "order_index": 2,
+          "name": "路由：client-side / proxy / gateway",
+          "hook": "三种路由故障半径完全不同——MongoDB / Redis / TiDB 为什么选法不同",
+          "sections": []
+        },
+        {
+          "slug": "rebalance-pain",
+          "order_index": 3,
+          "name": "rebalance 的七宗罪",
+          "hook": "扩容 p99 飙 10 倍、磁盘被打挂——分布式存储最痛的操作",
+          "sections": []
+        },
+        {
+          "slug": "cross-shard",
+          "order_index": 4,
+          "name": "跨分片查询与事务",
+          "hook": "\"在 shard 里\"和\"跨 shard\"是两个世界——跨 shard SQL 为什么慢 100 倍",
+          "sections": []
+        }
       ]
     },
     {
@@ -76,11 +366,41 @@
       "order_index": 6,
       "description": "2PC/3PC、Saga/TCC、分布式锁与 lease、幂等、exactly-once 真相。",
       "lessons": [
-        { "slug": "2pc-3pc", "order_index": 1, "name": "2PC / 3PC 与 coordinator 难题", "hook": "2PC 不是\"简单版 Raft\"——有共识解决不了的单点问题", "sections": [] },
-        { "slug": "saga-tcc", "order_index": 2, "name": "Saga 与 TCC", "hook": "没有 2PC 怎么做？补偿式事务的\"优雅\"和\"地雷\"", "sections": [] },
-        { "slug": "distributed-locks", "order_index": 3, "name": "分布式锁与 lease", "hook": "Redis / etcd / ZK 锁各自真能保证什么——以及保证不了的", "sections": [] },
-        { "slug": "idempotency", "order_index": 4, "name": "幂等：不只是\"重试不出错\"", "hook": "真幂等 = request_id + 状态机 + 过期 三件套", "sections": [] },
-        { "slug": "exactly-once-myth", "order_index": 5, "name": "exactly-once 的真相", "hook": "Kafka exactly-once ≠ exactly-once，是 effectively-once——救命区别", "sections": [] }
+        {
+          "slug": "2pc-3pc",
+          "order_index": 1,
+          "name": "2PC / 3PC 与 coordinator 难题",
+          "hook": "2PC 不是\"简单版 Raft\"——有共识解决不了的单点问题",
+          "sections": []
+        },
+        {
+          "slug": "saga-tcc",
+          "order_index": 2,
+          "name": "Saga 与 TCC",
+          "hook": "没有 2PC 怎么做？补偿式事务的\"优雅\"和\"地雷\"",
+          "sections": []
+        },
+        {
+          "slug": "distributed-locks",
+          "order_index": 3,
+          "name": "分布式锁与 lease",
+          "hook": "Redis / etcd / ZK 锁各自真能保证什么——以及保证不了的",
+          "sections": []
+        },
+        {
+          "slug": "idempotency",
+          "order_index": 4,
+          "name": "幂等：不只是\"重试不出错\"",
+          "hook": "真幂等 = request_id + 状态机 + 过期 三件套",
+          "sections": []
+        },
+        {
+          "slug": "exactly-once-myth",
+          "order_index": 5,
+          "name": "exactly-once 的真相",
+          "hook": "Kafka exactly-once ≠ exactly-once，是 effectively-once——救命区别",
+          "sections": []
+        }
       ]
     },
     {
@@ -89,11 +409,41 @@
       "order_index": 7,
       "description": "etcd / Kafka / TiDB-CockroachDB / Redis Cluster / MinIO-Ceph 在 K8s 上的生产实战。四段式模板：Raft/quorum 用法 / 数据分片 / 运维原语 / 典型事故。",
       "lessons": [
-        { "slug": "etcd", "order_index": 1, "name": "etcd 解剖", "hook": "K8s 的心脏如何存活：Raft / watch / lease / compaction + Roblox 73h 宕机事件", "sections": [] },
-        { "slug": "kafka", "order_index": 2, "name": "Kafka 解剖", "hook": "ISR / LEO/HW / exactly-once / rebalance—5 个状态机必须同时想清楚", "sections": [] },
-        { "slug": "tidb-cockroach", "order_index": 3, "name": "TiDB / CockroachDB 解剖", "hook": "分布式 SQL 四问：分片 / Raft group / 事务 / 时钟", "sections": [] },
-        { "slug": "redis-cluster", "order_index": 4, "name": "Redis Cluster 解剖（原理 + 云原生增量）", "hook": "gossip / slot / split brain + Redis on K8s Operator 实战 + 与云托管 Redis 对比", "sections": [] },
-        { "slug": "object-storage", "order_index": 5, "name": "对象存储解剖：MinIO / Ceph", "hook": "AI Infra 的底盘：erasure coding / CRUSH / MON quorum——MinIO 为什么赢过 Ceph 成为 K8s 时代 S3 兼容事实标准", "sections": [] }
+        {
+          "slug": "etcd",
+          "order_index": 1,
+          "name": "etcd 解剖",
+          "hook": "K8s 的心脏如何存活：Raft / watch / lease / compaction + Roblox 73h 宕机事件",
+          "sections": []
+        },
+        {
+          "slug": "kafka",
+          "order_index": 2,
+          "name": "Kafka 解剖",
+          "hook": "ISR / LEO/HW / exactly-once / rebalance—5 个状态机必须同时想清楚",
+          "sections": []
+        },
+        {
+          "slug": "tidb-cockroach",
+          "order_index": 3,
+          "name": "TiDB / CockroachDB 解剖",
+          "hook": "分布式 SQL 四问：分片 / Raft group / 事务 / 时钟",
+          "sections": []
+        },
+        {
+          "slug": "redis-cluster",
+          "order_index": 4,
+          "name": "Redis Cluster 解剖（原理 + 云原生增量）",
+          "hook": "gossip / slot / split brain + Redis on K8s Operator 实战 + 与云托管 Redis 对比",
+          "sections": []
+        },
+        {
+          "slug": "object-storage",
+          "order_index": 5,
+          "name": "对象存储解剖：MinIO / Ceph",
+          "hook": "AI Infra 的底盘：erasure coding / CRUSH / MON quorum——MinIO 为什么赢过 Ceph 成为 K8s 时代 S3 兼容事实标准",
+          "sections": []
+        }
       ]
     },
     {
@@ -102,12 +452,48 @@
       "order_index": 8,
       "description": "重试 deadline、熔断限流、负载均衡、RPC 分布式语义、service mesh、gRPC 原生治理。",
       "lessons": [
-        { "slug": "retry-and-deadline", "order_index": 1, "name": "重试、退避与 deadline", "hook": "不 jitter 的重试 = DDoS 自己；不带 deadline 的重试 = 资源泄漏", "sections": [] },
-        { "slug": "circuit-breaker-rl", "order_index": 2, "name": "熔断 & 限流", "hook": "熔断 = 保护我，限流 = 保护你——角色对调会出事", "sections": [] },
-        { "slug": "load-balancing", "order_index": 3, "name": "负载均衡算法", "hook": "P2C / EWMA / LC / 一致性哈希——RR 在长连接下为什么崩", "sections": [] },
-        { "slug": "rpc-semantics", "order_index": 4, "name": "RPC 分布式语义", "hook": "socket timeout ≠ application timeout；gRPC streaming 半关闭；HTTP/2 head-of-line", "sections": [] },
-        { "slug": "service-mesh", "order_index": 5, "name": "Service mesh：Envoy / Istio", "hook": "sidecar 不只是\"把重试移出代码\"——治理移到基础设施的代价", "sections": [] },
-        { "slug": "grpc-governance", "order_index": 6, "name": "gRPC 原生治理", "hook": "不用 mesh 也能做好——xDS / Resolver / LB 能力清单", "sections": [] }
+        {
+          "slug": "retry-and-deadline",
+          "order_index": 1,
+          "name": "重试、退避与 deadline",
+          "hook": "不 jitter 的重试 = DDoS 自己；不带 deadline 的重试 = 资源泄漏",
+          "sections": []
+        },
+        {
+          "slug": "circuit-breaker-rl",
+          "order_index": 2,
+          "name": "熔断 & 限流",
+          "hook": "熔断 = 保护我，限流 = 保护你——角色对调会出事",
+          "sections": []
+        },
+        {
+          "slug": "load-balancing",
+          "order_index": 3,
+          "name": "负载均衡算法",
+          "hook": "P2C / EWMA / LC / 一致性哈希——RR 在长连接下为什么崩",
+          "sections": []
+        },
+        {
+          "slug": "rpc-semantics",
+          "order_index": 4,
+          "name": "RPC 分布式语义",
+          "hook": "socket timeout ≠ application timeout；gRPC streaming 半关闭；HTTP/2 head-of-line",
+          "sections": []
+        },
+        {
+          "slug": "service-mesh",
+          "order_index": 5,
+          "name": "Service mesh：Envoy / Istio",
+          "hook": "sidecar 不只是\"把重试移出代码\"——治理移到基础设施的代价",
+          "sections": []
+        },
+        {
+          "slug": "grpc-governance",
+          "order_index": 6,
+          "name": "gRPC 原生治理",
+          "hook": "不用 mesh 也能做好——xDS / Resolver / LB 能力清单",
+          "sections": []
+        }
       ]
     },
     {
@@ -116,10 +502,34 @@
       "order_index": 9,
       "description": "故障域设计、多活 vs 主备、跨机房同步、流量切换与 GSLB。",
       "lessons": [
-        { "slug": "failure-domains", "order_index": 1, "name": "故障域设计", "hook": "AZ / region / rack / 节点——故障域画错，HA 只是纸面数字", "sections": [] },
-        { "slug": "active-active", "order_index": 2, "name": "多活 vs 主备", "hook": "多活看起来更好，但冲突解决是你下半辈子的债", "sections": [] },
-        { "slug": "cross-region-sync", "order_index": 3, "name": "跨机房同步：sync / semi-sync / async", "hook": "三种复制的 RPO / RTO trade-off", "sections": [] },
-        { "slug": "traffic-switching", "order_index": 4, "name": "流量切换 / 灰度 / GSLB", "hook": "DNS / anycast / SDN 各自失败模式", "sections": [] }
+        {
+          "slug": "failure-domains",
+          "order_index": 1,
+          "name": "故障域设计",
+          "hook": "AZ / region / rack / 节点——故障域画错，HA 只是纸面数字",
+          "sections": []
+        },
+        {
+          "slug": "active-active",
+          "order_index": 2,
+          "name": "多活 vs 主备",
+          "hook": "多活看起来更好，但冲突解决是你下半辈子的债",
+          "sections": []
+        },
+        {
+          "slug": "cross-region-sync",
+          "order_index": 3,
+          "name": "跨机房同步：sync / semi-sync / async",
+          "hook": "三种复制的 RPO / RTO trade-off",
+          "sections": []
+        },
+        {
+          "slug": "traffic-switching",
+          "order_index": 4,
+          "name": "流量切换 / 灰度 / GSLB",
+          "hook": "DNS / anycast / SDN 各自失败模式",
+          "sections": []
+        }
       ]
     },
     {
@@ -128,10 +538,34 @@
       "order_index": 10,
       "description": "三位一体、分布式 tracing、SLO & error budget、生产事故复盘实战。",
       "lessons": [
-        { "slug": "three-pillars", "order_index": 1, "name": "metric / log / trace 三位一体", "hook": "三者不是冗余——每种问题有一种\"最快回答\"的信号源", "sections": [] },
-        { "slug": "distributed-tracing", "order_index": 2, "name": "分布式 tracing 内功", "hook": "sampling / context propagation / span linking——追链路追丢的真相", "sections": [] },
-        { "slug": "slo-error-budget", "order_index": 3, "name": "SLO & error budget", "hook": "SLO 不是\"可用率\"——是产品 + SRE 同一把尺子，\"要不要发版\"变算术题", "sections": [] },
-        { "slug": "incident-postmortem", "order_index": 4, "name": "生产大故障复盘实战", "hook": "用学过的全部工具复盘一次真事故：alert → root cause → 防复发", "sections": [] }
+        {
+          "slug": "three-pillars",
+          "order_index": 1,
+          "name": "metric / log / trace 三位一体",
+          "hook": "三者不是冗余——每种问题有一种\"最快回答\"的信号源",
+          "sections": []
+        },
+        {
+          "slug": "distributed-tracing",
+          "order_index": 2,
+          "name": "分布式 tracing 内功",
+          "hook": "sampling / context propagation / span linking——追链路追丢的真相",
+          "sections": []
+        },
+        {
+          "slug": "slo-error-budget",
+          "order_index": 3,
+          "name": "SLO & error budget",
+          "hook": "SLO 不是\"可用率\"——是产品 + SRE 同一把尺子，\"要不要发版\"变算术题",
+          "sections": []
+        },
+        {
+          "slug": "incident-postmortem",
+          "order_index": 4,
+          "name": "生产大故障复盘实战",
+          "hook": "用学过的全部工具复盘一次真事故：alert → root cause → 防复发",
+          "sections": []
+        }
       ]
     }
   ]
