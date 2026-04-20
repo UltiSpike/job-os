@@ -1,0 +1,138 @@
+{
+  "track": {
+    "slug": "distsys-prod",
+    "name": "分布式系统生产实战",
+    "description": "理论底座 → K8s 载体 + 工业系统 → 服务端弹性 & 容灾，10 模块 49 lesson。P6 核心密度 + P5+ 友好入口。2026-04 版本锚点。"
+  },
+  "modules": [
+    {
+      "slug": "fundamentals",
+      "name": "分布式基础 & 故障模型 & 时钟",
+      "order_index": 1,
+      "description": "为什么分布式、八大谬误、故障模型（crash/omission/byzantine/partition）、物理/逻辑/向量/混合时钟、失效检测、分区 vs 崩溃。入门必备。",
+      "lessons": [
+        { "slug": "why-distributed", "order_index": 1, "name": "为什么分布式 & 八大谬误", "hook": "从 Roblox 2021 etcd 73h 大崩说起——单机到分布式不是扩容，是换物理学", "sections": [] },
+        { "slug": "failure-models", "order_index": 2, "name": "故障模型图鉴", "hook": "你的代码不是在会 panic 的机器上跑，是在会失联、发错包、时空倒流的机器上跑", "sections": [] },
+        { "slug": "clocks-and-order", "order_index": 3, "name": "时钟与顺序", "hook": "没有 wall clock 也能 \"A 在 B 之前\"——Lamport 的洞察改变了分布式的语法", "sections": [] },
+        { "slug": "failure-detection", "order_index": 4, "name": "失效检测与 heartbeat", "hook": "\"对方还活着吗\"——这个问题比你想的难得多", "sections": [] },
+        { "slug": "partition-vs-crash", "order_index": 5, "name": "分区 vs 崩溃", "hook": "网络分区长得像节点崩溃，但修法完全不同；搞混是 top 事故", "sections": [] }
+      ]
+    },
+    {
+      "slug": "consistency",
+      "name": "一致性模型 & 隔离级别",
+      "order_index": 2,
+      "description": "一致性谱系、linearizable/sequential/causal、SI/SSI/RR/serializable、CAP/PACELC、读写 anomaly 图鉴。",
+      "lessons": [
+        { "slug": "consistency-spectrum", "order_index": 1, "name": "一致性谱系", "hook": "\"强一致\" 和 \"最终一致\" 中间还有 5 层，搞不清你永远在吵错架", "sections": [] },
+        { "slug": "linearizable-vs-causal", "order_index": 2, "name": "linearizable / sequential / causal", "hook": "这三个词被滥用到失义，这节还它们精确定义", "sections": [] },
+        { "slug": "isolation-levels", "order_index": 3, "name": "SI / SSI / RR / serializable", "hook": "以为写了 BEGIN/COMMIT 就安全？SI 下的 write skew 静悄悄撕碎业务不变式", "sections": [] },
+        { "slug": "cap-pacelc", "order_index": 4, "name": "CAP 与 PACELC", "hook": "CAP 三选二是误导；PACELC 画出真实选择", "sections": [] },
+        { "slug": "rw-anomalies", "order_index": 5, "name": "读写 anomaly 图鉴", "hook": "phantom / lost update / write skew / stale read——跨场景分辨", "sections": [] }
+      ]
+    },
+    {
+      "slug": "consensus",
+      "name": "共识 & 复制",
+      "order_index": 3,
+      "description": "为什么需要共识、Raft 三件事、成员变更与 learner、Paxos 思路 / Zab 对比、慢节点 & 灰故障、链式复制。",
+      "lessons": [
+        { "slug": "why-consensus", "order_index": 1, "name": "为什么需要共识", "hook": "2PC 不是共识、leader election 不是共识——它们都会卡，共识是\"保证不卡\"那层", "sections": [] },
+        { "slug": "raft-essentials", "order_index": 2, "name": "Raft 三件事：election / log / safety", "hook": "150 行伪代码讲透 Raft——你只需要三个不变式", "sections": [] },
+        { "slug": "raft-membership", "order_index": 3, "name": "成员变更 & learner 的坑", "hook": "配错让 etcd 集群永久挂——真实事故复盘", "sections": [] },
+        { "slug": "paxos-and-zab", "order_index": 4, "name": "Paxos 思路 & Zab 对比", "hook": "Raft 不是唯一答案，各自解决不同问题", "sections": [] },
+        { "slug": "slow-nodes", "order_index": 5, "name": "慢节点 & 灰故障", "hook": "节点没死但很慢，比 crash 可怕 10 倍——运维 top 1 事故", "sections": [] },
+        { "slug": "chain-replication", "order_index": 6, "name": "链式复制 & quorum 写", "hook": "不只 Raft——chain replication 在特定场景吞吐高 3 倍", "sections": [] }
+      ]
+    },
+    {
+      "slug": "k8s-stateful",
+      "name": "K8s 有状态原语",
+      "order_index": 4,
+      "description": "StatefulSet 语义、Headless svc、Lease 选主、PDB 分布式语义、Operator 模式。K8s 作为分布式载体层。",
+      "lessons": [
+        { "slug": "statefulset-semantics", "order_index": 1, "name": "StatefulSet 的 identity 与 ordering", "hook": "不是\"有状态版 Deployment\"——pod name / PV 绑定是一等公民", "sections": [] },
+        { "slug": "headless-and-discovery", "order_index": 2, "name": "Headless svc 与服务发现", "hook": "为什么中间件必须 headless——DNS 直接暴露 pod name 的深意", "sections": [] },
+        { "slug": "lease-election", "order_index": 3, "name": "K8s 原生 leader election（Lease）", "hook": "不用 ZK 也能选主——Lease + optimistic lock 是 K8s 的共识原语", "sections": [] },
+        { "slug": "pdb-semantics", "order_index": 4, "name": "PDB & 滚动更新的分布式语义", "hook": "PDB 不是\"别一起挂\"，是\"别违反 quorum\"——用分布式语法读它", "sections": [] },
+        { "slug": "operator-pattern", "order_index": 5, "name": "Operator 模式的责任边界", "hook": "Operator 不是 StatefulSet pro——接管了分布式系统的运维 runbook", "sections": [] }
+      ]
+    },
+    {
+      "slug": "sharding",
+      "name": "分片 & 路由 & rebalance",
+      "order_index": 5,
+      "description": "分片策略、路由层、rebalance 的痛、跨分片查询与事务。",
+      "lessons": [
+        { "slug": "sharding-strategies", "order_index": 1, "name": "hash / range / 一致性哈希 / vnode", "hook": "四种分片的生死线，选错一年都在救火", "sections": [] },
+        { "slug": "routing-layers", "order_index": 2, "name": "路由：client-side / proxy / gateway", "hook": "三种路由故障半径完全不同——MongoDB / Redis / TiDB 为什么选法不同", "sections": [] },
+        { "slug": "rebalance-pain", "order_index": 3, "name": "rebalance 的七宗罪", "hook": "扩容 p99 飙 10 倍、磁盘被打挂——分布式存储最痛的操作", "sections": [] },
+        { "slug": "cross-shard", "order_index": 4, "name": "跨分片查询与事务", "hook": "\"在 shard 里\"和\"跨 shard\"是两个世界——跨 shard SQL 为什么慢 100 倍", "sections": [] }
+      ]
+    },
+    {
+      "slug": "dist-txn",
+      "name": "分布式事务 & 幂等 & 锁",
+      "order_index": 6,
+      "description": "2PC/3PC、Saga/TCC、分布式锁与 lease、幂等、exactly-once 真相。",
+      "lessons": [
+        { "slug": "2pc-3pc", "order_index": 1, "name": "2PC / 3PC 与 coordinator 难题", "hook": "2PC 不是\"简单版 Raft\"——有共识解决不了的单点问题", "sections": [] },
+        { "slug": "saga-tcc", "order_index": 2, "name": "Saga 与 TCC", "hook": "没有 2PC 怎么做？补偿式事务的\"优雅\"和\"地雷\"", "sections": [] },
+        { "slug": "distributed-locks", "order_index": 3, "name": "分布式锁与 lease", "hook": "Redis / etcd / ZK 锁各自真能保证什么——以及保证不了的", "sections": [] },
+        { "slug": "idempotency", "order_index": 4, "name": "幂等:不只是\"重试不出错\"", "hook": "真幂等 = request_id + 状态机 + 过期 三件套", "sections": [] },
+        { "slug": "exactly-once-myth", "order_index": 5, "name": "exactly-once 的真相", "hook": "Kafka exactly-once ≠ exactly-once，是 effectively-once——救命区别", "sections": [] }
+      ]
+    },
+    {
+      "slug": "industry",
+      "name": "工业系统解剖",
+      "order_index": 7,
+      "description": "etcd / Kafka / TiDB-CockroachDB / Redis Cluster / MinIO-Ceph 在 K8s 上的生产实战。四段式模板：Raft/quorum 用法 / 数据分片 / 运维原语 / 典型事故。",
+      "lessons": [
+        { "slug": "etcd", "order_index": 1, "name": "etcd 解剖", "hook": "K8s 的心脏如何存活：Raft / watch / lease / compaction + Roblox 73h 宕机事件", "sections": [] },
+        { "slug": "kafka", "order_index": 2, "name": "Kafka 解剖", "hook": "ISR / LEO/HW / exactly-once / rebalance—5 个状态机必须同时想清楚", "sections": [] },
+        { "slug": "tidb-cockroach", "order_index": 3, "name": "TiDB / CockroachDB 解剖", "hook": "分布式 SQL 四问：分片 / Raft group / 事务 / 时钟", "sections": [] },
+        { "slug": "redis-cluster", "order_index": 4, "name": "Redis Cluster 解剖（原理 + 云原生增量）", "hook": "gossip / slot / split brain + Redis on K8s Operator 实战 + 与云托管 Redis 对比", "sections": [] },
+        { "slug": "object-storage", "order_index": 5, "name": "对象存储解剖：MinIO / Ceph", "hook": "AI Infra 的底盘：erasure coding / CRUSH / MON quorum——MinIO 为什么赢过 Ceph 成为 K8s 时代 S3 兼容事实标准", "sections": [] }
+      ]
+    },
+    {
+      "slug": "reliability",
+      "name": "服务端可靠性模式 & mesh",
+      "order_index": 8,
+      "description": "重试 deadline、熔断限流、负载均衡、RPC 分布式语义、service mesh、gRPC 原生治理。",
+      "lessons": [
+        { "slug": "retry-and-deadline", "order_index": 1, "name": "重试、退避与 deadline", "hook": "不 jitter 的重试 = DDoS 自己；不带 deadline 的重试 = 资源泄漏", "sections": [] },
+        { "slug": "circuit-breaker-rl", "order_index": 2, "name": "熔断 & 限流", "hook": "熔断 = 保护我，限流 = 保护你——角色对调会出事", "sections": [] },
+        { "slug": "load-balancing", "order_index": 3, "name": "负载均衡算法", "hook": "P2C / EWMA / LC / 一致性哈希——RR 在长连接下为什么崩", "sections": [] },
+        { "slug": "rpc-semantics", "order_index": 4, "name": "RPC 分布式语义", "hook": "socket timeout ≠ application timeout；gRPC streaming 半关闭；HTTP/2 head-of-line", "sections": [] },
+        { "slug": "service-mesh", "order_index": 5, "name": "Service mesh：Envoy / Istio", "hook": "sidecar 不只是\"把重试移出代码\"——治理移到基础设施的代价", "sections": [] },
+        { "slug": "grpc-governance", "order_index": 6, "name": "gRPC 原生治理", "hook": "不用 mesh 也能做好——xDS / Resolver / LB 能力清单", "sections": [] }
+      ]
+    },
+    {
+      "slug": "multi-region",
+      "name": "多活 & 跨机房 & 容灾",
+      "order_index": 9,
+      "description": "故障域设计、多活 vs 主备、跨机房同步、流量切换与 GSLB。",
+      "lessons": [
+        { "slug": "failure-domains", "order_index": 1, "name": "故障域设计", "hook": "AZ / region / rack / 节点——故障域画错，HA 只是纸面数字", "sections": [] },
+        { "slug": "active-active", "order_index": 2, "name": "多活 vs 主备", "hook": "多活看起来更好，但冲突解决是你下半辈子的债", "sections": [] },
+        { "slug": "cross-region-sync", "order_index": 3, "name": "跨机房同步：sync / semi-sync / async", "hook": "三种复制的 RPO / RTO trade-off", "sections": [] },
+        { "slug": "traffic-switching", "order_index": 4, "name": "流量切换 / 灰度 / GSLB", "hook": "DNS / anycast / SDN 各自失败模式", "sections": [] }
+      ]
+    },
+    {
+      "slug": "observability",
+      "name": "可观测 & 排障 & 混沌",
+      "order_index": 10,
+      "description": "三位一体、分布式 tracing、SLO & error budget、生产事故复盘实战。",
+      "lessons": [
+        { "slug": "three-pillars", "order_index": 1, "name": "metric / log / trace 三位一体", "hook": "三者不是冗余——每种问题有一种\"最快回答\"的信号源", "sections": [] },
+        { "slug": "distributed-tracing", "order_index": 2, "name": "分布式 tracing 内功", "hook": "sampling / context propagation / span linking——追链路追丢的真相", "sections": [] },
+        { "slug": "slo-error-budget", "order_index": 3, "name": "SLO & error budget", "hook": "SLO 不是\"可用率\"——是产品 + SRE 同一把尺子，\"要不要发版\"变算术题", "sections": [] },
+        { "slug": "incident-postmortem", "order_index": 4, "name": "生产大故障复盘实战", "hook": "用学过的全部工具复盘一次真事故：alert → root cause → 防复发", "sections": [] }
+      ]
+    }
+  ]
+}
