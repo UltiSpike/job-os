@@ -22,9 +22,11 @@ def get_config():
     saved = settings_repo.get_setting("asr") or {}
     base = ASRConfig().model_dump()
     base.update(saved)
-    if base.get("apiAccessKey"):
-        k = base["apiAccessKey"]
-        base["apiAccessKey_masked"] = f"{k[:6]}…{k[-4:]}" if len(k) > 12 else "***"
+    # 密钥永不回前端：只返回掩码，真值仅留在服务端（WS 桥接时由 BFF 注入）
+    key = base.pop("apiAccessKey", "") or ""
+    base["apiAccessKey"] = ""
+    if key:
+        base["apiAccessKey_masked"] = f"{key[:6]}…{key[-4:]}" if len(key) > 12 else "***"
     return base
 
 
@@ -49,17 +51,42 @@ async def test_config(cfg: dict | None = None):
 
     from server.services.asr_volc import build_full_client_request, parse_server_text
 
+    cfg = cfg or {}
     saved = settings_repo.get_setting("asr") or {}
-    merged = {}
     base_default = ASRConfig().model_dump()
-    for k in base_default:
-        merged[k] = (cfg.get(k) if cfg else None) or saved.get(k) or base_default[k]
 
-    ws_url = merged.get("wsUrl") or ""
+    caller_ws = (cfg.get("wsUrl") or "").strip()
+    saved_ws = (saved.get("wsUrl") or base_default["wsUrl"]).strip()
+    ws_url = caller_ws or saved_ws
+
+    # 安全约束：已保存的凭据只能发往已保存的地址。
+    # 调用方若换了目的地，必须自己提供 apiAppId/apiAccessKey，禁止复用服务端存储的凭据。
+    if caller_ws and caller_ws != saved_ws:
+        app_id = (cfg.get("apiAppId") or "").strip()
+        access_key = (cfg.get("apiAccessKey") or "").strip()
+        if not access_key:
+            return {
+                "ok": False,
+                "stage": "config",
+                "error": "测试自定义 wsUrl 时必须同时提供 apiAppId/apiAccessKey（已保存的凭据不会发往新地址）",
+            }
+    else:
+        app_id = (cfg.get("apiAppId") or "").strip() or saved.get("apiAppId") or base_default["apiAppId"]
+        access_key = (cfg.get("apiAccessKey") or "").strip() or saved.get("apiAccessKey") or base_default["apiAccessKey"]
+
     if not ws_url:
         return {"ok": False, "stage": "config", "error": "wsUrl required"}
-    if not merged.get("apiAppId") or not merged.get("apiAccessKey"):
+    if not app_id or not access_key:
         return {"ok": False, "stage": "config", "error": "apiAppId/apiAccessKey required"}
+
+    merged = {
+        **base_default,
+        **{k: v for k, v in saved.items() if k != "apiAccessKey"},
+        **{k: v for k, v in cfg.items() if k != "apiAccessKey"},
+        "wsUrl": ws_url,
+        "apiAppId": app_id,
+        "apiAccessKey": access_key,
+    }
 
     headers = {
         "X-Api-App-Key": merged["apiAppId"],

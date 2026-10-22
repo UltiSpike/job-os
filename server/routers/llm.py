@@ -62,21 +62,6 @@ def _resolve(req_target: LLMPreset | None, preset_name: str | None) -> LLMPreset
     raise HTTPException(400, "未配置任何 LLM preset，请先 POST /api/v1/llm/presets")
 
 
-def _mask_preset(p) -> dict:
-    """把 LLMPreset (db model) 序列化成前端 dict + 掩码 api_key"""
-    out = {
-        "name": p.name,
-        "base_url": p.base_url,
-        "model": p.model,
-        "api_key": "",
-        "extra_headers": p.extra_headers,
-        "is_active": bool(p.is_active),
-    }
-    if p.api_key:
-        out["api_key_masked"] = f"{p.api_key[:6]}…{p.api_key[-4:]}" if len(p.api_key) > 12 else "***"
-    return out
-
-
 # presets CRUD 已经移到 routers/llm_presets.py /api/v1/llm-presets/*
 
 

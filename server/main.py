@@ -16,7 +16,6 @@ from pathlib import Path
 
 import uvicorn
 from fastapi import FastAPI, Request
-from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from server.exceptions import ConfigError, JobOsError, NotFoundError, UpstreamError, ValidationError
@@ -71,12 +70,8 @@ async def lifespan(app: FastAPI):
 def create_app() -> FastAPI:
     app = FastAPI(title="Job OS", version="3.0", lifespan=lifespan)
 
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=["*"],
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
+    # 不注册 CORS 中间件：前端由本进程在 / 同源托管，API 无需跨域访问。
+    # 之前 allow_origins=["*"] + 全站零鉴权，等于任意网页都能读写本机 API（含凭证）。
 
     # request id 中间件 — 每个请求生成一个，写入 contextvar 供 logger 用
     @app.middleware("http")

@@ -8,6 +8,7 @@ from typing import Any
 from fastapi import APIRouter
 from pydantic import BaseModel
 
+from server.redact import redact_secrets
 from server.storage import db, jobs_repo, questions_repo, settings_repo
 
 router = APIRouter(prefix="/api/v1/migrate", tags=["migration"])
@@ -119,11 +120,12 @@ def from_localstorage(payload: MigrationPayload):
 
 @router.get("/export")
 def export_all():
-    """导出全量数据，作为备份"""
-    return {
+    """导出全量数据，作为备份（密钥字段脱敏后返回）"""
+    payload = {
         "exportedAt": datetime.now(timezone.utc).isoformat(),
         "job_states": jobs_repo.list_job_states(),
         "interviews": jobs_repo.list_interviews(),
         "questions": questions_repo.list_questions(),
         "settings": settings_repo.list_settings(),
     }
+    return redact_secrets(payload)

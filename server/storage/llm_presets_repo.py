@@ -46,12 +46,13 @@ def upsert(name: str, base_url: str, model: str, api_key: str, extra_headers: st
     now = now_iso()
     with transaction() as conn:
         if existing:
-            # 空 api_key 时保留原值
+            # 空 api_key / 空 extra_headers 时保留原值（GET 只回掩码，前端留空即“不改”）
             new_key = api_key or existing.api_key
+            new_extra = extra_headers or existing.extra_headers
             conn.execute(
                 """UPDATE llm_presets SET base_url = ?, model = ?, api_key = ?, extra_headers = ?, updated_at = ?
                    WHERE name = ?""",
-                (base_url, model, new_key, extra_headers, now, name),
+                (base_url, model, new_key, new_extra, now, name),
             )
         else:
             conn.execute(

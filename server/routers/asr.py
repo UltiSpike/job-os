@@ -34,16 +34,39 @@ async def test_asr_config(cfg: dict):
     任何空字段会从 settings.asr 里 fallback，方便前端「点测试就能用」。
     """
     from server.storage import settings_repo
+    cfg = cfg or {}
     saved = settings_repo.get_setting("asr") or {}
-    merged = {}
-    for k in ("wsUrl", "apiAppId", "apiAccessKey", "apiResourceId"):
-        merged[k] = (cfg.get(k) or "").strip() or saved.get(k, "")
-    cfg = merged
-    ws_url = cfg.get("wsUrl") or ""
+
+    caller_ws = (cfg.get("wsUrl") or "").strip()
+    saved_ws = (saved.get("wsUrl") or "").strip()
+    ws_url = caller_ws or saved_ws
+
+    # 安全约束：已保存的凭据只能发往已保存的地址（否则等于把密钥交给调用方指定的目标）
+    if caller_ws and caller_ws != saved_ws:
+        app_id = (cfg.get("apiAppId") or "").strip()
+        access_key = (cfg.get("apiAccessKey") or "").strip()
+        if not access_key:
+            return {
+                "ok": False,
+                "stage": "config",
+                "error": "测试自定义 wsUrl 时必须同时提供 apiAppId/apiAccessKey（已保存的凭据不会发往新地址）",
+            }
+    else:
+        app_id = (cfg.get("apiAppId") or "").strip() or saved.get("apiAppId", "")
+        access_key = (cfg.get("apiAccessKey") or "").strip() or saved.get("apiAccessKey", "")
+
     if not ws_url:
         return {"ok": False, "stage": "config", "error": "wsUrl required"}
-    if not cfg.get("apiAppId") or not cfg.get("apiAccessKey"):
+    if not app_id or not access_key:
         return {"ok": False, "stage": "config", "error": "apiAppId/apiAccessKey required"}
+
+    cfg = {
+        "wsUrl": ws_url,
+        "apiAppId": app_id,
+        "apiAccessKey": access_key,
+        "apiResourceId": (cfg.get("apiResourceId") or "").strip() or saved.get("apiResourceId", ""),
+        "connectId": cfg.get("connectId") or "",
+    }
 
     headers = {
         "X-Api-App-Key":     cfg.get("apiAppId", ""),       # 火山的 App-Key 字段值是 APP ID
@@ -141,28 +164,44 @@ async def asr_ws_bridge(ws: WebSocket):
             return
 
         if init.get("type") != "init":
-            logger.warning(f"first message not init: {init}")
+            logger.warning(f"first message not init: type={init.get('type')!r}")
             await ws.send_text(json.dumps({"type": "error", "message": "first message must be type=init"}))
             await ws.close()
             return
 
-        cfg = init.get("config") or {}
-        ws_url = cfg.get("wsUrl") or ""
+        caller_cfg = init.get("config") or {}
+        from server.storage import settings_repo
+
+        saved = settings_repo.get_setting("asr") or {}
+
+        # 目的地与凭据以服务端保存的配置为准；浏览器的 init.config 只作为补充参数。
+        # 这样已保存的 apiAccessKey 永远不会被发往调用方指定的地址。
+        ws_url = (saved.get("wsUrl") or "").strip() or (caller_cfg.get("wsUrl") or "").strip()
+        app_id = saved.get("apiAppId") or caller_cfg.get("apiAppId") or ""
+        access_key = saved.get("apiAccessKey") or caller_cfg.get("apiAccessKey") or ""
+
         if not ws_url:
-            logger.warning("wsUrl missing in init.config")
-            await ws.send_text(json.dumps({"type": "error", "message": "config.wsUrl is required"}))
+            logger.warning("wsUrl missing")
+            await ws.send_text(json.dumps({"type": "error", "message": "ASR 未配置，请先在设置里保存 WebSocket URL"}))
             await ws.close()
             return
 
-        # 校验必须的火山字段
-        if not cfg.get("apiAppId") or not cfg.get("apiAccessKey"):
+        if not app_id or not access_key:
             logger.warning("apiAppId/apiAccessKey missing")
             await ws.send_text(json.dumps({
                 "type": "error",
-                "message": "config.apiAppId and config.apiAccessKey are required",
+                "message": "ASR 未配置，请先在设置里保存 App ID / Access Token",
             }))
             await ws.close()
             return
+
+        cfg = {
+            **caller_cfg,
+            **{k: v for k, v in saved.items() if k != "apiAccessKey"},
+            "wsUrl": ws_url,
+            "apiAppId": app_id,
+            "apiAccessKey": access_key,
+        }
 
         headers = {
             "X-Api-App-Key":     cfg.get("apiAppId", ""),
@@ -171,7 +210,7 @@ async def asr_ws_bridge(ws: WebSocket):
             "X-Api-Connect-Id":  cfg.get("connectId") or str(uuid.uuid4()),
         }
 
-        logger.info(f"connecting upstream: {ws_url} app_key={headers['X-Api-App-Key']} resource={headers['X-Api-Resource-Id']} connect_id={headers['X-Api-Connect-Id']}")
+        logger.info(f"connecting upstream: {ws_url} resource={headers['X-Api-Resource-Id']}")
         try:
             upstream = await websockets.connect(
                 ws_url,
@@ -191,13 +230,11 @@ async def asr_ws_bridge(ws: WebSocket):
 
         logger.info("upstream connected, sending full_client_request")
         init_frame = build_full_client_request(cfg)
-        # dump 出 init 帧的 header + payload (gunzip)
+        # 只校验帧可解压，不打印内容（避免口述正文进日志）
         import gzip as _gz
         try:
-            payload_raw = init_frame[8:]  # 跳过 header(4) + size(4)
-            decoded = _gz.decompress(payload_raw).decode('utf-8', 'replace')
+            _gz.decompress(init_frame[8:])  # 跳过 header(4) + size(4)
             logger.info(f"INIT frame total={len(init_frame)} header={init_frame[:8].hex()}")
-            logger.info(f"INIT json: {decoded}")
         except Exception as e:
             logger.warning(f"failed to decode init frame: {e}")
         await upstream.send(init_frame)

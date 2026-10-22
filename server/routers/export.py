@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from fastapi import APIRouter
 from fastapi.responses import JSONResponse
 
+from server.redact import redact_secrets
 from server.storage import jobs_repo, questions_repo, resumes_repo, settings_repo
 
 router = APIRouter(prefix="/api/v1/export", tags=["export"])
@@ -27,8 +28,9 @@ def export_all():
         },
     }
     filename = f"job-os-backup-{datetime.now().strftime('%Y%m%d-%H%M%S')}.json"
+    # 备份里不落明文密钥（ASR access key / LLM api key 等），只保留 *** 占位
     return JSONResponse(
-        content=payload,
+        content=redact_secrets(payload),
         headers={
             "Content-Disposition": f'attachment; filename="{filename}"',
         },

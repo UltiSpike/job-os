@@ -143,7 +143,7 @@ function renderLLMTab() {
     <div class="field"><label>Base URL</label><input id="ll-base" type="text" value="${escapeHtml(editing?.base_url || '')}" placeholder="https://api.openai.com/v1"></div>
     <div class="field"><label>Model</label><input id="ll-model" type="text" value="${escapeHtml(editing?.model || '')}" placeholder="gpt-4o-mini"></div>
     <div class="field"><label>API Key ${editing?.api_key_masked ? `<span style="color:var(--char-soft)">已存：${editing.api_key_masked}</span>` : ''}</label><input id="ll-key" type="password" placeholder="sk-..."></div>
-    <div class="field"><label>Extra Headers (一行一个 k: v)</label><textarea id="ll-extra" placeholder="X-Custom: value">${escapeHtml(editing?.extra_headers || '')}</textarea></div>
+    <div class="field"><label>Extra Headers (一行一个 k: v) ${editing?.extra_headers_masked ? `<span style="color:var(--char-soft);font-weight:400">已存：${escapeHtml(editing.extra_headers_masked).replace(/\n/g, ' / ')}</span>` : ''}</label><textarea id="ll-extra" placeholder="留空则保留原值；X-Custom: value"></textarea></div>
 
     <div class="ll-result" id="ll-result"></div>
 
