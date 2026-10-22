@@ -22,38 +22,30 @@ python3 -m server.main --port 8891
 
 ```
 job-os/
-├── server/                # FastAPI BFF
-│   ├── main.py           # 入口
-│   ├── routers/          # API 路由
-│   │   ├── jobs.py       # 岗位 + 状态 + 面试
-│   │   ├── questions.py  # 题库 + 评分 + 复习
-│   │   ├── llm.py        # LLM 代理（流式/非流式）
-│   │   ├── asr.py        # ASR 转写 + WebSocket 桥接
-│   │   └── migration.py  # localStorage → SQLite 迁移
-│   ├── storage/          # 数据访问层
-│   │   ├── db.py
-│   │   ├── jobs_repo.py
-│   │   ├── questions_repo.py
-│   │   └── settings_repo.py
-│   └── services/
-│       └── asr_volc.py   # 火山引擎 ASR 二进制协议
+├── server/                # FastAPI BFF（23 个 router）
+│   ├── main.py            # 入口（默认只监听 127.0.0.1，不注册 CORS）
+│   ├── routers/           # jobs / questions / llm / llm_presets / asr / asr_config /
+│   │                      # curriculum / resumes / profile / me / export / migration …
+│   ├── storage/           # SQLite 数据访问层（db schema + 各 repo）
+│   ├── services/          # asr_volc.py（火山引擎 ASR 二进制协议）、mastery_service
+│   └── redact.py          # 响应/导出脱敏（密钥字段 → ***）
 │
-├── web/                  # 前端（暂用 v5.html）
-│   └── index.html
+├── web/                   # 前端 SPA（原生 JS，无构建步骤）
+│   ├── index.html
+│   ├── api/ store/ views/ components/ lib/ styles/
 │
-├── scraper/              # 爬虫（保持原样）
-│   ├── scrape.py         # ← 原 v4.py
-│   ├── score.py          # ← 原 v4_1.py
-│   └── build_html.py     # ← 原 build_html_v5.py
+├── scraper/               # 个人用的岗位抓取脚本（旧版生成器，仅供参考）
+│   ├── scrape.py
+│   ├── score.py
+│   └── build_html.py
 │
-├── data/                 # 运行时数据（gitignore）
-│   ├── snapshot.json     # 爬虫产物
-│   ├── rejected.json
-│   └── app.db            # SQLite（首次运行自动创建）
+├── data/                  # 运行时数据（.gitignore，不入库）
+│   ├── app.db             # SQLite（首次运行自动创建）
+│   ├── snapshot.json      # 爬虫产物
+│   └── curriculum/        # 手工维护的课程内容（入库）
 │
-├── docs/
-└── scripts/
-    └── start.sh
+├── docs/                  # 设计与重构文档
+└── scripts/               # start.sh 等
 ```
 
 ## API 端点
@@ -61,18 +53,16 @@ job-os/
 ```
 GET  /api/v1/health                  健康检查
 
-# 岗位（read-only，from snapshot.json）
+# 岗位（爬虫产出，SQLite）
 GET  /api/v1/jobs?tier=P0            列出岗位
 GET  /api/v1/jobs/{href}             单个岗位
 POST /api/v1/jobs/reload             重新加载 snapshot
 
-# 岗位状态（SQLite）
+# 岗位状态 / 面试
 GET    /api/v1/job-states            所有用户状态
 GET    /api/v1/job-states/{href}     单个状态
 PATCH  /api/v1/job-states/{href}     upsert
 DELETE /api/v1/job-states/{href}
-
-# 面试
 GET    /api/v1/interviews?job_id=xxx
 POST   /api/v1/jobs/{href}/interviews
 PATCH  /api/v1/interviews/{id}
@@ -89,21 +79,41 @@ GET    /api/v1/questions/topics      技能点聚合（热力图数据）
 GET    /api/v1/questions/due         今日待复习
 POST   /api/v1/questions/{id}/review 提交评分（自动算下次复习时间）
 
-# LLM
-GET  /api/v1/llm/config
-PUT  /api/v1/llm/config
-POST /api/v1/llm/test
-POST /api/v1/llm/chat                非流式
-POST /api/v1/llm/chat/stream         SSE 流式
+# LLM（预设存 SQLite；api_key 只回掩码）
+GET    /api/v1/llm-presets
+POST   /api/v1/llm-presets
+PATCH  /api/v1/llm-presets/{name}
+POST   /api/v1/llm-presets/{name}:activate
+POST   /api/v1/llm-presets/{name}:test
+POST   /api/v1/llm/test
+POST   /api/v1/llm/chat              非流式
+POST   /api/v1/llm/chat/stream       SSE 流式
 
-# ASR
+# ASR（火山引擎；access key 只存服务端，不回前端）
+GET  /api/v1/asr-config
+PUT  /api/v1/asr-config
+POST /api/v1/asr-config:test
+POST /api/v1/asr/test
 POST /api/v1/asr/transcribe          文件转写
 WS   /api/v1/asr/ws                  实时桥接火山引擎
 
-# 迁移
-POST /api/v1/migrate/from-localstorage
+# 导出 / 迁移（导出会自动脱敏密钥字段）
+GET  /api/v1/export
 GET  /api/v1/migrate/export
+POST /api/v1/migrate/from-localstorage
 ```
+
+## 安全边界（重要）
+
+本项目按**单用户、本机使用**设计：
+
+- 默认只监听 `127.0.0.1:8891`，**不要用 `--host 0.0.0.0` 暴露到公网/局域网**；
+- 全站**无登录鉴权**，且**不注册 CORS**（前端由本进程同源托管）——任何能访问该端口的进程都能读写数据；
+- LLM `api_key`、火山 ASR `access_key` 只存在本地 `data/app.db`（SQLite 明文），
+  API 只返回掩码，导出接口会对密钥字段脱敏（`***`）；
+- `data/` 下的运行时数据与导出备份已在 `.gitignore` 中忽略，请勿提交。
+
+如需在多用户/公网环境使用，请自行补充鉴权、TLS 与反向代理。
 
 ## 数据迁移
 
@@ -131,11 +141,29 @@ GET  /api/v1/migrate/export
      -d @migration.json
    ```
 
+## 免责声明
+
+`scraper/` 中的抓取脚本仅用于个人学习与研究，请自行遵守目标网站的 robots.txt、服务条款与当地法律，作者不对使用后果负责。仓库不包含任何抓取到的岗位数据（`data/` 已忽略）。
+
+## License
+
+本项目采用 **[PolyForm Noncommercial License 1.0.0](LICENSE)**：
+
+- 允许个人学习、研究、非营利组织内部使用，以及修改和分发；
+- **任何商业用途需另行获得授权**。
+
+> 该协议不是 OSI 认可的开源协议，GitHub 会显示为 "Other"。
+
 ## 改动日志
+
+### v3.1 (2026-10-22) — 安全加固
+- ASR / LLM 凭据不再回传前端，导出接口对密钥字段脱敏
+- 测试类接口禁止「复用已存密钥 + 调用方指定地址」
+- 移除全开放的 CORS；ASR WebSocket 日志不再打印初始帧内容
+- 清理历史提交中的身份与内部信息，补充非商用协议
 
 ### v3 (2026-04-08)
 - 重构为模块化 BFF + SQLite 持久化
 - 拆分 router（jobs / questions / llm / asr / migration）
 - 用户状态从 localStorage → SQLite（保留迁移路径）
 - 保留 web/index.html 作为前端（以后可换 React）
-```

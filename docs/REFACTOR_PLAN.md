@@ -154,7 +154,7 @@ scraper 作为**独立工具**，输出 JSON 到 `server/data/snapshot.json`，s
 **关键抽象**：
 - **Job** 是不可变的（爬虫产出），**JobState** 是用户的状态（可变）—— 两者分离让爬虫和用户数据互不影响
 - **Question** 可以独立于 Interview 存在（自学题）
-- **Question.jobId** 可选，让训练场和岗位 Pipeline 联动（"快手投了→生成快手专项题库"）
+- **Question.jobId** 可选，让训练场和岗位 Pipeline 联动（"某司投了→生成某司专项题库"）
 - **Review** 是一次复习记录，间隔复习算法基于 review history 决定下次时间
 
 ### 3.2 边界上下文

@@ -214,8 +214,8 @@ v4.py → v4_1.py → v4_1_output/tiered.json
   "P0": [
     {
       "title": "AI平台-算力调度",
-      "company": "京东零售",
-      "salary": "30-60K·20薪",
+      "company": "某互联网公司",
+      "salary": "XX-XXK·XX薪",
       "area": "北京通州区...",
       "experience": "经验不限",
       "href": "https://www.zhipin.com/job_detail/xxx.html",
