@@ -2165,7 +2165,6 @@ const AI_PROVIDERS = {
   kimi: { name: 'Kimi (月之暗面)', baseUrl: 'https://api.moonshot.cn/v1', model: 'moonshot-v1-8k' },
   glm: { name: '智谱 GLM', baseUrl: 'https://open.bigmodel.cn/api/paas/v4', model: 'glm-4-flash' },
   hpcai_prod: { name: 'HPC-AI MaaS (Prod)', baseUrl: 'https://api.hpc-ai.com/inference/v1', model: 'moonshotai/kimi-k2.5' },
-  hpcai_dev: { name: 'HPC-AI MaaS (Dev)', baseUrl: 'http://dev-maas.internal:31006/v1', model: 'moonshotai/kimi-k2.5' },
   custom: { name: '自定义 (OpenAI 兼容)', baseUrl: '', model: '' },
 };
 
@@ -4354,8 +4353,6 @@ function openSettings() {
       💡 提供商指南：<br>
       · <strong>DeepSeek</strong> - 最便宜，¥0.001/千 token<br>
       · <strong>HPC-AI MaaS (Prod)</strong> - 推荐模型可用 <code>moonshotai/kimi-k2.5</code><br>
-      · <strong>HPC-AI MaaS (Dev)</strong> - API Key 用 DevAccessToken（浏览器 cookie 里复制）；<br>
-      &nbsp;&nbsp;额外 Header 填 <code>X-MaaS-Main-UID: 你的用户ID</code><br>
       · <strong>目标：</strong>先让 WebSocket 实时转写稳定工作，再逐步加高级配置
     </div>
 
@@ -4380,7 +4377,7 @@ function onProviderChange(key) {
     document.getElementById('set-baseurl').value = p.baseUrl;
     document.getElementById('set-model').value = p.model;
     const streamEl = document.getElementById('set-stream');
-    if (streamEl) streamEl.checked = key !== 'hpcai_dev';
+    if (streamEl) streamEl.checked = true;
   }
 }
 

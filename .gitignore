@@ -17,15 +17,17 @@ Thumbs.db
 *.swp
 
 # 本地数据 — 单用户应用，DB 与爬虫产出不入库
-data/app.db
-data/app.db-journal
-data/app.db-wal
-data/app.db-shm
+data/app.db*
 data/snapshot.json
 data/rejected.json
 
 # 但要保留 curriculum 课程内容（手工维护的资产）
 !data/curriculum/
+
+# 导出/备份里可能含明文密钥（ASR access key 等），绝不入库
+job-os-backup-*.json
+migration*.json
+exports/
 
 # Logs
 *.log
